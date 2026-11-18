@@ -1,0 +1,31 @@
+
+# Python environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# IDE
+.vscode/
+.idea/
+
+# Local document storage
+storage/
+phase-1/input/
+phase-1/output/
+phase-1/reports/
+
+# Sensitive and temporary files
+.env
+.env.*
+*.log
+*.tmp
+
+# Python testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db

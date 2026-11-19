@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DocuSync AI | Document workspace</title>
+<link rel="stylesheet" href="/static/workspace.css"></head><body>
+<div class="app">
+<header class="top">
+ <div class="logo"><span class="brand-mark" aria-hidden="true"></span><h1>DocuSync AI</h1></div>
+ <button class="btn" id="settings"><span id="reviewer-label"></span>Settings</button>
+</header>
+<aside class="library" aria-labelledby="library-heading">
+ <h2 id="library-heading">Documents</h2>
+ <button class="btn pri upload" id="upload"><span aria-hidden="true">+</span> Upload PDF</button>
+ <input id="pdf-file" type="file" accept=".pdf,application/pdf" hidden>
+ <label for="docsel">Current document</label>
+ <select id="docsel" aria-label="Document" disabled><option>No documents yet</option></select>
+ <nav class="library-nav" aria-label="Workspace">
+  <button id="nv-review" class="on" aria-pressed="true">Document review</button>
+  <button id="nv-dash" aria-pressed="false" hidden>Run summary</button>
+  <button id="batch">Batch review</button>
+ </nav>
+</aside>
+<main id="main" class="desk">
+ <section class="pane" id="viewpane" aria-labelledby="preview-heading">
+  <header class="pane-heading">
+   <h2 id="preview-heading">Document preview</h2>
+   <div class="chip" id="runchip" role="status"></div>
+  </header>
+  <div class="tabs" id="vtabs" role="group" aria-label="Preview mode">
+   <button class="tab on" data-t="pdf" aria-pressed="true">Source PDF</button>
+   <button class="tab" data-t="text" aria-pressed="false">Extracted text</button>
+   <button class="tab" data-t="zoning" aria-pressed="false">Zoning</button>
+   <button class="tab" data-t="order" aria-pressed="false">Reading order</button>
+  </div>
+  <div class="legend" id="legend" hidden></div>
+  <div class="viewer" id="viewer"><div class="empty">Loading documents…</div></div>
+  <footer class="page-controls" aria-label="Page controls">
+   <div class="page-controls-group" id="page-tools" hidden>
+    <button class="btn" id="page-prev" aria-label="Previous page">←</button>
+    <span id="page-label" aria-live="polite"></span>
+    <button class="btn" id="page-next" aria-label="Next page">→</button>
+    <button class="btn" id="zoom-out" aria-label="Zoom out">−</button>
+    <button class="btn" id="zoom-in" aria-label="Zoom in">+</button>
+   </div>
+   <button class="btn" id="rot" title="Rotate source view" disabled>Rotate</button>
+  </footer>
+ </section>
+ <aside class="side" aria-labelledby="review-heading">
+  <header class="pane-heading"><h2 id="review-heading">Review &amp; export</h2></header>
+  <div class="tabs" id="stabs" role="group" aria-label="Review panel">
+   <button class="tab on" data-t="meta" aria-pressed="true">Metadata</button>
+   <button class="tab" data-t="xml" aria-pressed="false">XML preview</button>
+   <button class="tab" data-t="deck" aria-pressed="false">Changes</button>
+  </div>
+  <div class="sbar" id="sbar"></div>
+  <div class="sbody" id="sbody"></div>
+  <footer class="review-actions">
+   <button class="btn" id="reproc" disabled>Reprocess</button>
+   <button class="btn pri" id="dlxml" disabled>Export XML</button>
+  </footer>
+ </aside>
+</main>
+<section class="dash" id="dash" hidden></section>
+</div>
+<dialog id="settings-dialog" aria-labelledby="settings-heading">
+ <div class="dialog-heading"><h2 id="settings-heading">Workspace settings</h2><form method="dialog"><button class="btn">Close</button></form></div>
+ <p id="settings-info"></p>
+ <form id="profile-form" class="workspace-tools"><label for="profile-name">Local reviewer</label>
+  <input id="profile-name" maxlength="80" required><button class="btn pri">Save profile</button><output id="profile-status"></output>
+ </form></dialog>
+<script>
+const $=s=>document.querySelector(s),esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const COL={h:"#674b88",p:"#21746a",li:"#426c31",ul:"#426c31",ol:"#426c31",table:"#9a5424",figure:"#a44465",header:"#535f70",footer:"#535f70",aside:"#85621d",hr:"#606d66"};
+const col=t=>COL[t]||COL[t[0]]||COL.p;
+const S={docs:[],id:null,data:null,vtab:"pdf",stab:"meta",rot:0,filter:"all",xml:"",changes:[],cfilter:"all"};
+const badge=c=>{const v=Math.round(c);return `<span class="b ${v>=97?"g":v>=80?"a":"r"}">${v}%</span>`};
+async function J(u,o){const r=await fetch(u,o);if(!r.ok)throw new Error(r.status);return r.json()}
+async function init(){
+ const sm=await J("/api/summary");S.sum=sm;S.docs=sm.docs;
+ $("#docsel").disabled=!S.docs.length;
+ $("#docsel").innerHTML=S.docs.map(d=>`<option value="${esc(d.id)}">${esc(d.file||d.id)}  -  ${d.pages} pp${d.ocr_pages?`, ${d.ocr_pages} OCR`:""}</option>`).join("")||"<option>No batch documents</option>";
+ $("#runchip").innerHTML=`<span class="dot ${sm.failed?"bad":""}"></span><span>${sm.succeeded??"?"}/${sm.documents} documents OK &middot; ${sm.pages} pages &middot; ${sm.wall_seconds}s</span>`;
+ if(S.docs.length)open(S.docs[0].id);else $("#viewer").innerHTML='<div class="empty">No processed documents found in the run directory.</div>';
+ dash();
+}
+async function open(id){S.id=id;$("#docsel").value=id;S.data=await J("/api/doc/"+encodeURIComponent(id));
+ try{S.xml=await (await fetch(`/api/doc/${encodeURIComponent(id)}/xml`)).text()}catch(e){S.xml=""}
+ try{S.changes=await J(`/api/doc/${encodeURIComponent(id)}/changes`)}catch(e){S.changes=[]}
+ viewer();side()}
+function viewer(){
+ const d=S.data;if(!d)return;const lg=$("#legend");lg.hidden=!(S.vtab==="zoning"||S.vtab==="order");
+ lg.innerHTML=S.vtab==="zoning"?Object.entries({heading:"h",paragraph:"p",list:"ul",table:"table",figure:"figure","header/footer":"header",footnote:"aside"}).map(([k,t])=>`<span><b style="background:${col(t)}"></b>${k}</span>`).join(""):"Numbers show the reading order within each page";
+ $("#rot").disabled=S.vtab!=="pdf";
+ if(S.vtab==="text"){$("#viewer").innerHTML=`<div class="textview">`+d.pages.map(p=>`<div class="pl"><span>Page ${p.n}</span><span>${p.source.toUpperCase()}</span></div>`+p.blocks.map(b=>`<div class="tb"><small>${b.tag}${b.kind?" / "+esc(b.kind):""}</small>${esc(b.text)||"<i style='color:var(--mute)'>(no text)</i>"}</div>`).join("")).join("")+`</div>`;return}
+ $("#viewer").innerHTML=d.pages.map(p=>{
+  let ov="";
+  if(S.vtab==="zoning"||S.vtab==="order"){ov=`<svg viewBox="0 0 ${p.w} ${p.h}" preserveAspectRatio="none">`+p.blocks.filter(b=>b.bbox).map((b,k)=>{const [x0,y0,x1,y1]=b.bbox,c=col(b.tag);
+   return S.vtab==="zoning"?`<rect x="${x0}" y="${y0}" width="${x1-x0}" height="${y1-y0}" fill="${c}" fill-opacity=".16" stroke="${c}" stroke-width="1.4"><title>${esc(b.tag+(b.kind?" / "+b.kind:"")+" - "+b.text.slice(0,80))}</title></rect>`
+   :`<circle cx="${x0}" cy="${y0+8}" r="9" fill="${c}"/><text x="${x0}" y="${y0+11.5}" font-size="10" text-anchor="middle" fill="#fff" font-family="sans-serif">${k+1}</text>`}).join("")+`</svg>`}
+  const src=`/api/doc/${encodeURIComponent(d.id)}/page/${p.n}.png?dpi=110&rot=${S.vtab==="pdf"?S.rot:0}`;
+  return `<div class="pl"><span>Page ${p.n}</span><span>${p.source==="ocr"?"OCR":"native text"} &middot; ${badge((p.diag.confidence||0)*100)}</span></div><div class="page"><img loading="lazy" src="${src}" alt="page ${p.n}">${ov}</div>`}).join("")}
+function side(){
+ const d=S.data;if(!d)return;const sb=$("#sbar"),bd=$("#sbody");
+ $("#dlxml").style.display=S.stab==="xml"||S.stab==="meta"?"":"none";
+ if(S.stab==="xml"){sb.innerHTML=`<span style="color:var(--mute)">${S.xml.length.toLocaleString()} characters</span>`;
+  bd.innerHTML=`<pre class="xml">`+esc(S.xml).replace(/(&lt;\/?)([\w:-]+)/g,'$1<span class="t">$2</span>').replace(/ ([\w:-]+)=(&quot;.*?&quot;)/g,' <span class="a">$1</span>=<span class="v">$2</span>')+`</pre>`;return}
+ if(S.stab==="deck"){const cs=S.changes.filter(c=>S.cfilter==="all"||c.action===S.cfilter);
+  sb.innerHTML=`<select id="cf" style="min-width:0">${["all","applied","review"].map(v=>`<option ${S.cfilter===v?"selected":""} value="${v}">${v}</option>`).join("")}</select><span style="color:var(--mute)">${cs.length} of ${S.changes.length} changes</span><span style="margin-left:auto"><a class="btn" href="/api/doc/${encodeURIComponent(d.id)}/deck">Deck</a></span>`;
+  bd.innerHTML=cs.length?cs.slice(0,400).map(c=>`<div class="card"><div class="h"><b>Slide ${c.original_location.slide}</b><span>${esc(c.change_type.replace(/_/g," "))}</span>${badge(c.confidence*100)}<span style="margin-left:auto">${c.action}</span></div>
+   ${c.old_content||c.new_content?`<div>${c.old_content?`<span class="del">${esc(c.old_content.slice(0,160))}</span>`:""} ${c.new_content?`<span class="ins">${esc(c.new_content.slice(0,200))}</span>`:""}</div>`:""}
+   <div style="color:var(--mute);font-size:12px;margin-top:5px">${esc(c.reason)}</div>
+   <div class="acts"><button class="btn ${c.decision==="accepted"?"on":""}" data-r="${c.id}|accepted">Accept</button><button class="btn ${c.decision==="rejected"?"on":""}" data-r="${c.id}|rejected">Reject</button></div></div>`).join(""):`<div class="empty">No deck changes for this document.</div>`;
+  $("#cf").onchange=e=>{S.cfilter=e.target.value;side()};
+  bd.querySelectorAll("[data-r]").forEach(b=>b.onclick=async()=>{const [id,dec]=b.dataset.r.split("|"),c=S.changes.find(x=>x.id===id);const nd=c.decision===dec?"":dec;await J("/api/review",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,decision:nd})});c.decision=nd;side()});return}
+ // metadata
+ const q=d.quality||{},v=d.validation||{};const cnt={};d.pages.forEach(p=>cnt[p.source]=(cnt[p.source]||0)+1);
+ const blocks=[];d.pages.forEach(p=>p.blocks.forEach(b=>{if(b.text||b.n_items)blocks.push({...b,page:p.n,c:b.source==="ocr"?b.conf:b.conf})}));
+ const lim=S.filter==="all"?101:+S.filter;const shown=blocks.filter(b=>b.conf<lim);
+ sb.innerHTML=`<select id="mf" style="min-width:0"><option value="all">Confidence: All</option><option value="98" ${S.filter==="98"?"selected":""}>Below 98%</option><option value="80" ${S.filter==="80"?"selected":""}>Below 80%</option></select><span style="color:var(--mute)">${shown.length+7} fields</span>`;
+ const F=(l,val,c)=>`<div class="fld"><label>${l}${c!=null?badge(c):""}</label><div class="val ${c!=null&&c<80?"low":""}">${esc(val)||"&nbsp;"}</div></div>`;
+ bd.innerHTML=`<div class="sec">Document</div>`+F("Title",d.title,null)+F("Language",d.lang,null)+F("Pages",`${d.pages.length}  (${Object.entries(cnt).map(([k,n])=>`${n} ${k}`).join(", ")})`,null)
+  +F("Mean page confidence (heuristic)",Math.round((q.mean_page_confidence||0)*100)+"%",null)+F("XML validation",v.well_formed?(v.issues&&v.issues.length?v.issues.join("; "):"well-formed, no issues"):"failed",null)
+  +F("Structure",`${v.headings||0} headings, ${v.tables||0} tables, ${v.figures||0} figures`,null)+F("Processing time",(d.seconds||"-")+" s",null)
+  +`<div class="sec">Page diagnostics</div>`+d.pages.map(p=>`<div class="card"><div class="h"><b>Page ${p.n}</b><span>${esc(p.diag.health||"")} &rarr; ${esc(p.source)}</span>${badge((p.diag.confidence||0)*100)}</div><div style="color:var(--mute);font-size:12px">${esc((p.diag.reasons||[]).join("; ")||"native text layer looks healthy")}${p.diag.ocr?` &middot; OCR ${p.diag.ocr.conf}% (${esc(p.diag.ocr.langs)})`:""}</div></div>`).join("")
+  +`<div class="sec">Content blocks</div>`+shown.slice(0,300).map(b=>F(`p${b.page} &middot; ${b.tag}${b.kind?" / "+esc(b.kind):""}`,b.text||`${b.n_items} items`,b.conf)).join("");
+ $("#mf").onchange=e=>{S.filter=e.target.value;side()}}
+function dash(){const s=S.sum;$("#dash").innerHTML=`<div class="grid">${[["Documents",s.documents],["Pages",s.pages],["OCR pages",s.ocr_pages],["Mean confidence*",Math.round((s.mean_confidence||0)*100)+"%"],["Wall time",(s.wall_seconds||0)+" s"]].map(k=>`<div class="kpi"><span style="color:var(--mute)">${k[0]}</span><b>${k[1]}</b></div>`).join("")}</div>
+ <table><tr><th>Document<th>Pages<th>OCR<th>Lang<th>Seconds<th>Confidence*<th>Deck changes<th>Validation</tr>${s.docs.map(d=>`<tr class="c" data-id="${esc(d.id)}"><td>${esc(d.file)}<td>${d.pages}<td>${d.ocr_pages}<td>${esc(d.lang)}<td>${d.seconds}<td>${badge((d.conf||0)*100)}<td>${d.changes}<td>${d.ok?(d.issues.length?esc(d.issues.join("; ")):"OK"):"FAILED"}</tr>`).join("")}</table>
+ <p style="color:var(--mute)">*Confidence values are heuristics, not measured accuracy.</p>`;
+ $("#dash").querySelectorAll("tr.c").forEach(r=>r.onclick=()=>{nav("review");open(r.dataset.id)})}
+function nav(v){$("#main").hidden=v!=="review";$("#dash").hidden=v!=="dash";setActive($("#nv-review"),v==="review");setActive($("#nv-dash"),v==="dash")}
+$("#nv-review").onclick=()=>nav("review");$("#nv-dash").onclick=()=>nav("dash");
+$("#docsel").onchange=e=>W.batch?open(e.target.value).catch(showError):selectWorkspace(e.target.value).catch(showError);
+$("#vtabs").onclick=e=>{const t=e.target.dataset.t;if(!t)return;setView(t)};
+$("#stabs").onclick=e=>{const t=e.target.dataset.t;if(!t)return;S.stab=t;document.querySelectorAll("#stabs .tab").forEach(b=>setActive(b,b.dataset.t===t));if(W.batch)side();else reviewPanel().catch(showError)};
+$("#rot").onclick=()=>{S.rot=(S.rot+90)%360;W.batch?viewer():workspaceViewer()};
+$("#dlxml").onclick=()=>{if(S.id)location.href=W.batch?`/api/doc/${encodeURIComponent(S.id)}/xml?download=1`:`${docUrl()}/xml?download=1`};
+$("#reproc").onclick=async()=>{if(!S.id)return;const b=$("#reproc");b.disabled=true;try{
+ if(W.batch){await J(`/api/reprocess/${encodeURIComponent(S.id)}`,{method:"POST"});await open(S.id)}
+ else{await workspaceFetch(docUrl()+"/retry",{method:"POST"});await selectWorkspace(S.id)}
+ }catch(e){showError(e)}finally{if(W.batch)b.disabled=false}};
+</script><script src="/static/workspace.js"></script></body></html>

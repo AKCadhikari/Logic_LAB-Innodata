@@ -1,0 +1,60 @@
+{
+  "cold_run": {
+    "seconds": 186.8,
+    "exit_code": 0,
+    "workers": 1,
+    "cpu_count": 1,
+    "peak_rss_mb_children": 591
+  },
+  "corpus": {
+    "documents": 13,
+    "succeeded": 13,
+    "pages": 125,
+    "ocr_pages": 40,
+    "decks": 13,
+    "decks_valid": 13,
+    "xml_issues": {}
+  },
+  "xml_vs_golden_example": {
+    "baseline_native_text_layer": {
+      "text_similarity": 0.135,
+      "unit_recall": 0.084,
+      "unit_precision": 0.043,
+      "unit_f1": 0.057,
+      "reading_order_spearman": 0.995,
+      "gold_units": 155,
+      "pred_units": 278,
+      "gold_chars": 24296,
+      "pred_chars": 7384
+    },
+    "docsync": {
+      "text_similarity": 0.951,
+      "unit_recall": 0.606,
+      "unit_precision": 0.45,
+      "unit_f1": 0.516,
+      "reading_order_spearman": 0.836,
+      "gold_units": 155,
+      "pred_units": 209,
+      "gold_chars": 24296,
+      "pred_chars": 24654
+    }
+  },
+  "deck_vs_reference_example": {
+    "before_repair": {
+      "paragraphs": 334,
+      "exact_match": 210,
+      "exact_rate": 0.629,
+      "char_similarity": 0.7454,
+      "shapes_missing": 10,
+      "shapes_extra": 0
+    },
+    "after_repair": {
+      "paragraphs": 334,
+      "exact_match": 213,
+      "exact_rate": 0.638,
+      "char_similarity": 0.7592,
+      "shapes_missing": 6,
+      "shapes_extra": 0
+    }
+  }
+}

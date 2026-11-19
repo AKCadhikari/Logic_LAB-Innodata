@@ -1,0 +1,21 @@
+{
+  "schema_profile": "brief",
+  "lang_format": "iso",
+  "emit_kind": true,
+  "ocr_dpi": 200,
+  "ocr_backend": "glm-ocr",
+  "glm_ocr_url": "http://127.0.0.1:11434",
+  "glm_ocr_model": "glm-ocr:q8_0",
+  "glm_ocr_timeout_s": 90,
+  "glm_ocr_retries": 0,
+  "paddle_ocr_timeout_s": 90,
+  "docling_enabled": true,
+  "workers": 0,
+  "time_budget_s": 6600,
+  "amend_nonlatin_auto": false,
+  "tesseract_cmd": "",
+  "ollama_enabled": false,
+  "ollama_url": "http://127.0.0.1:11434",
+  "ollama_model": "qwen3:4b",
+  "ollama_timeout_s": 12
+}

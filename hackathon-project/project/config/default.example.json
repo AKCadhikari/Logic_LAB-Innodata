@@ -1,0 +1,10 @@
+{
+  "schema_profile": "brief",
+  "lang_format": "iso",
+  "emit_kind": true,
+  "ocr_dpi": 200,
+  "workers": 0,
+  "time_budget_s": 6600,
+  "amend_nonlatin_auto": false,
+  "tesseract_cmd": ""
+}

@@ -1,85 +1,83 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DocuSync AI - review</title>
-<style>
-:root{--bg:#0a1020;--rail:#0c1426;--panel:#0f1a30;--panel2:#13203b;--line:#1f2f4d;--ink:#dbe5f7;--mute:#7f93b6;--acc:#4f8cff;--ok:#2fc58a;--warn:#f0b24a;--bad:#ff6b6b;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:"Segoe UI",system-ui,-apple-system,Roboto,Helvetica,Arial,sans-serif}
-*{box-sizing:border-box}html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font:13px/1.45 var(--sans)}
-button,select,input{font:inherit;color:inherit}
-.app{display:grid;grid-template-columns:56px 1fr;grid-template-rows:56px 1fr;height:100%}
-.rail{grid-row:1/3;background:var(--rail);border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding:10px 0;gap:6px}
-.rail button{width:38px;height:38px;border:0;border-radius:9px;background:none;color:var(--mute);cursor:pointer;display:grid;place-items:center}
-.rail button.on,.rail button:hover{background:var(--panel2);color:var(--acc)}
-.rail svg{width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.7}
-.top{display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--rail)}
-.logo{font-weight:700;letter-spacing:.2px;display:flex;align-items:center;gap:8px}.logo i{width:22px;height:22px;border-radius:6px;background:linear-gradient(135deg,#4f8cff,#2fc58a);display:inline-block}
-.top .sp{flex:1}.chip{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:5px 12px;color:var(--mute);display:flex;gap:7px;align-items:center}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--ok)}.dot.bad{background:var(--bad)}
-select{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:7px 10px;min-width:240px}
-main{min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 410px}
-.pane{min-height:0;display:flex;flex-direction:column;border-right:1px solid var(--line)}
-.tabs{display:flex;gap:4px;padding:0 14px;border-bottom:1px solid var(--line);background:var(--rail);align-items:center}
-.tab{white-space:nowrap;padding:12px 10px;color:var(--mute);cursor:pointer;border:0;background:none;border-bottom:2px solid transparent}
-.tab.on{color:var(--acc);border-color:var(--acc)}
-.tools{margin-left:auto;display:flex;gap:8px;padding:6px 0}
-.btn{white-space:nowrap;border:1px solid var(--line);background:var(--panel);padding:6px 11px;border-radius:8px;cursor:pointer;color:var(--ink)}
-.btn:hover{border-color:var(--acc)}.btn.pri{border-color:#2d5bd0;color:#9bbcff}.btn.warn{border-color:#8a6a2a;color:var(--warn)}
-.viewer{flex:1;overflow:auto;padding:18px;background:#070c18}
-.page{position:relative;margin:0 auto 18px;max-width:860px;background:#fff;border-radius:3px;box-shadow:0 8px 30px #0008}
-.page img{display:block;width:100%;height:auto}.page svg{position:absolute;inset:0;width:100%;height:100%}
-.pl{max-width:860px;margin:0 auto 6px;color:var(--mute);font-size:12px;display:flex;justify-content:space-between}
-.legend{display:flex;gap:10px;flex-wrap:wrap;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel);font-size:12px;color:var(--mute)}
-.legend b{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
-.textview{max-width:860px;margin:0 auto}.tb{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 12px;margin-bottom:8px}
-.tb small{color:var(--mute);font-family:var(--mono);font-size:11px;margin-right:8px}
-.side{min-height:0;display:flex;flex-direction:column;background:var(--panel)}
-.sbar{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--line)}
-.sbody{flex:1;overflow:auto;padding:12px 14px}
-.sec{margin:14px 0 8px;color:var(--mute);font-size:11px;letter-spacing:.8px;text-transform:uppercase}
-.fld{margin-bottom:11px}.fld label{display:flex;gap:7px;align-items:center;color:var(--mute);font-size:12px;margin-bottom:4px}
-.val{background:#0a1326;border:1px solid var(--line);border-radius:9px;padding:9px 11px;word-break:break-word;max-height:150px;overflow:auto;white-space:pre-wrap}
-.val.low{border-color:#6b2c2c;background:#170f16}
-.b{font-size:10.5px;padding:1px 6px;border-radius:5px;font-weight:600}.b.g{background:#12372b;color:var(--ok)}.b.a{background:#3a2e12;color:var(--warn)}.b.r{background:#3b1717;color:var(--bad)}
-pre.xml{margin:0;font:12px/1.5 var(--mono);white-space:pre-wrap;word-break:break-all}.xml .t{color:#7fb4ff}.xml .a{color:#f0b24a}.xml .v{color:#7de0b0}
-.card{border:1px solid var(--line);background:#0b1429;border-radius:10px;padding:10px 12px;margin-bottom:9px}
-.card .h{display:flex;gap:8px;align-items:center;margin-bottom:6px;color:var(--mute);font-size:12px}
-.del{background:#3b1717;color:#ffb1b1;border-radius:4px;padding:0 3px;text-decoration:line-through}.ins{background:#12372b;color:#8ff0c2;border-radius:4px;padding:0 3px}
-.acts{display:flex;gap:6px;margin-top:8px}.acts .btn{padding:3px 9px;font-size:12px}.acts .on{background:#17325a;border-color:var(--acc)}
-.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin:18px}.kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}.kpi b{display:block;font-size:24px;margin-top:4px}
-table{border-collapse:collapse;width:100%}td,th{padding:9px 12px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--mute);font-weight:500}tr.c{cursor:pointer}tr.c:hover{background:var(--panel2)}
-.dash{overflow:auto;padding:0 18px 24px;grid-column:1/3}.empty{color:var(--mute);padding:40px;text-align:center}
-</style></head><body>
+<title>DocuSync AI | Document workspace</title>
+<link rel="stylesheet" href="/static/workspace.css"></head><body>
 <div class="app">
-<nav class="rail">
- <button id="nv-review" class="on" title="Review"><svg viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5M9 13h7M9 17h5"/></svg></button>
- <button id="nv-dash" title="Dashboard"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="4" rx="1"/><rect x="13" y="10" width="7" height="10" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/></svg></button>
-</nav>
-<header class="top"><div class="logo"><i></i>DocuSync&nbsp;AI</div><select id="docsel"></select><div class="sp"></div><div class="chip" id="runchip"><span class="dot"></span><span>no run loaded</span></div></header>
-<main id="main">
- <section class="pane" id="viewpane">
-  <div class="tabs" id="vtabs"><button class="tab" data-t="zoning">Zoning</button><button class="tab" data-t="order">Reading Order</button><button class="tab on" data-t="pdf">Source PDF</button><button class="tab" data-t="text">Text</button>
-   <div class="tools"><button class="btn" id="rot" title="Rotate source view">Rotate</button></div></div>
+<header class="top">
+ <div class="logo"><span class="brand-mark" aria-hidden="true"></span><h1>DocuSync AI</h1></div>
+ <button class="btn" id="settings"><span id="reviewer-label"></span>Settings</button>
+</header>
+<aside class="library" aria-labelledby="library-heading">
+ <h2 id="library-heading">Documents</h2>
+ <button class="btn pri upload" id="upload"><span aria-hidden="true">+</span> Upload PDF</button>
+ <input id="pdf-file" type="file" accept=".pdf,application/pdf" hidden>
+ <label for="docsel">Current document</label>
+ <select id="docsel" aria-label="Document" disabled><option>No documents yet</option></select>
+ <nav class="library-nav" aria-label="Workspace">
+  <button id="nv-review" class="on" aria-pressed="true">Document review</button>
+  <button id="nv-dash" aria-pressed="false" hidden>Run summary</button>
+  <button id="batch">Batch review</button>
+ </nav>
+</aside>
+<main id="main" class="desk">
+ <section class="pane" id="viewpane" aria-labelledby="preview-heading">
+  <header class="pane-heading">
+   <h2 id="preview-heading">Document preview</h2>
+   <div class="chip" id="runchip" role="status"></div>
+  </header>
+  <div class="tabs" id="vtabs" role="group" aria-label="Preview mode">
+   <button class="tab on" data-t="pdf" aria-pressed="true">Source PDF</button>
+   <button class="tab" data-t="text" aria-pressed="false">Extracted text</button>
+   <button class="tab" data-t="zoning" aria-pressed="false">Zoning</button>
+   <button class="tab" data-t="order" aria-pressed="false">Reading order</button>
+  </div>
   <div class="legend" id="legend" hidden></div>
-  <div class="viewer" id="viewer"><div class="empty">Select a document</div></div>
+  <div class="viewer" id="viewer"><div class="empty">Loading documents…</div></div>
+  <footer class="page-controls" aria-label="Page controls">
+   <div class="page-controls-group" id="page-tools" hidden>
+    <button class="btn" id="page-prev" aria-label="Previous page">←</button>
+    <span id="page-label" aria-live="polite"></span>
+    <button class="btn" id="page-next" aria-label="Next page">→</button>
+    <button class="btn" id="zoom-out" aria-label="Zoom out">−</button>
+    <button class="btn" id="zoom-in" aria-label="Zoom in">+</button>
+   </div>
+   <button class="btn" id="rot" title="Rotate source view" disabled>Rotate</button>
+  </footer>
  </section>
- <aside class="side">
-  <div class="tabs" id="stabs"><button class="tab on" data-t="meta">Metadata</button><button class="tab" data-t="xml">XML</button><button class="tab" data-t="deck">Changes</button>
-   <div class="tools"><button class="btn pri" id="dlxml">XML</button><button class="btn warn" id="reproc">Re-process</button></div></div>
+ <aside class="side" aria-labelledby="review-heading">
+  <header class="pane-heading"><h2 id="review-heading">Review &amp; export</h2></header>
+  <div class="tabs" id="stabs" role="group" aria-label="Review panel">
+   <button class="tab on" data-t="meta" aria-pressed="true">Metadata</button>
+   <button class="tab" data-t="xml" aria-pressed="false">XML preview</button>
+   <button class="tab" data-t="deck" aria-pressed="false">Changes</button>
+  </div>
   <div class="sbar" id="sbar"></div>
   <div class="sbody" id="sbody"></div>
+  <footer class="review-actions">
+   <button class="btn" id="reproc" disabled>Reprocess</button>
+   <button class="btn pri" id="dlxml" disabled>Export XML</button>
+  </footer>
  </aside>
 </main>
 <section class="dash" id="dash" hidden></section>
 </div>
+<dialog id="settings-dialog" aria-labelledby="settings-heading">
+ <div class="dialog-heading"><h2 id="settings-heading">Workspace settings</h2><form method="dialog"><button class="btn">Close</button></form></div>
+ <p id="settings-info"></p>
+ <form id="profile-form" class="workspace-tools"><label for="profile-name">Local reviewer</label>
+  <input id="profile-name" maxlength="80" required><button class="btn pri">Save profile</button><output id="profile-status"></output>
+ </form></dialog>
 <script>
 const $=s=>document.querySelector(s),esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const COL={h:"#a77bff",p:"#4f8cff",li:"#2fc58a",ul:"#2fc58a",ol:"#2fc58a",table:"#f0883e",figure:"#ff6fb5",header:"#8a97b1",footer:"#8a97b1",aside:"#e6c84a",hr:"#667"};
-const col=t=>COL[t]||COL[t[0]]||"#4f8cff";
+const COL={h:"#674b88",p:"#21746a",li:"#426c31",ul:"#426c31",ol:"#426c31",table:"#9a5424",figure:"#a44465",header:"#535f70",footer:"#535f70",aside:"#85621d",hr:"#606d66"};
+const col=t=>COL[t]||COL[t[0]]||COL.p;
 const S={docs:[],id:null,data:null,vtab:"pdf",stab:"meta",rot:0,filter:"all",xml:"",changes:[],cfilter:"all"};
 const badge=c=>{const v=Math.round(c);return `<span class="b ${v>=97?"g":v>=80?"a":"r"}">${v}%</span>`};
 async function J(u,o){const r=await fetch(u,o);if(!r.ok)throw new Error(r.status);return r.json()}
 async function init(){
  const sm=await J("/api/summary");S.sum=sm;S.docs=sm.docs;
- $("#docsel").innerHTML=S.docs.map(d=>`<option value="${esc(d.id)}">${esc(d.file||d.id)}  -  ${d.pages} pp${d.ocr_pages?`, ${d.ocr_pages} OCR`:""}</option>`).join("");
+ $("#docsel").disabled=!S.docs.length;
+ $("#docsel").innerHTML=S.docs.map(d=>`<option value="${esc(d.id)}">${esc(d.file||d.id)}  -  ${d.pages} pp${d.ocr_pages?`, ${d.ocr_pages} OCR`:""}</option>`).join("")||"<option>No batch documents</option>";
  $("#runchip").innerHTML=`<span class="dot ${sm.failed?"bad":""}"></span><span>${sm.succeeded??"?"}/${sm.documents} documents OK &middot; ${sm.pages} pages &middot; ${sm.wall_seconds}s</span>`;
  if(S.docs.length)open(S.docs[0].id);else $("#viewer").innerHTML='<div class="empty">No processed documents found in the run directory.</div>';
  dash();
@@ -129,13 +127,15 @@ function dash(){const s=S.sum;$("#dash").innerHTML=`<div class="grid">${[["Docum
  <table><tr><th>Document<th>Pages<th>OCR<th>Lang<th>Seconds<th>Confidence*<th>Deck changes<th>Validation</tr>${s.docs.map(d=>`<tr class="c" data-id="${esc(d.id)}"><td>${esc(d.file)}<td>${d.pages}<td>${d.ocr_pages}<td>${esc(d.lang)}<td>${d.seconds}<td>${badge((d.conf||0)*100)}<td>${d.changes}<td>${d.ok?(d.issues.length?esc(d.issues.join("; ")):"OK"):"FAILED"}</tr>`).join("")}</table>
  <p style="color:var(--mute)">*Confidence values are heuristics, not measured accuracy.</p>`;
  $("#dash").querySelectorAll("tr.c").forEach(r=>r.onclick=()=>{nav("review");open(r.dataset.id)})}
-function nav(v){$("#main").hidden=v!=="review";$("#dash").hidden=v!=="dash";$("#nv-review").classList.toggle("on",v==="review");$("#nv-dash").classList.toggle("on",v==="dash")}
+function nav(v){$("#main").hidden=v!=="review";$("#dash").hidden=v!=="dash";setActive($("#nv-review"),v==="review");setActive($("#nv-dash"),v==="dash")}
 $("#nv-review").onclick=()=>nav("review");$("#nv-dash").onclick=()=>nav("dash");
-$("#docsel").onchange=e=>open(e.target.value);
-$("#vtabs").onclick=e=>{const t=e.target.dataset.t;if(!t)return;S.vtab=t;document.querySelectorAll("#vtabs .tab").forEach(b=>b.classList.toggle("on",b.dataset.t===t));viewer()};
-$("#stabs").onclick=e=>{const t=e.target.dataset.t;if(!t)return;S.stab=t;document.querySelectorAll("#stabs .tab").forEach(b=>b.classList.toggle("on",b.dataset.t===t));side()};
-$("#rot").onclick=()=>{S.rot=(S.rot+90)%360;viewer()};
-$("#dlxml").onclick=()=>{if(S.id)location.href=`/api/doc/${encodeURIComponent(S.id)}/xml?download=1`};
-$("#reproc").onclick=async()=>{if(!S.id)return;const b=$("#reproc");b.textContent="Working...";b.disabled=true;try{await J(`/api/reprocess/${encodeURIComponent(S.id)}`,{method:"POST"});await open(S.id)}finally{b.textContent="Re-process";b.disabled=false}};
-init().catch(e=>{$("#viewer").innerHTML=`<div class="empty">Could not load run data: ${esc(e.message)}</div>`});
-</script></body></html>
+$("#docsel").onchange=e=>W.batch?open(e.target.value).catch(showError):selectWorkspace(e.target.value).catch(showError);
+$("#vtabs").onclick=e=>{const t=e.target.dataset.t;if(!t)return;setView(t)};
+$("#stabs").onclick=e=>{const t=e.target.dataset.t;if(!t)return;S.stab=t;document.querySelectorAll("#stabs .tab").forEach(b=>setActive(b,b.dataset.t===t));if(W.batch)side();else reviewPanel().catch(showError)};
+$("#rot").onclick=()=>{S.rot=(S.rot+90)%360;W.batch?viewer():workspaceViewer()};
+$("#dlxml").onclick=()=>{if(S.id)location.href=W.batch?`/api/doc/${encodeURIComponent(S.id)}/xml?download=1`:`${docUrl()}/xml?download=1`};
+$("#reproc").onclick=async()=>{if(!S.id)return;const b=$("#reproc");b.disabled=true;try{
+ if(W.batch){await J(`/api/reprocess/${encodeURIComponent(S.id)}`,{method:"POST"});await open(S.id)}
+ else{await workspaceFetch(docUrl()+"/retry",{method:"POST"});await selectWorkspace(S.id)}
+ }catch(e){showError(e)}finally{if(W.batch)b.disabled=false}};
+</script><script src="/static/workspace.js"></script></body></html>

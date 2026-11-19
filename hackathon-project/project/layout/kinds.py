@@ -1,6 +1,7 @@
 """Semantic `kind` attribute (bonus marks in the brief) + per-block language tagging."""
 from __future__ import annotations
 import re
+from statistics import median
 from layout.model import DocIR, Block
 from utils.textutil import detect_lang, script_counts
 
@@ -21,8 +22,7 @@ def _pick_title(doc: DocIR):
                 and 6 <= len((b.text or "").strip()) <= 300 and b.kind != "equation"]
         if not cand:
             continue
-        sizes = sorted(b.size for b in cand)
-        med = sizes[len(sizes) // 2]
+        med = median(b.size for b in cand)
         best = max(cand, key=lambda b: (b.size, -(b.bbox[1] if b.bbox else 0)))
         if best.size >= 1.2 * med:
             return best
@@ -40,7 +40,13 @@ def assign_kinds(doc: DocIR) -> None:
             if chosen in page.blocks:
                 i = page.blocks.index(chosen)
                 for nb in page.blocks[i + 1:i + 3]:
-                    if nb.tag == "p" and nb.size and abs(nb.size - chosen.size) < 0.1 * chosen.size and nb.bbox and chosen.bbox and 0 <= nb.bbox[1] - chosen.bbox[3] < 1.5 * chosen.size:
+                    if not nb.bbox or not chosen.bbox:
+                        continue
+                    centers_close = abs(sum(nb.bbox[::2]) - sum(chosen.bbox[::2])) < page.width * 0.05
+                    similar_size = abs(nb.size - chosen.size) < 0.1 * chosen.size
+                    short_centered = (centers_close and 0.78 * chosen.size <= nb.size
+                                      and 1 <= len(nb.text.split()) <= 7 and not nb.text.endswith((".", ":")))
+                    if nb.tag == "p" and (similar_size or short_centered) and 0 <= nb.bbox[1] - chosen.bbox[3] < 1.5 * chosen.size:
                         chosen.text = (chosen.text + " " + nb.text).strip(); chosen.bbox = (min(chosen.bbox[0], nb.bbox[0]), chosen.bbox[1], max(chosen.bbox[2], nb.bbox[2]), nb.bbox[3])
                         chosen.spans = []; page.blocks.remove(nb); break
                 break
@@ -53,6 +59,14 @@ def assign_kinds(doc: DocIR) -> None:
                 b.kind = "figure_caption" if False else b.kind
                 continue
             txt = b.text or " ".join(c.text for c in b.children)
+            if b.tag == "p" and len(txt.split()) <= 3 and (REFS.match(txt) or ACK.match(txt)) and len(txt) < 32:
+                b.tag = "h2"
+            elif section == "references" and not (REFS.match(txt) or ACK.match(txt)):
+                if b.tag in ("p", "h2", "h3", "h4", "h5", "h6", "ul", "ol"):
+                    b.kind = "reference_entry"
+                    if b.tag not in ("ul", "ol"):
+                        b.tag = "p"
+                    continue
             if b is chosen:
                 title_done = True; section = "front"; continue
             if b.tag.startswith("h"):
@@ -68,14 +82,14 @@ def assign_kinds(doc: DocIR) -> None:
                 elif ACK.match(head): section = "acknowledgment"; b.kind = "acknowledgment"
                 else: section = "body"
                 continue
-            if b.tag == "aside":
+            if b.tag == "aside" or b.kind == "equation":
                 continue
             items = b.children if b.tag in ("ul", "ol") else [b]
             for it in items:
                 t = (it.text or "").strip()
                 if b.kind == "figure_caption" or it.kind == "figure_caption":
                     it.kind = "figure_caption"; continue
-                if KEYW.match(t): k = "keywords"
+                if KEYW.match(t) or t.lower().startswith(("mathematics subject classification", "computing classification system")): k = "keywords"
                 elif ABSTRACT.match(t) and section in ("front", "abstract"): k = "abstract"; section = "abstract"
                 elif section == "references": k = "reference_entry"
                 elif section == "abstract": k = "abstract"

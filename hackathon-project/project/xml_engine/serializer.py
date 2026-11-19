@@ -17,14 +17,15 @@ PROFILES = {
 
 
 def _style_key(s: Span):
-    return (s.bold, s.italic, s.sup, s.sub, s.strike, s.link)
+    return (s.bold, s.italic, s.sup, s.sub, s.strike, s.link, s.formula)
 
 
 def _runs(spans: list[Span]) -> list[Span]:
     out: list[Span] = []
     for s in spans:
         if out and _style_key(out[-1]) == _style_key(s):
-            out[-1] = Span(text=out[-1].text + s.text, size=s.size, bold=s.bold, italic=s.italic, sup=s.sup, sub=s.sub, strike=s.strike, link=s.link)
+            out[-1] = Span(text=out[-1].text + s.text, size=s.size, bold=s.bold, italic=s.italic,
+                           sup=s.sup, sub=s.sub, strike=s.strike, link=s.link, formula=s.formula)
         else:
             out.append(Span(**{**s.__dict__}))
     return out
@@ -44,6 +45,7 @@ def _inline(el: etree._Element, text: str, spans: list[Span]):
         if not t:
             continue
         wrappers = []
+        if r.formula: wrappers.append(("span", {"kind": "equation"}))
         if r.link: wrappers.append(("a", {"href": xml_safe(r.link)}))
         if r.bold and not base_bold and t.strip(): wrappers.append(("strong", {}))
         if r.italic and not base_ital and t.strip(): wrappers.append(("em", {}))
@@ -74,16 +76,21 @@ def _attrs(b: Block, cfg, doc_lang: str, settings) -> dict:
     return a
 
 
-def _emit(parent, b: Block, cfg, doc_lang, settings):
+def _emit(parent, b: Block, cfg, doc_lang, settings, nodes):
     t = b.tag
     if t in ("ul", "ol"):
         el = etree.SubElement(parent, t, **_attrs(b, cfg, doc_lang, settings))
         for li in b.children:
             e = etree.SubElement(el, "li", **_attrs(li, cfg, doc_lang, settings)); _inline(e, li.text, li.spans)
+            if nodes is not None:
+                nodes[id(li)] = e
     elif t == "table":
         el = etree.SubElement(parent, "table", **({"data-bbox": ",".join(f"{v:.1f}" for v in b.bbox)} if settings.emit_bbox and b.bbox else {}))
         if b.caption:
-            etree.SubElement(el, "caption").text = xml_safe(b.caption)
+            caption = etree.SubElement(el, "caption")
+            caption.text = xml_safe(b.caption)
+            if nodes is not None:
+                nodes[(id(b), "caption")] = caption
         rows: dict[int, list] = {}
         for c in b.cells:
             rows.setdefault(c.row, []).append(c)
@@ -96,7 +103,10 @@ def _emit(parent, b: Block, cfg, doc_lang, settings):
                 at = {}
                 if c.rowspan > 1: at["rowspan"] = str(c.rowspan)
                 if c.colspan > 1: at["colspan"] = str(c.colspan)
-                etree.SubElement(tr, "th" if c.header else "td", **at).text = xml_safe(c.text)
+                cell = etree.SubElement(tr, "th" if c.header else "td", **at)
+                cell.text = xml_safe(c.text)
+                if nodes is not None:
+                    nodes[id(c)] = cell
     elif t == "figure":
         el = etree.SubElement(parent, "figure", **({"class": b.cls} if b.cls in ("stamp", "handwritten") else {}))
         etree.SubElement(el, "img", alt=xml_safe(b.alt or "Figure"))
@@ -104,21 +114,32 @@ def _emit(parent, b: Block, cfg, doc_lang, settings):
             fc = etree.SubElement(el, "figcaption")
             if settings.emit_kind: fc.set("kind", "figure_caption")
             fc.text = xml_safe(b.caption)
+            if nodes is not None:
+                nodes[(id(b), "caption")] = fc
     elif t in ("header", "footer"):
         el = etree.SubElement(parent, t, **_attrs(b, cfg, doc_lang, settings)); _inline(el, b.text, b.spans)
     else:
         tag = t if t in BLOCK_TAGS else "p"
         el = etree.SubElement(parent, tag, **_attrs(b, cfg, doc_lang, settings)); _inline(el, b.text, b.spans)
+    if nodes is not None:
+        nodes[id(b)] = el
 
 
-def to_xml(doc: DocIR, settings) -> bytes:
+def to_xml(doc: DocIR, settings, locations: dict | None = None, assets: dict | None = None) -> bytes:
+    if settings.schema_profile == "sample":
+        from xml_engine.sample import sample_xml
+        return sample_xml(doc, settings, locations, assets)
     cfg = PROFILES.get(settings.schema_profile, PROFILES["brief"])
     root = etree.Element("document", lang=lang_attr(doc.lang, settings.lang_format))
+    nodes = {} if locations is not None else None
     for p in doc.pages:
         at = {cfg["page_attr"]: str(p.n)}
         if cfg["page_dims"]:
             at.update(height=f"{p.height:.2f}", width=f"{p.width:.2f}")
         pe = etree.SubElement(root, "page", **at)
         for b in p.blocks:
-            _emit(pe, b, cfg, doc.lang, settings)
+            _emit(pe, b, cfg, doc.lang, settings, nodes)
+    if locations is not None:
+        tree = root.getroottree()
+        locations.update((key, tree.getpath(node)) for key, node in nodes.items())
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", pretty_print=True)

@@ -2,10 +2,12 @@
 (2) document-version comparison (added / deleted / modified / moved paragraphs) with a machine-readable report."""
 from __future__ import annotations
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import Levenshtein
+from layout.model import DocIR
 
 TOK = re.compile(r"\s+|\d+(?:[.,]\d+)*|[\u3040-\u30ff\u3400-\u9fff]|[^\W\d_\u3040-\u30ff\u3400-\u9fff]+|[^\w\s]|_", re.U)
 WORD = re.compile(r"\w", re.U)
@@ -131,23 +133,98 @@ def compare_documents(old_units: list[dict], new_units: list[dict], doc_id: str 
     o_txt = [ws_lower(u["text"]) for u in old_units]
     n_txt = [ws_lower(u["text"]) for u in new_units]
     used_new: set[int] = set()
+    positions = defaultdict(list)
+    for j, text in enumerate(n_txt):
+        if text:
+            positions[text].append(j)
+    exact = {}
+    for i, text in enumerate(o_txt):
+        same = [j for j in positions.get(text, ()) if j not in used_new]
+        if same:
+            j = min(same, key=lambda j: (new_units[j].get("page") != old_units[i].get("page"), abs(j - i)))
+            exact[i] = (text, 100.0, j)
+            used_new.add(j)
     for i, ot in enumerate(o_txt):
         if not ot:
             continue
-        r = process.extractOne(ot, n_txt, scorer=fuzz.ratio, score_cutoff=thr_mod)
-        if not r:
+        match = exact.get(i)
+        ambiguous = False
+        if match is None:
+            candidates = {j: text for j, text in enumerate(n_txt) if j not in used_new and text}
+            matches = process.extract(ot, candidates, scorer=fuzz.ratio, score_cutoff=thr_mod, limit=2)
+            if matches:
+                match = matches[0]
+                ambiguous = len(matches) == 2 and matches[0][1] - matches[1][1] < 5
+        if match is None:
             changes.append(_rec(doc_id, "deleted", old_units[i], None, 0.9, "remove from dependent documents"))
             continue
-        j, score = r[2], r[1]
+        _, score, j = match
         used_new.add(j)
         if score >= thr_same:
             if old_units[i].get("page") != new_units[j].get("page"):
                 changes.append(_rec(doc_id, "moved", old_units[i], new_units[j], score / 100, "relocate dependent content"))
         else:
-            changes.append(_rec(doc_id, "modified", old_units[i], new_units[j], score / 100, "update dependent content"))
+            record = _rec(doc_id, "modified", old_units[i], new_units[j], score / 100, "update dependent content")
+            if ambiguous:
+                record["reason"] = "Multiple source passages have similar match scores."
+            changes.append(record)
     for j, u in enumerate(new_units):
         if j not in used_new and n_txt[j]:
             changes.append(_rec(doc_id, "added", None, u, 0.9, "add to dependent documents"))
+    return changes
+
+
+def compare_ir(old: DocIR, new: DocIR) -> list[dict]:
+    """Compare reviewed document content, preserving page and section references."""
+    def groups(doc: DocIR) -> dict[str, list[dict]]:
+        result = {"text": [], "table": [], "figure": [], "structure": []}
+        for page in doc.pages:
+            for index, block in enumerate(page.blocks):
+                location = {"page": page.n, "idx": index, "verified_source":
+                            block.source == "native" and not page.requires_review
+                            and page.diag.get("health", "healthy") == "healthy"}
+                if block.tag == "table":
+                    grid = "\n".join(
+                        f"{cell.row},{cell.col} ({cell.rowspan}×{cell.colspan}): {cell.text}"
+                        for cell in block.cells
+                    )
+                    result["table"].append({**location, "text": f"{block.caption}\n{grid}"})
+                elif block.tag == "figure":
+                    result["figure"].append({**location, "text": block.caption or block.alt or "Figure",
+                                             "fingerprint": block.fingerprint})
+                else:
+                    content = block.text or "\n".join(child.text for child in block.children)
+                    result["text"].append({**location, "text": content})
+                if block.tag != "p" or block.kind not in ("", "body"):
+                    result["structure"].append({**location, "text": f"{block.tag} {block.kind}".strip()})
+        return result
+
+    before, after = groups(old), groups(new)
+    frequency = Counter(ws_lower(unit["text"]) for unit in before["text"])
+    trustworthy = [{(unit["page"], unit["idx"]) for unit in group["text"] if unit["verified_source"]}
+                   for group in (before, after)]
+    changes = []
+    for kind in before:
+        for change in compare_documents(before[kind], after[kind], new.doc_id, thr_same=100):
+            eligible = (kind == "text" and change["change_type"] == "modified" and change["confidence"] >= 0.85
+                        and not change.get("reason")
+                        and frequency[ws_lower(change["old_content"])] == 1)
+            if eligible and not all((change[key]["page"], change[key]["idx"]) in locations
+                                    for key, locations in zip(("original_location", "new_location"), trustworthy)):
+                eligible = False
+                change["reason"] = "OCR-derived or unverified text changes require review before slide updates."
+            changes.append({**change, "category": kind, "can_sync": eligible})
+    new_figures = {(unit["page"], unit["idx"]): unit for unit in after["figure"]}
+    for unit in before["figure"]:
+        replacement = new_figures.get((unit["page"], unit["idx"]))
+        if (replacement and unit["text"] == replacement["text"] and unit["fingerprint"]
+                and replacement["fingerprint"] and unit["fingerprint"] != replacement["fingerprint"]):
+            changes.append({**_rec(new.doc_id, "modified", unit, replacement, 1, "review"),
+                            "category": "figure appearance"})
+    for field, a, b in (("language", old.lang, new.lang), ("page count", len(old.pages), len(new.pages))):
+        if a != b:
+            changes.append({**_rec(new.doc_id, "modified", {"text": str(a)}, {"text": str(b)}, 1, "review"),
+                            "category": field})
     return changes
 
 

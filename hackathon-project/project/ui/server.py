@@ -17,6 +17,14 @@ _img_cache: dict = {}
 _lock = threading.Lock()
 
 
+@app.before_request
+def reject_cross_site_writes():
+    origin = request.headers.get("Origin")
+    if (request.method in ("POST", "PATCH", "PUT", "DELETE") and origin
+            and origin.rstrip("/") != request.host_url.rstrip("/")):
+        return jsonify(error="Open DocuSync directly to change the workspace."), 403
+
+
 def _ids() -> list[str]:
     d = CFG["run"] / "ir"
     return sorted(p.stem for p in d.glob("*.json")) if d.exists() else []
@@ -94,22 +102,44 @@ def doc(doc_id):
 @app.get("/api/doc/<doc_id>/page/<int:n>.png")
 def page_png(doc_id, n):
     ir = _ir(doc_id)
-    dpi = min(max(int(request.args.get("dpi", 110)), 40), 220)
-    rot = int(request.args.get("rot", 0)) % 360
-    key = (doc_id, n, dpi, rot)
+    return render_page(_pdf_path(doc_id, ir), n)
+
+
+@app.get("/api/documents/<document_id>/page/<int:n>.png")
+def workspace_page(document_id, n):
+    workspace = app.extensions.get("workspace")
+    if workspace is None or workspace.get(document_id) is None:
+        abort(404)
+    return render_page(workspace.source(document_id), n)
+
+
+def render_page(path: Path, n: int):
+    dpi = min(max(request.args.get("dpi", 110, type=int), 40), 220)
+    rot = request.args.get("rot", 0, type=int) % 360
+    if rot % 90:
+        abort(400, "Rotation must be a multiple of 90 degrees.")
+    key = (path, n, dpi, rot)
     with _lock:
         if key not in _img_cache:
             import pymupdf
-            d = pymupdf.open(str(_pdf_path(doc_id, ir)))
-            if not 1 <= n <= d.page_count:
-                abort(404)
-            pg = d[n - 1]
-            if rot:
-                pg.set_rotation((pg.rotation + rot) % 360)
-            _img_cache[key] = pg.get_pixmap(dpi=dpi).tobytes("png"); d.close()
-            if len(_img_cache) > 80:
+            try:
+                with pymupdf.open(str(path)) as d:
+                    if d.needs_pass:
+                        abort(422, "This PDF requires a password.")
+                    if not 1 <= n <= d.page_count:
+                        abort(404)
+                    pg = d[n - 1]
+                    if rot:
+                        pg.set_rotation((pg.rotation + rot) % 360)
+                    if pg.rect.width * pg.rect.height * (dpi / 72) ** 2 > 20_000_000:
+                        abort(422, "The page is too large to preview at this scale.")
+                    _img_cache[key] = pg.get_pixmap(dpi=dpi).tobytes("png")
+            except (pymupdf.FileDataError, OSError):
+                abort(422, "This PDF cannot be rendered.")
+            if len(_img_cache) > 24:
                 _img_cache.pop(next(iter(_img_cache)))
-    return Response(_img_cache[key], mimetype="image/png")
+        data = _img_cache[key]
+    return Response(data, mimetype="image/png")
 
 
 @app.get("/api/doc/<doc_id>/xml")
@@ -159,8 +189,8 @@ def reprocess(doc_id):
     from config.settings import Settings
     from agents.orchestrator import process_pdf
     from utils.logs import AuditLog
-    res = process_pdf(_pdf_path(doc_id, ir), Settings.load(), CFG["output"], CFG["run"], AuditLog(CFG["run"] / "audit.jsonl"))
     with _lock:
+        res = process_pdf(_pdf_path(doc_id, ir), Settings.load(), CFG["output"], CFG["run"], AuditLog(CFG["run"] / "audit.jsonl"))
         _img_cache.clear()
     return jsonify({"ok": res.get("ok"), "seconds": res.get("seconds")})
 
@@ -170,11 +200,26 @@ def main():
     ap.add_argument("--run-dir", default=str(HERE.parents[1] / "phase-1" / "docsync_run"))
     ap.add_argument("--input", default=str(HERE.parents[1] / "phase-1" / "input"))
     ap.add_argument("--output", default=str(HERE.parents[1] / "phase-1" / "output"))
+    ap.add_argument("--storage", default=str(HERE.parents[1] / "storage"))
+    ap.add_argument("--config", help="Path to local document processing settings")
     ap.add_argument("--port", type=int, default=8765)
     a = ap.parse_args()
     CFG.update(run=Path(a.run_dir).resolve(), input=Path(a.input).resolve(), output=Path(a.output).resolve())
+    configure_workspace(Path(a.storage).resolve(), a.config)
     print(f"DocuSync review UI on http://127.0.0.1:{a.port}  (run dir: {CFG['run']})")
     app.run(host="127.0.0.1", port=a.port, debug=False, threaded=True)
+
+
+def configure_workspace(storage: Path, config: str | None = None):
+    from config.settings import Settings
+    from ui.workspace import Workspace
+    from ui.workspace_routes import api
+
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
+    app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
+    app.extensions["workspace"] = Workspace(storage, Settings.load(config))
+    if api.name not in app.blueprints:
+        app.register_blueprint(api)
 
 
 if __name__ == "__main__":

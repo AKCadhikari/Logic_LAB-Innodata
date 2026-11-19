@@ -93,8 +93,9 @@ def test_unreadable_pdf_does_not_stop_batch(tmp_path, settings, audit):
 
 
 def test_ocr_fallback_on_image_only_page(tmp_path, settings, audit):
-    import shutil
-    if not shutil.which("tesseract"):
+    settings.ocr_backend = "tesseract"
+    from ocr.engine import available_langs
+    if "eng" not in available_langs(settings):
         import pytest; pytest.skip("tesseract not installed")
     src = make_pdf(tmp_path / "t.pdf", [lambda p: paragraph(p, 100, "Scanned documents require optical character recognition to be readable.", size=16)])
     pix = pymupdf.open(str(src))[0].get_pixmap(dpi=200)

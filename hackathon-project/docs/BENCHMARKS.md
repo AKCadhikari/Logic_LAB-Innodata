@@ -1,5 +1,9 @@
 # Benchmarks (measured with `project/tests/benchmark.py`; raw numbers in `benchmark_results.json`)
 
+This file records the historical Linux run. The [implementation roadmap](../../docs/IMPLEMENTATION_ROADMAP.md)
+records the Windows synthetic run and browser verification separately. Windows process memory is now sampled
+with psutil, so those memory figures use a different method.
+
 Environment: Linux VM, **1 CPU core**, 3 GB RAM, Python 3.12, Tesseract 5. Not the target hardware (Windows 11, Ryzen 3).
 
 ## Throughput (cold cache, 1 worker)

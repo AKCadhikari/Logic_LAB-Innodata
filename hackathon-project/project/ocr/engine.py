@@ -18,9 +18,10 @@ class OCRUnavailable(RuntimeError):
 def find_tesseract(settings) -> str:
     cand = settings.tesseract_cmd or os.environ.get("TESSERACT_CMD") or shutil.which("tesseract")
     if not cand and sys.platform.startswith("win"):
-        for p in (r"C:\Program Files\Tesseract-OCR\tesseract.exe", r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"):
+        for p in (Path(sys.prefix) / "tesseract" / "tesseract.exe",
+                  r"C:\Program Files\Tesseract-OCR\tesseract.exe", r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"):
             if Path(p).exists():
-                cand = p; break
+                cand = str(p); break
     if not cand:
         raise OCRUnavailable("Tesseract not found. Install it (see README) or set tesseract_cmd / TESSERACT_CMD.")
     return cand
@@ -28,8 +29,11 @@ def find_tesseract(settings) -> str:
 
 def available_langs(settings) -> set[str]:
     try:
-        out = subprocess.run([find_tesseract(settings), "--list-langs"], capture_output=True, text=True, timeout=30).stdout
-        return {l.strip() for l in out.splitlines()[1:] if l.strip()}
+        result = _run([find_tesseract(settings), "--list-langs"], None, 5, settings)
+        if result.returncode:
+            return set()
+        out = result.stdout.decode("utf-8", "replace")
+        return {line.strip() for line in out.splitlines()[1:] if line.strip()}
     except Exception:
         return set()
 
@@ -47,6 +51,8 @@ def tess_langs(lang_code: str, installed: set[str] | None = None) -> str:
 
 def render_gray(page, dpi: int) -> np.ndarray:
     import pymupdf
+    if page.rect.width * page.rect.height * (dpi / 72) ** 2 > 25_000_000:
+        raise ValueError("Page exceeds the OCR render limit.")
     pix = page.get_pixmap(matrix=pymupdf.Matrix(dpi / 72, dpi / 72), colorspace=pymupdf.csGRAY, alpha=False)
     return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).copy()
 
@@ -157,12 +163,12 @@ def ocr_page(page, lang_code: str, dpi: int, settings, installed: set[str] | Non
     img, info = preprocess(gray, settings, orient=orient, deskew=deskew)
     info["dpi"] = dpi
     langs = tess_langs(lang_code, installed)
-    if lang_code in ("und", "", None) and info.get("osd_script") in _SCRIPT_PACK:
+    if info.get("osd_script") in _SCRIPT_PACK:
         langs = _SCRIPT_PACK[info["osd_script"]]
         if installed:
             langs = "+".join(l for l in langs.split("+") if l in installed) or "eng"
     info["langs"] = langs
-    if info.get("rotate") in (90, 270):
+    if info.get("rotate"):
         info["note"] = "page rotated by OCR preprocessing; bbox are in rotated space"
     lines = ocr_image(img, langs, dpi, settings)
     if not lines:                                   # photo / sparse layouts: retry with sparse-text mode on the raw render
@@ -178,12 +184,13 @@ def pick_language(page, settings, installed: set[str] | None, dpi: int = 130) ->
     img, info = preprocess(gray, settings, orient=True, deskew=False)
     routed = _SCRIPT_PACK.get(info.get("osd_script", ""), None)
     cands = []
-    for pk in ([routed] if routed else []) + ["ara+eng", LATIN_ALL]:
+    other = ["ara+eng", LATIN_ALL] if routed else ["ara+eng", LATIN_ALL, "jpn+eng", "kor+eng"]
+    for pk in ([routed] if routed else []) + other:
         pk = "+".join(l for l in pk.split("+") if not installed or l in installed)
         if pk and pk not in cands:
             cands.append(pk)
     best, best_score, best_text = None, -1.0, ""
-    for pk in cands[:3]:
+    for pk in cands:
         try:
             lines = ocr_image(img, pk, dpi, settings)
         except Exception:

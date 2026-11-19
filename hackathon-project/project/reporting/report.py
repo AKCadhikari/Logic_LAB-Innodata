@@ -21,12 +21,12 @@ def write_reports(work_dir: Path, results: list[dict], amend: list[dict], settin
         f"<td>{r.get('seconds','')}</td><td>{r.get('quality',{}).get('mean_page_confidence','')}</td>"
         f"<td>{html.escape('; '.join(r.get('validation',{}).get('issues',[])) or r.get('error','') or 'ok')}</td></tr>" for r in results)
     arows = "".join(
-        f"<tr><td>{html.escape(a.get('pptx',''))}</td><td>{a.get('slides','')}</td><td>{a.get('applied',0)}</td><td>{a.get('review',0)}</td><td>{html.escape(a.get('output',''))}</td></tr>" for a in amend)
+        f"<tr><td>{html.escape(a.get('pptx',''))}</td><td>{a.get('slides','')}</td><td>{a.get('applied',0)}</td><td>{a.get('review',0)}</td><td>{html.escape(a.get('output') or '')}</td><td>{html.escape(a.get('error') or a.get('status',''))}</td></tr>" for a in amend)
     page = f"""<!doctype html><meta charset=utf-8><title>DocuSync AI run report</title>
 <style>body{{font:14px system-ui;margin:2rem;background:#0b1220;color:#dbe4f3}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}
 td,th{{border-bottom:1px solid #22304a;padding:.45rem .6rem;text-align:left}}th{{color:#7fa6ff}}h1,h2{{font-weight:600}}</style>
 <h1>DocuSync AI - run report</h1><p>{summary['succeeded']}/{summary['documents']} documents, {summary['pages']} pages ({summary['ocr_pages']} OCR), {summary['wall_seconds']} s wall clock.</p>
 <h2>Documents</h2><table><tr><th>File<th>Pages<th>OCR pages<th>Lang<th>Seconds<th>Mean confidence (heuristic)<th>Validation</tr>{rows}</table>
-<h2>Presentation amendments</h2><table><tr><th>Deck<th>Slides<th>Auto-applied<th>Flagged for review<th>Output</tr>{arows}</table>"""
+<h2>Presentation amendments</h2><table><tr><th>Deck<th>Slides<th>Auto-applied<th>Flagged for review<th>Output<th>Status</tr>{arows}</table>"""
     (work_dir / "report.html").write_text(page, encoding="utf-8")
     return summary

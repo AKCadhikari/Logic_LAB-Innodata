@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+import pymupdf
+import pytest
+from lxml import etree
+from pydantic import ValidationError
+
+from agents.orchestrator import process_pdf
+from layout.docling_adapter import apply_regions
+from layout.model import Block, DocIR, PageIR, ir_from_dict
+from ocr import glm, paddle
+from ocr.recognition import RecognitionError
+from ocr.router import OCRRouter
+
+
+def fixture_pdf(path, *, scanned):
+    with pymupdf.open() as pdf:
+        page = pdf.new_page()
+        page.insert_text((60, 70), "Verification of a scanned document and its scientific details.", fontsize=16)
+        if scanned:
+            with pymupdf.open() as output:
+                output.new_page().insert_image(page.rect, pixmap=page.get_pixmap(dpi=150))
+                output.save(path)
+        else:
+            pdf.save(path)
+
+
+def test_native_pages_bypass_both_engines(tmp_path, settings, audit, monkeypatch):
+    settings.docling_enabled = False
+    def fail(*args):
+        pytest.fail("Native text must not invoke OCR.")
+    monkeypatch.setattr(glm, "model_info", fail)
+    monkeypatch.setattr(paddle.PaddleOCR, "recognise", fail)
+    source = tmp_path / "native.pdf"
+    fixture_pdf(source, scanned=False)
+    report = process_pdf(source, settings, tmp_path / "out", tmp_path / "run", audit)
+    assert report["ok"] and not report["page_log"][0]["ocr_required"]
+
+
+def test_glm_page_flows_through_ir_and_xml(tmp_path, settings, audit, monkeypatch):
+    settings.docling_enabled = False
+    monkeypatch.setattr(glm, "model_info", lambda settings: {"ready": True})
+    def recognise(page, dpi, settings):
+        raw = {"done": True, "model": "glm-ocr:q8_0",
+               "response": "# Sample heading\n\nA documented result.\n\n"
+                           "<table><tr><th>Metric</th><th>Value</th></tr><tr><td>μ</td><td>42</td></tr></table>"
+                           "\n\n$$E = mc^2$$"}
+        return glm.parse(page.number + 1, raw)
+    monkeypatch.setattr(glm, "recognise", recognise)
+    monkeypatch.setattr(paddle.PaddleOCR, "recognise", lambda *args: pytest.fail("Accepted GLM result already exists."))
+    source = tmp_path / "scan.pdf"
+    fixture_pdf(source, scanned=True)
+    stages = []
+    result = process_pdf(source, settings, tmp_path / "out", tmp_path / "run", audit, processing=stages.append)
+    assert result["ok"] and result["page_log"][0]["ocr"]["engine"] == "glm-ocr"
+    assert [step["stage"] for step in stages] == ["diagnostics", "ocr", "layout", "validation"]
+    xml = etree.parse(str(tmp_path / "out" / "scan.xml"))
+    assert xml.findtext(".//table/tbody/tr/td") == "μ"
+    assert xml.findtext(".//p[@kind='equation']") == "E = mc^2"
+    assert (tmp_path / "run" / "recognition" / "scan" / "page-0001-1-glm-ocr.json").is_file()
+    assert result["page_log"][0]["confidence"] is None
+
+
+@pytest.mark.parametrize("failure", ["timeout", "empty", "table"])
+def test_paddle_runs_after_failed_glm_only(tmp_path, settings, monkeypatch, failure):
+    monkeypatch.setattr(glm, "model_info", lambda settings: {"ready": True})
+    def recognise(page, dpi, settings):
+        if failure == "timeout":
+            raise RecognitionError("GLM-OCR timed out.")
+        content = "" if failure == "empty" else "<table><tr><td>Incomplete</td></tr>"
+        return glm.parse(1, {"done": True, "response": content})
+    monkeypatch.setattr(glm, "recognise", recognise)
+    monkeypatch.setattr(paddle.PaddleOCR, "recognise", lambda *args:
+                        paddle.parse(1, [["Verified words"], [.98], [[[10, 12], [80, 12], [80, 23], [10, 23]]]], 144, "test"))
+    calls = []
+    with pymupdf.open() as pdf:
+        result, info = OCRRouter(settings, tmp_path).recognise(pdf.new_page(), "en", 180, {}, calls.append)
+    assert calls == ["glm-ocr", "paddleocr"] and info["engine"] == "paddleocr"
+    assert info["attempts"][0]["status"] == "rejected"
+    assert result.lines[0].bbox == (5, 6, 40, 11.5)
+
+
+def test_failed_page_remains_in_xml_and_is_marked_for_review(tmp_path, settings, audit, monkeypatch):
+    settings.docling_enabled = False
+    monkeypatch.setattr(glm, "model_info", lambda settings: {"ready": False, "reason": "GLM-OCR offline"})
+    def unavailable(*args):
+        raise RecognitionError("PaddleOCR unavailable.", unavailable=True)
+    monkeypatch.setattr(paddle.PaddleOCR, "recognise", unavailable)
+    source = tmp_path / "scan.pdf"
+    fixture_pdf(source, scanned=True)
+    result = process_pdf(source, settings, tmp_path / "out", tmp_path / "run", audit)
+    assert result["ok"] and result["page_log"][0]["review_required"] and result["quality"]["review_pages"] == [1]
+    xml = etree.parse(str(tmp_path / "out" / "scan.xml"))
+    assert xml.find("page").get("n") == "1"
+
+
+def test_docling_enrichment_keeps_ocr_text_and_uses_matched_geometry():
+    page = PageIR(1, 612, 792, [Block("p", "Same extracted title", source="ocr")], source="ocr")
+    region = {"kind": "title", "text": "Same extracted title", "bbox": (40, 42, 100, 65)}
+    assert apply_regions(page, [region]) == 1
+    assert (page.blocks[0].text, page.blocks[0].tag, page.blocks[0].bbox) == (
+        "Same extracted title", "h1", region["bbox"])
+
+
+def test_ir_rejects_disordered_pages_and_invalid_geometry():
+    doc = DocIR("example", "example.pdf", pages=[PageIR(1, 612, 792)]).to_dict()
+    doc["pages"][0]["n"] = 2
+    with pytest.raises(ValidationError, match="numbered"):
+        ir_from_dict(doc)
+    with pytest.raises(ValidationError, match="Bounding box"):
+        Block("p", "invalid", bbox=(30, 20, 10, 40))

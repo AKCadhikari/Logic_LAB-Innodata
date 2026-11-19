@@ -1,16 +1,18 @@
-"""Central orchestrator. The "agents" are deterministic stage workers sharing one structured state; every
-delegation and decision is written to the audit log.  No LLM is required (and none is used) - see docs for why."""
+"""Document diagnostics, local OCR, layout reconstruction and validated XML."""
 from __future__ import annotations
 import json, os, time, traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Callable
 
 from config.settings import Settings
 from diagnostics.page_diagnostics import analyze_page
 from ingestion.discover import describe
-from layout.model import PageIR, DocIR, Line, Block, Span
+from layout.model import PageIR, DocIR, Line, Block, Span, ir_from_dict
 from layout import native, reconstruct, kinds, figures
+from layout.docling_adapter import DoclingLayout
 from ocr import engine as ocr
+from ocr.router import OCRRouter
 from quality.qa import page_confidence, doc_quality
 from utils.cache import Cache, file_key
 from utils.logs import AuditLog
@@ -51,13 +53,22 @@ def _text_of(lines) -> str:
     return " ".join(l.text for l in lines)
 
 
-def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, audit: AuditLog, deadline: float | None = None) -> dict:
+def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, audit: AuditLog,
+                deadline: float | None = None, progress: Callable[[int, int], None] | None = None,
+                processing: Callable[[dict], None] | None = None) -> dict:
     import pymupdf
     from rapidfuzz import fuzz
     t0 = time.time()
     doc_id = pdf.stem
     res = {"doc_id": doc_id, "file": pdf.name, "ok": False, "pages": 0, "error": "", "page_log": []}
     cache = Cache(work_dir / settings.cache_dir, settings.use_cache)
+    router = OCRRouter(settings, work_dir / "recognition" / doc_id)
+    layout = DoclingLayout(settings)
+
+    def stage(name: str, **values) -> None:
+        if processing:
+            processing({"stage": name, **values})
+
     fkey = file_key(pdf)
     try:
         doc = pymupdf.open(str(pdf))
@@ -66,8 +77,19 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
         res["error"] = f"cannot open: {e}"
         _write_xml(out_dir, pdf, b'<?xml version="1.0" encoding="UTF-8"?>\n<document lang="und"/>\n')
         return res
+    if doc.needs_pass:
+        doc.close()
+        res["error"] = "PDF is encrypted and requires a password."
+        return res
     n = doc.page_count
+    if not n:
+        doc.close()
+        res["error"] = "PDF contains no pages."
+        return res
+    if progress:
+        progress(0, n)
     res["pages"] = n
+    stage("diagnostics")
     audit.event("analysis", "start", doc=doc_id, pages=n)
     # ---- Document Analysis agent: per-page diagnostics ------------------------------------------
     diags = []
@@ -87,14 +109,49 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
         d = diags[i]; tp = time.time()
         fast = bool(deadline and time.time() > deadline)
         dpi = settings.ocr_dpi_fast if fast else settings.ocr_dpi
-        rec = {"n": i + 1, "w": d["width"], "h": d["height"], "lines": [], "tables": [], "figs": [], "source": "native", "diag": d}
+        rec = {"n": i + 1, "w": d["width"], "h": d["height"], "lines": [], "tables": [], "figs": [],
+               "source": "native", "diag": d, "blocks": None}
         try:
             page = doc[i]
             decision = d["decision"]
             if fast and decision == "compare":
                 decision = "native"; d["reasons"].append("fast mode: compare skipped")
-            can_ocr = settings.ocr_enabled
-            if decision in ("ocr", "compare") and can_ocr:
+            if decision != "native" and settings.ocr_enabled and settings.ocr_backend == "glm-ocr":
+                result, info = router.recognise(page, lang, dpi, d,
+                                               lambda engine: stage("ocr", page=i + 1, engine=engine))
+                d["ocr"] = info
+                if result and decision == "compare":
+                    native_text = page.get_text()
+                    similarity = fuzz.token_set_ratio(norm_cmp(native_text), norm_cmp(result.text())) / 100
+                    d["compare_similarity"] = round(similarity, 3)
+                    if similarity >= settings.native_vs_ocr_min_similarity:
+                        d["reasons"].append("Kept native text after comparing OCR.")
+                        result = None
+                    else:
+                        d["reasons"].append("OCR and native text disagree. Review before relying on the result.")
+                        info["requires_review"] = True
+                if result and d.get("mixed_content"):
+                    similarity = fuzz.partial_ratio(norm_cmp(page.get_text()).strip(), norm_cmp(result.text()))
+                    if similarity < settings.native_vs_ocr_min_similarity * 100:
+                        d["reasons"].append("The OCR result could not corroborate the sparse native text.")
+                        info["requires_review"] = True
+                if info.get("review_reason"):
+                    d["reasons"].append(info["review_reason"])
+                audit.event("ocr", "selection", doc=doc_id, page=i + 1, **info)
+                if result:
+                    rec["lines"], rec["blocks"], rec["source"] = result.lines, result.blocks or None, "ocr"
+                    if lang == "und":
+                        lang = detect_lang(result.text())
+                    if d["health"] != "absent":
+                        rec["figs"] = native.extract_figures(page, settings, [])
+                        if rec["lines"] and not d["rotation"]:
+                            rec["lines"] = native.recover_running_text(page, rec["lines"], settings.header_band)
+                else:
+                    rec["lines"] = native.extract_lines(page)
+                    if info["requires_review"]:
+                        d["reasons"].append("OCR requires manual review. The source page and any native text were retained.")
+            elif decision in ("ocr", "compare") and settings.ocr_enabled and settings.ocr_backend == "tesseract" and _installed(settings):
+                stage("ocr", page=i + 1, engine="tesseract")
                 deskew = d["health"] == "absent" and d["image_coverage"] > 0.6
                 if lang == "und":                   # undetermined doc: pick the OCR language pack by trial on this page
                     lang = ocr.pick_language(page, settings, _installed(settings))
@@ -104,7 +161,10 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
                     lang = detect_lang(_text_of(olines)) or "und"
                 oconf = sum(l.conf for l in olines) / len(olines) if olines else 0.0
                 otext = _text_of(olines)
-                d["ocr"] = {"dpi": dpi, "langs": info.get("langs"), "conf": round(oconf, 1), "cached": cached, "lines": len(olines), **{k: info[k] for k in ("rotate", "skew", "osd_script", "retry") if k in info}}
+                d["ocr"] = {"engine": "tesseract", "status": "accepted" if olines else "review_required",
+                            "requires_review": not bool(olines), "confidence": round(oconf, 1) if olines else None,
+                            "dpi": dpi, "langs": info.get("langs"), "conf": round(oconf, 1), "cached": cached,
+                            "lines": len(olines), **{k: info[k] for k in ("rotate", "skew", "osd_script", "retry") if k in info}}
                 if decision == "ocr":
                     use_ocr = bool(olines) or d["native_chars"] == 0
                     if not olines and d["health"] != "absent":
@@ -121,10 +181,17 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
                     if d["health"] != "absent":     # digital page with broken text: keep real figures
                         try: rec["figs"] = native.extract_figures(page, settings, [])
                         except Exception: pass
+                        if not (d["rotation"] or info.get("rotate") or info.get("skew")):
+                            rec["lines"] = native.recover_running_text(page, olines, settings.header_band)
                 elif decision == "ocr":
                     rec["lines"] = native.extract_lines(page)
             else:
                 rec["lines"] = native.extract_lines(page)
+                if decision in ("ocr", "compare"):
+                    reason = ("OCR is disabled." if not settings.ocr_enabled
+                              else "The configured OCR engine is unavailable.")
+                    d["reasons"].append(reason)
+                    d["ocr"] = {"engine": None, "status": "review_required", "requires_review": True}
             if rec["source"] == "native" and rec["lines"] and d["health"] in ("healthy", "suspicious"):
                 rec["tables"] = native.extract_tables(page, settings)
                 rec["figs"] = native.extract_figures(page, settings, [t.bbox for t in rec["tables"]], rec["lines"])
@@ -133,43 +200,89 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
         except Exception as e:
             audit.event("extraction", "page_error", doc=doc_id, page=i + 1, error=str(e), trace=traceback.format_exc()[-600:])
             d["error"] = str(e)
+            d["reasons"].append("A page extraction step failed.")
+            if not rec["lines"]:
+                try:
+                    rec["lines"] = native.extract_lines(doc[i])
+                except Exception:
+                    pass
         raw.append(rec)
-        res["page_log"].append({"page": i + 1, "source": rec["source"], "health": d["health"], "seconds": round(time.time() - tp, 2)})
+        ocr_info = d.get("ocr", {})
+        unread_scan = (d["decision"] == "ocr" and not rec["lines"] and d.get("image_coverage", 0) > 0.5
+                       and (ocr_info.get("status") != "accepted" or "error" in d))
+        res["page_log"].append({"page": i + 1, "source": rec["source"], "health": d["health"],
+                                "native_chars": d["native_chars"], "ocr_required": d.get("ocr_required", False),
+                                "ocr": ocr_info, "seconds": round(time.time() - tp, 2), "unread_scan": unread_scan})
+        if progress:
+            progress(i + 1, n)
     doc.close()
+    router.close()
     # ---- Layout Reconstruction agent ------------------------------------------------------------------
     ctx = reconstruct.compute_context(raw, settings)
     ctx.lang = lang
     pages: list[PageIR] = []
-    for rp in raw:
-        try:
-            ls = rp["lines"]
-            rtl = bool(ls) and sum(l.rtl for l in ls) / len(ls) > 0.5
-            pg = reconstruct.build_page(rp["n"], rp["w"], rp["h"], ls, rp["tables"], rp["figs"], ctx, settings, rp["source"], doc_rtl=rtl)
-            for b in pg.blocks:
-                if b.tag == "figure" and not b.alt:
-                    b.alt = figures.describe(b, rp["w"], rp["h"], rp["n"])
-        except Exception as e:
-            audit.event("layout", "page_error", doc=doc_id, page=rp["n"], error=str(e), trace=traceback.format_exc()[-600:])
-            pg = PageIR(n=rp["n"], width=rp["w"], height=rp["h"], source=rp["source"])
-            pg.blocks = [Block(tag="p", text=" ".join(l.text for l in rp["lines"]), kind="body")] if rp["lines"] else []
-        pg.diag = rp["diag"]
-        pg.diag["confidence"] = page_confidence(pg)
-        pages.append(pg)
+    try:
+        for rp in raw:
+            stage("layout", page=rp["n"])
+            try:
+                ls = rp["lines"]
+                rtl = bool(ls) and sum(l.rtl for l in ls) / len(ls) > 0.5
+                pg = reconstruct.build_page(rp["n"], rp["w"], rp["h"], ls, rp["tables"], rp["figs"], ctx, settings, rp["source"], doc_rtl=rtl)
+                if rp["blocks"] is not None:
+                    pg.blocks = rp["blocks"] + pg.blocks
+                for b in pg.blocks:
+                    if b.tag == "figure" and not b.alt:
+                        b.alt = figures.describe(b, rp["w"], rp["h"], rp["n"])
+            except Exception as e:
+                audit.event("layout", "page_error", doc=doc_id, page=rp["n"], error=str(e), trace=traceback.format_exc()[-600:])
+                pg = PageIR(n=rp["n"], width=rp["w"], height=rp["h"], source=rp["source"])
+                pg.blocks = [Block(tag="p", text=" ".join(l.text for l in rp["lines"]), kind="body")] if rp["lines"] else []
+            pg.diag = rp["diag"]
+            ocr_info = pg.diag.get("ocr", {})
+            pg.ocr_engine = ocr_info.get("engine") or ""
+            pg.requires_review = bool(ocr_info.get("requires_review") or pg.diag.get("error"))
+            layout_status, regions = layout.enrich(pdf, pg)
+            pg.diag["layout"] = {"engine": "Docling" if layout_status == "applied" else "reconstruction",
+                                 "status": layout_status, "regions": len(regions)}
+            pg.layout_engine = pg.diag["layout"]["engine"]
+            if regions:
+                report = work_dir / "recognition" / doc_id / f"page-{pg.n:04d}-docling.json"
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(json.dumps(regions, ensure_ascii=False), encoding="utf-8")
+            for block in pg.blocks:
+                if block.source == "ocr" and not block.ocr_engine:
+                    block.ocr_engine = pg.ocr_engine
+                    block.recognition_confidence = block.conf
+            pg.diag["confidence"] = page_confidence(pg)
+            page_result = res["page_log"][pg.n - 1]
+            page_result.update(layout=pg.diag["layout"], review_required=pg.requires_review,
+                               confidence=pg.diag["confidence"])
+            pages.append(pg)
+    finally:
+        layout.close()
     dir_ = DocIR(doc_id=doc_id, path=str(pdf), lang=lang, pages=pages, meta={"settings": settings.schema_profile})
     kinds.assign_kinds(dir_)
+    stage("validation")
+    dir_ = ir_from_dict(dir_.to_dict())
     # ---- XML Generation + QA agents -----------------------------------------------------------------------
-    data = to_xml(dir_, settings)
+    assets = {}
+    data = to_xml(dir_, settings, assets=assets if settings.schema_profile == "sample" else None)
     val = validate_xml(data, n, settings)
-    if not val["well_formed"]:                                   # never emit invalid XML: fall back to plain paragraphs
-        audit.event("xml", "fallback_plain", doc=doc_id, issues=val["issues"])
-        for pg in dir_.pages:
-            pg.blocks = [Block(tag="p", text="\n".join(b.text for b in pg.blocks if b.text), kind="body")]
-        data = to_xml(dir_, settings); val = validate_xml(data, n, settings)
+    if not val["well_formed"] or val["issues"]:
+        audit.event("xml", "invalid", doc=doc_id, issues=val["issues"])
+        res.update(validation=val, error="Generated XML failed validation.")
+        return res
+    if assets:
+        with pymupdf.open(pdf) as source_pdf:
+            for name, (page, box) in assets.items():
+                asset_path = out_dir / name
+                asset_path.parent.mkdir(parents=True, exist_ok=True)
+                source_pdf[page - 1].get_pixmap(dpi=180, clip=pymupdf.Rect(box), alpha=False).save(asset_path)
     _write_xml(out_dir, pdf, data)
     ir_dir = work_dir / "ir"; ir_dir.mkdir(parents=True, exist_ok=True)
     (ir_dir / f"{doc_id}.json").write_text(json.dumps(dir_.to_dict(), ensure_ascii=False), encoding="utf-8")
     q = doc_quality(dir_, val)
-    res.update(ok=val["well_formed"], validation=val, quality=q, lang=lang, seconds=round(time.time() - t0, 2),
+    res.update(ok=val["well_formed"] and not val["issues"], validation=val, quality=q, lang=lang, seconds=round(time.time() - t0, 2),
                ocr_pages=sum(1 for p in pages if p.source == "ocr"), source_counts={s: sum(1 for p in pages if p.source == s) for s in ("native", "ocr")})
     audit.event("xml", "written", doc=doc_id, seconds=res["seconds"], issues=val["issues"], ocr_pages=res["ocr_pages"])
     return res
@@ -198,7 +311,8 @@ def _job(args):
 
 
 def run_pdfs(pdfs: list[Path], settings: Settings, out_dir: Path, work_dir: Path, audit: AuditLog, t_start: float) -> list[dict]:
-    workers = settings.workers or max(1, min((os.cpu_count() or 2) - 1, 6, len(pdfs) or 1))
+    workers = settings.workers or (1 if settings.ocr_backend == "glm-ocr" or settings.docling_enabled
+                                   else max(1, min((os.cpu_count() or 2) - 1, 6, len(pdfs) or 1)))
     deadline = t_start + 0.75 * settings.time_budget_s            # after this point OCR drops to fast mode
     audit.event("orchestrator", "batch_start", documents=len(pdfs), workers=workers, soft_deadline_s=round(0.75 * settings.time_budget_s))
     jobs = [(str(p), settings.to_dict(), str(out_dir), str(work_dir), str(audit.path) if audit.path else None, deadline) for p in pdfs]

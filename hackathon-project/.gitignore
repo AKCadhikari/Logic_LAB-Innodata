@@ -1,12 +1,18 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-docling/
 venv/
 .env
 *.env
 .docsync_cache/
 docsync_run/
 .pytest_cache/
+/storage/
+phase-1/output/*
+phase-2/output/*
+!phase-1/output/.gitkeep
+!phase-2/output/.gitkeep
 # confidential competition material must never be committed to a public repository
 phase-1/input/*
 phase-2/input/*

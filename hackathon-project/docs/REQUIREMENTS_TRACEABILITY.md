@@ -1,5 +1,9 @@
 # Requirements traceability
 
+The rows below record the original batch implementation. See the [implementation roadmap](../../docs/IMPLEMENTATION_ROADMAP.md)
+for the current Windows and individual document workflow evidence, and the [repository audit](../../docs/REPOSITORY_AUDIT.md)
+for source availability and schema caveats.
+
 | # | Requirement (source) | Module | Tests / evidence | Status |
 |---|---|---|---|---|
 | R1 | One XML per PDF, named as source with `.xml` (brief) | `utils/naming.py`, `agents/orchestrator.py` | `test_naming_rules`, benchmark 13/13 | Done |

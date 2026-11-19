@@ -7,6 +7,7 @@ Logs, per-document IR, reports and caches go to --work-dir (default: <output>/..
 """
 from __future__ import annotations
 import argparse, multiprocessing, sys, time
+from collections import Counter
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -25,8 +26,9 @@ def build_parser():
     ap.add_argument("--work-dir", default=None, help="logs, IR, reports, cache (default: <output>/../docsync_run)")
     ap.add_argument("--config", default=None, help="JSON file overriding config.settings.Settings")
     ap.add_argument("--workers", type=int, default=None, help="parallel documents (0 = auto)")
-    ap.add_argument("--profile", choices=["brief", "example"], default=None, help="XML schema profile")
+    ap.add_argument("--profile", choices=["brief", "example", "sample"], default=None, help="XML schema profile")
     ap.add_argument("--no-ocr", action="store_true", help="disable OCR fallback (diagnostics only)")
+    ap.add_argument("--ocr-backend", choices=["glm-ocr", "tesseract"], help="select the OCR pipeline")
     ap.add_argument("--skip-pptx", action="store_true", help="only generate XML")
     ap.add_argument("--time-budget", type=int, default=None, help="seconds before the run switches to fast mode")
     return ap
@@ -35,7 +37,7 @@ def build_parser():
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     settings = Settings.load(args.config, workers=args.workers, schema_profile=args.profile, time_budget_s=args.time_budget,
-                             ocr_enabled=False if args.no_ocr else None)
+                             ocr_enabled=False if args.no_ocr else None, ocr_backend=args.ocr_backend)
     inp, out = Path(args.input).resolve(), Path(args.output).resolve()
     work = Path(args.work_dir).resolve() if args.work_dir else out.parent / "docsync_run"
     log = get_logger()
@@ -57,20 +59,29 @@ def main(argv=None) -> int:
     amend = []
     if found["pptxs"] and not args.skip_pptx:
         from powerpoint.amend import amend_deck
-        for pdf, pptx in pair_documents(found["pdfs"], found["pptxs"]):
+        available = {r["doc_id"] for r in results if r.get("ok")}
+        eligible = [pdf for pdf in pdfs if pdf.stem in available]
+        sources = {deck: pdf for pdf, deck in pair_documents(eligible, found["pptxs"])}
+        target_counts = Counter(pptx_out_name(deck, settings.pptx_suffix_rule).casefold() for deck in found["pptxs"])
+        for pptx in found["pptxs"]:
             target = out / pptx_out_name(pptx, settings.pptx_suffix_rule)
+            pdf = sources.get(pptx)
             try:
+                if target_counts[target.name.casefold()] > 1:
+                    raise ValueError("Multiple source decks produce the same output filename.")
+                if pdf is None:
+                    raise ValueError("No uniquely matched, successfully processed source PDF.")
                 ar = amend_deck(pdf, pptx, target, work, settings, audit)
             except Exception as e:                       # a failed deck must never stop the batch
                 audit.event("powerpoint", "deck_failed", deck=pptx.name, error=str(e))
-                import shutil; shutil.copyfile(pptx, target)
-                ar = {"pptx": pptx.name, "output": target.name, "error": str(e), "applied": 0, "review": 0}
+                ar = {"pptx": pptx.name, "output": None, "error": str(e), "applied": 0, "review": 0,
+                      "valid": False, "status": "failed"}
             amend.append(ar)
             log.info("deck %-40s -> %s (applied=%s review=%s)", pptx.name, target.name, ar.get("applied"), ar.get("review"))
     from reporting.report import write_reports
     write_reports(work, results, amend, settings, {"wall": time.time() - t0})
     log.info("done in %.1fs; report: %s", time.time() - t0, work / "report.html")
-    return 0 if all(r.get("ok") for r in results) else 1
+    return 0 if all(r.get("ok") for r in results) and all(a["valid"] for a in amend) else 1
 
 
 if __name__ == "__main__":

@@ -43,6 +43,9 @@ def spearman(order_a: list[int]) -> float:
 def compare(pred, gold, thr: float = 0.85) -> dict:
     gt, pt = full_text(gold), full_text(pred)
     sim = 1 - Levenshtein.normalized_distance(gt, pt)
+    gold_words = gt.split()
+    cer = round(Levenshtein.distance(gt, pt) / len(gt), 4) if gt else None
+    wer = round(Levenshtein.distance(gold_words, pt.split()) / len(gold_words), 4) if gold_words else None
     gu, pu = units(gold), units(pred)
     def match(a_list, b_list):
         hits, mapping = 0, {}
@@ -60,5 +63,6 @@ def compare(pred, gold, thr: float = 0.85) -> dict:
     order = [0] * len(seq)
     for r, k in enumerate(ranks):
         order[k] = r
-    return {"text_similarity": round(sim, 3), "unit_recall": round(rec, 3), "unit_precision": round(prec, 3), "unit_f1": round(f1, 3),
+    return {"text_similarity": round(sim, 3), "character_error_rate": cer, "whitespace_word_error_rate": wer,
+            "unit_recall": round(rec, 3), "unit_precision": round(prec, 3), "unit_f1": round(f1, 3),
             "reading_order_spearman": round(spearman(order), 3), "gold_units": len(gu), "pred_units": len(pu), "gold_chars": len(gt), "pred_chars": len(pt)}

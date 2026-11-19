@@ -244,7 +244,6 @@ def build_page(n: int, w: float, h: float, lines: list[Line], tables: list[Block
     hdr, ftr, flow = [], [], []
     band = settings.header_band
     tboxes = [t.bbox for t in tables]
-    fboxes = [f.bbox for f in figures if f.alt != "__raster__"]
 
     def in_box(ln, boxes):
         cx, cy = (ln.bbox[0] + ln.bbox[2]) / 2, (ln.bbox[1] + ln.bbox[3]) / 2
@@ -259,13 +258,17 @@ def build_page(n: int, w: float, h: float, lines: list[Line], tables: list[Block
             (hdr if cy < h / 2 else ftr).append(ln); continue
         if in_box(ln, tboxes):
             continue
-        if in_box(ln, [f.bbox for f in figures if (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]) > 0 and f.cls == "vector"]) and not CAPTION_RE.match(ln.text):
+        if in_box(ln, [f.bbox for f in figures if f.bbox and (f.cls == "vector" or source == "ocr")]) and not CAPTION_RE.match(ln.text):
             continue
         flow.append(ln)
 
     for grp, tag, kind in ((hdr, "header", "publication_metadata"), (ftr, "footer", "publication_metadata")):
-        for ln in _merge_same_row(sorted(grp, key=lambda l: (l.bbox[1], l.bbox[0]))):
-            page.blocks.append(Block(tag=tag, text=xml_safe(ln.text.strip()), bbox=ln.bbox, kind=kind, spans=ln.spans, source=ln.source))
+        lines_in_band = sorted(grp, key=lambda l: (l.bbox[1], l.bbox[0]))
+        if settings.schema_profile != "sample":
+            lines_in_band = _merge_same_row(lines_in_band)
+        for ln in lines_in_band:
+            page.blocks.append(Block(tag=tag, text=xml_safe(ln.text.strip()), bbox=ln.bbox, kind=kind,
+                                     spans=ln.spans, source=ln.source, size=ln.size, conf=ln.conf))
     if ftr:   # footers go last
         page.blocks = [b for b in page.blocks if b.tag == "header"] + [b for b in page.blocks if b.tag == "footer"]
     head_blocks = [b for b in page.blocks if b.tag == "header"]
@@ -325,7 +328,11 @@ def _lines_to_blocks(lines: list[Line], ctx, settings, body: float, hsizes: list
         caps = bool(alpha) and sum(c.isupper() for c in alpha) / len(alpha) > 0.85 and len(alpha) >= 3
         blk = Block(tag="p", text=text, bbox=bbox, spans=spans, conf=conf, source=source, size=size)
         sym = sum(1 for c in text if not (c.isalpha() or c.isspace()))
-        is_eq = bool(EQ_TAIL.search(text)) and len(para) <= 3 and sym / max(len(text), 1) > 0.22 and nwords <= 30
+        numbered_formula = EQ_TAIL.search(text) or re.search(r"\(\d+\.\d+\)", text)
+        if not numbered_formula and x0 > 0.26 * w and "=" in text:
+            numbered_formula = re.search(r"(?<![\d.])\d{2}\)$", text)
+        is_eq = bool(numbered_formula and len(para) <= 5 and nwords <= 36 and (
+            sym / max(len(text), 1) > 0.22 or (x0 > 0.20 * w and re.search(r"[=±×÷√∑∫]", text))))
         mnum = NUMHEAD_RE.match(text)
         # footnote: small text in the lower part of the page
         if is_eq:
@@ -344,6 +351,7 @@ def _lines_to_blocks(lines: list[Line], ctx, settings, body: float, hsizes: list
             blk.tag = f"h{min(len(hsizes) + 1, 6)}"; blk.kind = "section_heading"
         elif mk:
             blk.tag = "li"; blk.kind = mk
+            blk.marker = text[:mlen].strip()
             blk.text, blk.spans = _marker_strip(text, spans, mlen)
         out.append(blk)
     # group consecutive li into lists

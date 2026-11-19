@@ -69,9 +69,17 @@ def analyze_page(page, settings) -> dict:
             sus.append(f"{h['moji']} mojibake sequences")
         if sus:
             health = "suspicious"; decision = "compare" if settings.compare_suspicious else "native"; reasons += sus
+    mixed = bool(stripped) and cov >= settings.native_mixed_min_image_coverage and len(stripped) <= settings.native_mixed_max_chars
+    if mixed and decision != "ocr":
+        decision = "ocr"
+        reasons.append("A large image accompanies a sparse native text layer.")
     return {
         "page": page.number + 1, "width": round(page.rect.width, 1), "height": round(page.rect.height, 1),
         "rotation": page.rotation, "native_chars": h["chars"], "text_density": round(h["chars"] / area * 1e4, 2),
+        "has_native_text": bool(stripped), "short_native_text": len(stripped) < settings.native_min_chars,
+        "has_images": bool(imgs), "appears_scanned": (not stripped and cov >= 0.4) or mixed,
+        "mixed_content": mixed,
+        "ocr_required": decision in ("ocr", "compare"),
         "ctrl_ratio": round(h["ctrl"], 4), "pua_ratio": round(h["pua"], 4), "mojibake": h["moji"],
         "wordlike": round(h["wordlike"], 3), "n_images": len(imgs), "image_coverage": round(cov, 3),
         "scripts": dict(sc.most_common(3)), "health": health, "decision": decision, "reasons": reasons,

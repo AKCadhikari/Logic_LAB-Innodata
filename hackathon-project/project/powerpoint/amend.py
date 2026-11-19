@@ -1,84 +1,99 @@
-"""PowerPoint amendment engine: proof-read a deck against the source PDF and apply targeted, formatting-preserving fixes.
-
-Evidence = the PDF's reconstructed text (OCR'd where the text layer is broken).  Every change is logged with a
-confidence and a recommended action; low-confidence differences are flagged for review, never applied silently."""
+"""Repair existing presentation text using attributable PDF evidence."""
 from __future__ import annotations
-import copy, json, re, statistics, time, zipfile
-from collections import Counter
-from dataclasses import dataclass
+
+import json
+import re
+import time
+from collections import Counter, defaultdict
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from pathlib import Path
+from subprocess import TimeoutExpired
+from tempfile import TemporaryDirectory
 
-from lxml import etree
-from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
+from pptx.oxml.ns import qn
 from rapidfuzz import fuzz, process
 
-from comparison.differ import align_correct, ws_lower
+from comparison.differ import TOK, Alignment, align_correct, ws_lower
+from config.settings import Settings
 from layout.model import DocIR, ir_from_dict
+from powerpoint.package import RunEdit, open_deck, write_deck
+from utils.logs import AuditLog
+from xml_engine.serializer import to_xml
 
-A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 FURNITURE = {"slide-number", "footer", "rule", "date"}
 
 
-@dataclass
+@dataclass(frozen=True)
 class Unit:
     text: str
     norm: str
     page: int
-    idx: int
-    kind: str
-    conf: float = 100.0
-    source: str = "native"
+    node: str
+    confidence: float
+    source: str
+    reliable: bool
+    engine: str = ""
+
+    def reference(self) -> dict:
+        return {"page": self.page, "xml_node": self.node, "text": self.text,
+                "extraction": self.source, "ocr_engine": self.engine or None,
+                "extraction_confidence": None if self.engine == "glm-ocr" else self.confidence}
 
 
-def load_ir(pdf: Path, work: Path, settings, audit) -> DocIR:
-    p = work / "ir" / f"{pdf.stem}.json"
-    if not p.exists():                                        # deck processed without its PDF run: process it now
-        from agents.orchestrator import process_pdf
-        import tempfile
-        process_pdf(pdf, settings, Path(tempfile.mkdtemp()), work, audit)
-    return ir_from_dict(json.loads(p.read_text(encoding="utf-8")))
+@dataclass(frozen=True)
+class Match:
+    unit: Unit
+    alignment: Alignment
+    score: float
+
+    @property
+    def confidence(self) -> float:
+        return min(0.99, (self.alignment.match_frac + self.score / 100) / 2)
 
 
-def build_evidence(ir: DocIR) -> tuple[list[Unit], list[tuple[str, str, int, int]]]:
-    units: list[Unit] = []
-    heads: list[tuple[str, str, int, int]] = []     # (tag, text, page, unit index of next unit)
-    k = 0
-    def add(text, page, kind, conf=100.0, src="native"):
-        nonlocal k
-        t = re.sub(r"\s+", " ", text).strip()
-        if len(t) < 2:
-            return
-        units.append(Unit(t, ws_lower(t), page, k, kind, conf, src)); k += 1
-    for pg in ir.pages:
-        for b in pg.blocks:
-            conf = b.conf; bsrc = b.source
-            if b.tag in ("header", "footer"):
+def load_ir(pdf: Path, work: Path, settings: Settings, audit: AuditLog) -> DocIR:
+    path = work / "ir" / f"{pdf.stem}.json"
+    if path.exists():
+        ir = ir_from_dict(json.loads(path.read_text(encoding="utf-8")))
+        if Path(ir.path).resolve() == pdf.resolve():
+            return ir
+    from agents.orchestrator import process_pdf
+
+    with TemporaryDirectory() as temp:
+        result = process_pdf(pdf, settings, Path(temp), work, audit)
+    if not result["ok"]:
+        raise ValueError("A successfully extracted source PDF is required for PowerPoint repair.")
+    return ir_from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def build_evidence(ir: DocIR, settings: Settings) -> list[Unit]:
+    locations = {}
+    to_xml(ir, settings, locations)
+    evidence = []
+    for page in ir.pages:
+        if page.requires_review:
+            continue
+        for block in page.blocks:
+            if block.tag in ("header", "footer") or block.kind == "equation":
                 continue
-            if b.tag.startswith("h") and b.tag[1:].isdigit():
-                heads.append((b.tag, re.sub(r"\s+", " ", b.text).strip(), pg.n, k)); add(b.text, pg.n, "heading", conf, bsrc)
-            elif b.tag in ("ul", "ol"):
-                for li in b.children:
-                    add(li.text, pg.n, "li", li.conf, bsrc)
-            elif b.tag == "table":
-                for c in b.cells:
-                    add(c.text, pg.n, "cell", 100.0, bsrc)
-                if b.caption: add(b.caption, pg.n, "caption")
-            elif b.tag == "figure":
-                if b.caption: add(b.caption, pg.n, "caption")
-            else:
-                if b.kind == "equation":
-                    add(b.text, pg.n, "equation", conf, bsrc); continue
-                t = re.sub(r"\s+", " ", b.text).strip()
-                if re.match(r"^\d{1,2}(?:\.\d{1,2}){0,3}\.?\s+\S", t) and len(t) <= 90 and len(t.split()) <= 12 and not t.endswith((".", ",")):
-                    heads.append(("h?", t, pg.n, k)); add(b.text, pg.n, "heading", conf, bsrc)
-                else:
-                    add(b.text, pg.n, b.kind or "p", conf, bsrc)
-    return units, heads
+            entries = [(id(block), block.text, block.conf)]
+            if block.tag in ("ul", "ol"):
+                entries = [(id(item), item.text, item.conf) for item in block.children]
+            elif block.tag in ("table", "figure"):
+                entries = [((id(block), "caption"), block.caption, block.conf)]
+            for key, content, confidence in entries:
+                text = " ".join(content.split())
+                if len(text) < 6 or key not in locations:
+                    continue
+                reliable = (block.source == "native" and page.diag.get("health") == "healthy"
+                            and not page.diag.get("error") and confidence >= 80)
+                evidence.append(Unit(text, ws_lower(text), page.n, locations[key], confidence,
+                                     block.source, reliable, block.ocr_engine))
+    return evidence
 
 
-# ------------------------------------------------------------------------------------------ pptx helpers
 def _is_group(sh):
     return sh.shape_type == MSO_SHAPE_TYPE.GROUP
 
@@ -155,270 +170,219 @@ def apply_text_edit(para, new: str):
             runs[ri].text = t[cut:]; remaining -= cut; ri += 1
 
 
-def _to_slide_number_field(para) -> bool:
-    ps = para._p
-    if ps.findall(f"{{{A_NS}}}fld"):
+def editable_paragraph(paragraph) -> bool:
+    protected = {qn("a:fld"), qn("a:br")}
+    return bool(paragraph.runs) and not any(child.tag in protected for child in paragraph._p)
+
+
+def record_text_edit(slide, paragraph, new: str, edits: dict[str, list[RunEdit]]) -> None:
+    if not editable_paragraph(paragraph):
+        raise ValueError("The paragraph contains a field or special break.")
+    nodes = [run._r.find(qn("a:t")) for run in paragraph.runs]
+    originals = [node.text or "" for node in nodes]
+    apply_text_edit(paragraph, new)
+    if para_text(paragraph) != new:
+        raise ValueError("The edited runs do not reproduce the approved paragraph.")
+    root = slide._element.getroottree()
+    part = str(slide.part.partname).lstrip("/")
+    edits[part].extend(RunEdit(root.getelementpath(node), old, node.text or "")
+                       for node, old in zip(nodes, originals) if (node.text or "") != old)
+
+
+def candidate_matches(text: str, evidence: list[Unit], normalized: list[str],
+                      vocab: Counter, settings: Settings) -> list[Match]:
+    scored = []
+    for _, score, index in process.extract(ws_lower(text), normalized, scorer=fuzz.partial_ratio,
+                                           limit=None, score_cutoff=settings.amend_review_match):
+        unit = evidence[index]
+        alignment = labeled_number(text, unit.text)
+        if alignment is None:
+            alignment = align_correct(text, unit.text, vocab,
+                                      strict=unit.confidence < 80 and unit.engine != "glm-ocr",
+                                      ocr=unit.source == "ocr", nonlatin_auto=settings.amend_nonlatin_auto)
+        if alignment.match_frac >= 0.5:
+            scored.append(Match(unit, alignment, score))
+    return sorted(scored, key=lambda match: (match.confidence, match.alignment.match_frac), reverse=True)
+
+
+NUMBER_LABEL = re.compile(r"^([^:\r\n]{5,80}:\s*)([+-]?\d+(?:[.,]\d+)*)(\s*[%\w°.-]*)$")
+
+
+def labeled_number(old: str, source: str) -> Alignment | None:
+    before, after = NUMBER_LABEL.fullmatch(old.strip()), NUMBER_LABEL.fullmatch(source.strip())
+    if not before or not after:
+        return None
+    if ws_lower(before[1]) != ws_lower(after[1]) or ws_lower(before[3]) != ws_lower(after[3]):
+        return None
+    if before[2] == after[2]:
+        return Alignment(old, 1, mode="high")
+    start = len(old) - len(old.lstrip()) + before.start(2)
+    new = old[:start] + after[2] + old[start + len(before[2]):]
+    return Alignment(new, 1, [{"type": "number_error", "old": before[2], "new": after[2],
+                               "oov": False, "applied": True}], "high")
+
+
+def confirm_ocr(ir: DocIR, match: Match, replacements: list[dict], settings: Settings, cache: dict[int, str]) -> bool:
+    """Require an alternate OCR pass to read each replacement with adjacent context."""
+    import pymupdf
+    from ocr.engine import available_langs, ocr_page
+
+    unit = match.unit
+    if (unit.confidence < 86 and unit.engine != "glm-ocr") or not settings.ocr_enabled:
         return False
-    rs = ps.findall(f"{{{A_NS}}}r")
-    if not rs or not re.fullmatch(r"\s*\d+\s*", "".join((r.find(f"{{{A_NS}}}t").text or "") for r in rs)):
-        return False
-    r0 = rs[0]
-    fld = etree.Element(f"{{{A_NS}}}fld", id="{B6F15528-21DE-4FAA-801E-634DDDAF4B2B}", type="slidenum")
-    rpr = r0.find(f"{{{A_NS}}}rPr")
-    if rpr is not None:
-        fld.append(copy.deepcopy(rpr))
-    t = etree.SubElement(fld, f"{{{A_NS}}}t"); t.text = "‹#›"
-    r0.addprevious(fld)
-    for r in rs:
-        ps.remove(r)
-    return True
+    if unit.page not in cache:
+        cache[unit.page] = ""
+        try:
+            with pymupdf.open(ir.path) as pdf:
+                check_settings = replace(settings, ocr_psm=11)
+                lines, _ = ocr_page(pdf[unit.page - 1], ir.lang, min(275, max(240, settings.ocr_dpi + 40)),
+                                    check_settings, available_langs(check_settings), orient=False, deskew=False)
+                cache[unit.page] = " ".join(word_tokens(" ".join(line.text for line in lines if line.conf >= 75)))
+        except (OSError, RuntimeError, ValueError, TimeoutExpired):
+            return False
+    revised = word_tokens(match.alignment.new_text)
+    for edit in replacements:
+        replacement = word_tokens(edit["new"])
+        if edit["type"] == "extra_text":
+            if not contains_words(cache[unit.page], revised) or word_tokens(unit.text) != revised:
+                return False
+            continue
+        if not replacement or not any(
+            revised[i:i + len(replacement)] == replacement and
+            contains_words(cache[unit.page], revised[max(0, i - 2):i + len(replacement) + 2])
+            for i in range(len(revised))
+        ):
+            return False
+    return bool(replacements)
 
 
-# ------------------------------------------------------------------------------------------ main engine
-def amend_deck(pdf: Path, pptx: Path, target: Path, work: Path, settings, audit) -> dict:
-    t0 = time.time()
-    ir = load_ir(pdf, work, settings, audit)
-    units, heads = build_evidence(ir)
-    from comparison.differ import TOK
-    vocab = Counter(t.lower() for u in units for t in TOK.findall(u.text) if re.match(r"\w", t))
-    prs = Presentation(str(pptx))
-    doc_id = pdf.stem
-    changes: list[dict] = []
-    def log(slide, shape, typ, old, new, conf, action, reason="", para=None):
-        rec = {"document": doc_id, "deck": pptx.name, "original_location": {"slide": slide, "shape": shape, "paragraph": para},
-               "new_location": {"slide": slide, "shape": shape, "paragraph": para}, "change_type": typ, "old_content": old, "new_content": new,
-               "confidence": round(conf, 3), "action": action, "recommended_action": "none" if action == "applied" and conf >= 0.85 else "human review", "reason": reason}
-        changes.append(rec); return rec
+def word_tokens(text: str) -> list[str]:
+    return re.findall(r"[+-]?\d+(?:[.,]\d+)*%?|[^\W\d_]+", text.casefold())
 
-    slides = list(prs.slides)
-    notes_pages: dict[int, int] = {}
-    if settings.amend_use_notes or True:                       # notes are only used as a page locator
-        for i, s in enumerate(slides, 1):
-            try:
-                if s.has_notes_slide and s.notes_slide.notes_text_frame is not None:
-                    m = re.search(r"Source:\s*page\s*(\d+)", s.notes_slide.notes_text_frame.text)
-                    if m: notes_pages[i] = int(m.group(1))
-            except Exception:
-                pass
-    by_page: dict[int, list[Unit]] = {}
-    for u in units:
-        by_page.setdefault(u.page, []).append(u)
 
-    # ---------------------------------------------------------------- 1. paragraph proof-reading
-    for si, slide in enumerate(slides, 1):
-        for sh in iter_shapes(slide.shapes):
-            if is_furniture(sh) or sh.name.lower().startswith("breadcrumb"):
+def contains_words(text: str, phrase: list[str]) -> bool:
+    return bool(phrase and (" " + " ".join(phrase) + " ") in (" " + text + " "))
+
+
+def local_edit(edit: dict, revised: str, source: str) -> bool:
+    if edit["type"] in {"number_error", "character_error", "word_error"}:
+        return bool(edit["old"].strip() and edit["new"].strip() and len(word_tokens(edit["new"])) <= 2)
+    if edit["type"] == "missing_words":
+        return not edit["old"].strip() and 1 <= len(word_tokens(edit["new"])) <= 2
+    return (edit["type"] == "extra_text" and not edit["new"].strip()
+            and 1 <= len(word_tokens(edit["old"])) <= 2 and word_tokens(source) == word_tokens(revised))
+
+
+def source_pages(slide, total: int) -> set[int]:
+    if not slide.has_notes_slide or slide.notes_slide.notes_text_frame is None:
+        return set()
+    notes = slide.notes_slide.notes_text_frame.text
+    match = re.search(r"^Source:\s*pages?\s+(\d+(?:(?:\s*[,–-]\s*|\s+and\s+)\d+)*)", notes, re.I | re.M)
+    if not match:
+        return set()
+    raw = match[1]
+    pages = {int(page) for page in re.findall(r"\d+", raw)}
+    for start, end in re.findall(r"(\d+)\s*[-–]\s*(\d+)", raw):
+        pages.update(range(max(1, int(start)), min(total, int(end)) + 1))
+    return {page for page in pages if 1 <= page <= total}
+
+
+def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Settings) -> dict:
+    evidence = build_evidence(ir, settings)
+    normalized = [unit.norm for unit in evidence]
+    vocab = Counter(token.lower() for unit in evidence for token in TOK.findall(unit.text) if token.isalnum())
+    deck = open_deck(source)
+    records = []
+    edits = defaultdict(list)
+    checked_pages = {}
+
+    for number, slide in enumerate(deck.slides, 1):
+        hints = source_pages(slide, len(ir.pages)) if settings.amend_use_notes else set()
+        hinted = [unit for unit in evidence if unit.page in hints]
+        hinted_text = [unit.norm for unit in hinted]
+        for shape in iter_shapes(slide.shapes):
+            if is_furniture(shape) or shape.name.lower().startswith("breadcrumb") or not shape.has_text_frame:
                 continue
-            matched = []                     # (para, unit idx, frac)
-            paras = list(text_paragraphs(sh))
-            for kind, p in paras:
-                txt = para_text(p)
-                letters = sum(c.isalpha() for c in txt)
-                if letters < 4 or len(txt.strip()) < 6:
+            for index, paragraph in enumerate(shape.text_frame.paragraphs, 1):
+                if not editable_paragraph(paragraph):
                     continue
-                hint = notes_pages.get(si)
-                pool = [u for pg in (hint - 1, hint, hint + 1) for u in by_page.get(pg, [])] if hint else units
-                best = None
-                for pl in ([pool, units] if hint else [pool]):
-                    s_norm = ws_lower(txt)
-                    cands = process.extract(s_norm, [u.norm for u in pl], scorer=fuzz.partial_ratio, limit=4, score_cutoff=settings.amend_review_match)
-                    scored = []
-                    for _, score, ci in cands:
-                        u = pl[ci]
-                        strict = u.conf < 80
-                        al = align_correct(txt, u.text, vocab, strict=strict, ocr=(u.source == "ocr"), nonlatin_auto=settings.amend_nonlatin_auto)
-                        scored.append((al.match_frac, -len(u.text), score, u, al))
-                    if scored:
-                        best = max(scored, key=lambda t: (t[0], t[1]))
-                        if best[0] >= 0.7 or pl is units:
-                            break
-                if not best or best[0] < 0.5:
-                    if letters >= 25 and sh.name.lower() not in ("title",):
-                        log(si, sh.name, "unsupported_text", txt, "", 0.3, "review", "no matching passage found in the source PDF")
+                text = para_text(paragraph)
+                if len(text.strip()) < 6 or sum(char.isalpha() for char in text) < 4:
                     continue
-                frac, _, score, u, al = best
-                conf = min(0.99, 0.5 * frac + 0.5 * score / 100) - (0.1 if u.conf < 80 else 0)
-                matched.append((p, u.idx, frac))
-                applied = [e for e in al.edits if e["applied"]]
-                for e in applied:
-                    log(si, sh.name, e["type"], e["old"].strip(), e["new"].strip(), conf, "applied", f"source page {u.page}, alignment {frac:.2f} ({al.mode})")
-                for e in al.edits:
-                    if not e["applied"] and (e["oov"] or re.search(r"\d", e["old"] + e["new"])) and al.mode in ("high", "mid") and e["old"].strip() != e["new"].strip():
-                        log(si, sh.name, e["type"], e["old"].strip(), e["new"].strip(), conf * 0.7, "review", f"possible difference vs source page {u.page}; not applied")
-                if applied:
-                    apply_text_edit(p, al.new_text)
-            # paragraph order inside a shape
-            if settings.amend_reorder and len(paras) >= 3 and len(matched) >= max(3, int(0.8 * len(paras))) and all(m[2] >= 0.88 for m in matched):
-                order = [m[1] for m in matched]
-                if order != sorted(order) and len(set(order)) == len(order):
-                    sp = matched[0][0]._p.getparent()
-                    slots = [m[0]._p for m in matched]
-                    idxs = {id(m[0]._p): m[1] for m in matched}
-                    new_seq = sorted(slots, key=lambda e: idxs[id(e)])
-                    positions = [sp.index(e) for e in slots]
-                    for e in slots: sp.remove(e)
-                    for pos, e in zip(sorted(positions), new_seq): sp.insert(pos, e)
-                    log(si, sh.name, "paragraph_reorder", "order " + str(order), "order " + str(sorted(order)), 0.8, "applied", "paragraph order differs from the source order")
+                matches = candidate_matches(text, hinted, hinted_text, vocab, settings) if hinted else []
+                if not matches or matches[0].alignment.match_frac < 0.75:
+                    matches = candidate_matches(text, evidence, normalized, vocab, settings)
+                if not matches:
+                    if sum(char.isalpha() for char in text) >= 25:
+                        records.append(change_record(ir, number, shape, index, text, "", 0, "review",
+                                                     "No matching passage found in the source PDF."))
+                    continue
 
-    # ---------------------------------------------------------------- 2. slide-number fields
-    for si, slide in enumerate(slides, 1):
-        for sh in iter_shapes(slide.shapes):
-            if sh.has_text_frame and (sh.name.lower() == "slide-number" or _ph_type(sh) == PP_PLACEHOLDER.SLIDE_NUMBER):
-                for p in sh.text_frame.paragraphs:
-                    old = para_text(p)
-                    if _to_slide_number_field(p):
-                        log(si, sh.name, "slide_number_field", old, "<slide number field>", 0.99, "applied", "hard-coded number replaced by an automatic field")
+                best = matches[0]
+                alignment = best.alignment
+                if ws_lower(text) == best.unit.norm:
+                    continue
+                proposals = [edit for edit in alignment.edits
+                             if edit["old"].strip() != edit["new"].strip() and
+                             (edit["applied"] or edit["oov"] or re.search(r"\d", edit["old"] + edit["new"]))]
+                if not proposals:
+                    continue
+                conflicting = [match.unit.reference() for match in matches[1:]
+                               if best.confidence - match.confidence <= 0.05
+                               and match.alignment.new_text != alignment.new_text]
+                applied_edits = [edit for edit in proposals if edit["applied"]]
+                safe_edits = all(local_edit(edit, alignment.new_text, best.unit.text) for edit in applied_edits)
+                supported = (not conflicting and bool(applied_edits) and safe_edits
+                             and alignment.mode == "high" and best.score >= settings.amend_min_match)
+                verified_ocr = (supported and best.unit.source == "ocr"
+                                and confirm_ocr(ir, best, applied_edits, settings, checked_pages))
+                apply = supported and (best.unit.reliable or verified_ocr)
+                if apply:
+                    reason = ("The replacement and adjacent text agree across two local OCR passes." if verified_ocr
+                              else "An unambiguous replacement is supported by the native PDF passage.")
+                elif conflicting:
+                    reason = "Multiple source passages support different text."
+                elif not best.unit.reliable:
+                    reason = "Source extraction requires verification before this edit can be applied."
+                else:
+                    reason = "The alignment does not support a high-confidence replacement in the existing text."
+                if apply:
+                    record_text_edit(slide, paragraph, alignment.new_text, edits)
+                record = change_record(ir, number, shape, index, text, alignment.new_text if apply else "",
+                                       best.confidence, "applied" if apply else "review", reason, best.unit)
+                record["proposals"] = applied_edits if apply else proposals
+                if len(record["proposals"]) == 1:
+                    record["change_type"] = record["proposals"][0]["type"]
+                if conflicting:
+                    record["alternatives"] = conflicting
+                records.append(record)
+    write_deck(source, target, edits, len(deck.slides))
+    return {"slides": len(deck.slides), "applied": [r for r in records if r["action"] == "applied"],
+            "review": [r for r in records if r["action"] == "review"], "records": records,
+            "status": "updated" if edits else "unchanged"}
 
-    # ---------------------------------------------------------------- 3. repeated footer consistency
-    foot = [(si, sh) for si, s in enumerate(slides, 1) for sh in iter_shapes(s.shapes) if sh.has_text_frame and (sh.name.lower() == "footer" or _ph_type(sh) == PP_PLACEHOLDER.FOOTER)]
-    variants = Counter(sh.text_frame.text.strip() for _, sh in foot if sh.text_frame.text.strip())
-    if len(variants) > 1:
-        longest = max(variants, key=len)
-        if all(longest.startswith(v) for v in variants) and variants[longest] >= 1:
-            for si, sh in foot:
-                t = sh.text_frame.text.strip()
-                if t and t != longest and longest.startswith(t):
-                    p = sh.text_frame.paragraphs[0]; old = para_text(p); apply_text_edit(p, longest)
-                    log(si, sh.name, "truncated_footer", old, longest, 0.9, "applied", "footer is a truncated copy of the footer used on other slides")
 
-    # ---------------------------------------------------------------- 4. breadcrumb completeness (numbered headings)
-    num_head: dict[str, str] = {}
-    for tag, text, page, _ in heads:
-        m = re.match(r"^(\d+(?:\.\d+)*)\.?\s+\S", text)
-        if m: num_head.setdefault(m.group(1), text)
-    for si, slide in enumerate(slides, 1):
-        shapes = list(iter_shapes(slide.shapes))
-        title = next((s for s in shapes if s.has_text_frame and (s.name.lower() == "title" or _ph_type(s) in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE))), None)
-        crumb = next((s for s in shapes if s.has_text_frame and s.name.lower().startswith("breadcrumb")), None)
-        if not title or not crumb:
-            continue
-        m = re.match(r"^(\d+(?:\.\d+)+)\b", title.text_frame.text.strip())
-        if not m:
-            continue
-        parts = m.group(1).split(".")
-        anc = [num_head[".".join(parts[:k])] for k in range(1, len(parts)) if ".".join(parts[:k]) in num_head]
-        want = " › ".join(re.sub(r"\s+", " ", a) for a in anc)
-        have = crumb.text_frame.text.strip()
-        if want and have != want and want.startswith(have.rstrip(" ›")) and len(want) > len(have):
-            p = crumb.text_frame.paragraphs[0]; old = para_text(p); apply_text_edit(p, want)
-            log(si, crumb.name, "breadcrumb", old, want, 0.85, "applied", "breadcrumb lacked ancestor headings of the numbered title")
+def change_record(ir: DocIR, slide: int, shape, paragraph: int, old: str, new: str, confidence: float,
+                  action: str, reason: str, unit: Unit | None = None) -> dict:
+    location = {"slide": slide, "shape_id": shape.shape_id, "shape": shape.name, "paragraph": paragraph}
+    return {"document": ir.doc_id, "original_location": location, "new_location": dict(location),
+            "change_type": "text_correction", "old_content": old, "new_content": new,
+            "old": old, "new": new, **location, "confidence": round(confidence, 3), "action": action,
+            "recommended_action": "none" if action == "applied" else "human review", "reason": reason,
+            "source": unit.reference() if unit else None}
 
-    # ---------------------------------------------------------------- 5. missing body boxes
-    stat: dict[str, Counter] = {}
-    lens = []
-    for slide in slides:
-        names = [s.name for s in iter_shapes(slide.shapes) if s.has_text_frame and not is_furniture(s) and s.name.lower() not in ("title",) and not s.name.lower().startswith("breadcrumb") and s.text_frame.text.strip()]
-        stat.setdefault(slide.slide_layout.name, Counter()).update(set(names))
-        for s in iter_shapes(slide.shapes):
-            if s.has_text_frame and s.name in names and s.name.lower().startswith("box"):
-                lens.append(len(s.text_frame.text))
-    cap = max(300, int(statistics.median(lens))) if lens else 600
-    SENT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"“(])")
-    spp = []
-    for slide in slides:
-        for s_ in iter_shapes(slide.shapes):
-            if s_.has_text_frame and s_.name.lower().startswith("box"):
-                for p_ in s_.text_frame.paragraphs:
-                    t_ = para_text(p_).strip()
-                    if len(t_) > 25: spp.append(len(SENT.split(t_)))
-    one_sentence_style = bool(spp) and statistics.median(spp) <= 1
-    titles = []
-    for slide in slides:
-        t_ = next((x for x in iter_shapes(slide.shapes) if x.has_text_frame and x.name.lower() == "title"), None)
-        titles.append(t_.text_frame.text.strip() if t_ is not None else "")
-    title_nums = [m.group(1) for m in (re.match(r"^(\d+(?:\.\d+)*)\b", t) for t in titles) if m]
-    for si, slide in enumerate(slides, 1):
-        peers = stat.get(slide.slide_layout.name, Counter())
-        n_layout = sum(1 for s in slides if s.slide_layout.name == slide.slide_layout.name)
-        if n_layout < 4 or not peers:
-            continue
-        body_name, cnt = peers.most_common(1)[0]
-        if cnt < max(3, 0.5 * n_layout):
-            continue
-        shapes = list(iter_shapes(slide.shapes))
-        if any(s.name == body_name for s in shapes):
-            continue
-        title = next((s for s in shapes if s.has_text_frame and s.name.lower() == "title"), None)
-        if not title or not title.text_frame.text.strip():
-            continue
-        mnum = re.match(r"^(\d+(?:\.\d+)*)\b", title.text_frame.text.strip())
-        if mnum and any(n.startswith(mnum.group(1) + ".") for n in title_nums):
-            continue                                    # a parent section title: an intentional divider slide
-        tnorm = ws_lower(title.text_frame.text)
-        hs = [(ws_lower(t), t, pg, k) for _, t, pg, k in heads]
-        r = process.extractOne(tnorm, [h[0] for h in hs], scorer=fuzz.ratio, score_cutoff=88)
-        if not r:
-            log(si, body_name, "missing_shape", "", "", 0.3, "review", f"body box '{body_name}' missing; no heading in the source matches the slide title")
-            continue
-        _, _, hi = r
-        k0 = hs[hi][3]
-        nxt = [h[3] for h in hs[hi + 1:]]
-        k1 = nxt[0] if nxt else len(units)
-        body_units = [u for u in units[k0 + 1:k1] if u.kind not in ("heading", "equation", "figure_caption")]
-        if not body_units:
-            log(si, body_name, "missing_shape", "", "", 0.3, "review", "matched heading has no body text in the source")
-            continue
-        text, picked = "", []
-        for u in body_units:
-            if text and len(text) + len(u.text) > cap:
-                break
-            text = (text + " " + u.text).strip() if u.kind != "li" else text; picked.append(u)
-            if len(text) >= cap: break
-        paras_txt = [u.text for u in picked] if all(u.kind != "li" for u in picked) else [u.text for u in picked]
-        if sum(len(x) for x in paras_txt) > cap * 1.3:                              # trim to a sentence boundary
-            joined = " ".join(paras_txt)[:cap]
-            cut = max(joined.rfind(". "), joined.rfind("? "), joined.rfind("! "))
-            paras_txt = [joined[:cut + 1] if cut > 80 else joined]
-        if one_sentence_style:
-            joined_all = " ".join(paras_txt)
-            paras_txt = [x.strip() for x in SENT.split(joined_all) if x.strip()]
-        peer = None
-        for j in range(si - 2, -1, -1):
-            peer = next((s for s in iter_shapes(slides[j].shapes) if s.name == body_name and s.has_text_frame), None)
-            if peer: break
-        if peer is None:
-            peer = next((s for s in slides[si:] for s in iter_shapes(s.shapes) if s.name == body_name and s.has_text_frame), None) if False else None
-        if peer is None:
-            continue
-        el = copy.deepcopy(peer._element)
-        tree = slide.shapes._spTree
-        ids = [int(x) for x in tree.xpath(".//p:cNvPr/@id")] or [1]
-        el.xpath(".//p:cNvPr")[0].set("id", str(max(ids) + 1))
-        anchor = next((s._element for s in shapes if s.name.lower() in ("rule", "breadcrumb")), None)
-        (anchor.addnext(el) if anchor is not None else tree.append(el))
-        new_sh = next(s for s in slide.shapes if s._element is el)
-        txb = new_sh.text_frame
-        ps = txb.paragraphs
-        tmpl = copy.deepcopy(ps[0]._p)
-        for p in ps[1:]:
-            p._p.getparent().remove(p._p)
-        first_p = ps[0]
-        def fill(p_el, text_):
-            runs = p_el.findall(f"{{{A_NS}}}r")
-            for r_ in runs[1:]: p_el.remove(r_)
-            if runs: runs[0].find(f"{{{A_NS}}}t").text = text_
-        fill(first_p._p, paras_txt[0])
-        prev = first_p._p
-        for t_ in paras_txt[1:]:
-            np_ = copy.deepcopy(tmpl); fill(np_, t_); prev.addnext(np_); prev = np_
-        log(si, body_name, "missing_shape", "", " ".join(paras_txt)[:300], 0.55, "applied", f"restored from source page {hs[hi][2]} (heading '{hs[hi][1][:40]}'); text boundaries are approximate")
 
-    # ---------------------------------------------------------------- save + validate
-    target.parent.mkdir(parents=True, exist_ok=True)
-    prs.save(str(target))
-    ok = True
-    try:
-        chk = Presentation(str(target))
-        ok = len(chk.slides) == len(slides) and zipfile.ZipFile(target).testzip() is None
-    except Exception as e:
-        ok = False; audit.event("powerpoint", "validation_failed", deck=pptx.name, error=str(e))
-    if not ok:
-        import shutil; shutil.copyfile(pptx, target)           # never ship a corrupt deck
-    (work / "changes").mkdir(parents=True, exist_ok=True)
-    (work / "changes" / f"{pptx.stem}.json").write_text(json.dumps(changes, ensure_ascii=False, indent=1), encoding="utf-8")
-    applied = sum(1 for c in changes if c["action"] == "applied")
-    res = {"pptx": pptx.name, "pdf": pdf.name, "output": target.name, "slides": len(slides), "applied": applied,
-           "review": sum(1 for c in changes if c["action"] == "review"), "types": dict(Counter(c["change_type"] for c in changes if c["action"] == "applied")),
-           "valid": ok, "seconds": round(time.time() - t0, 2)}
-    audit.event("powerpoint", "deck_done", **{k: v for k, v in res.items() if k != "types"})
-    return res
+def amend_deck(pdf: Path, pptx: Path, target: Path, work: Path, settings: Settings, audit: AuditLog) -> dict:
+    started = time.monotonic()
+    ir = load_ir(pdf, work, settings, audit)
+    report = repair_presentation(ir, pptx, target, settings)
+    changes_dir = work / "changes"
+    changes_dir.mkdir(parents=True, exist_ok=True)
+    (changes_dir / f"{pptx.stem}.json").write_text(json.dumps(report["records"], ensure_ascii=False, indent=2),
+                                                encoding="utf-8")
+    result = {"pptx": pptx.name, "pdf": pdf.name, "output": target.name, "slides": report["slides"],
+              "applied": len(report["applied"]), "review": len(report["review"]), "status": report["status"],
+              "types": dict(Counter(r["change_type"] for r in report["applied"])),
+              "valid": True, "seconds": round(time.monotonic() - started, 2)}
+    audit.event("powerpoint", "deck_done", **result)
+    return result

@@ -75,7 +75,8 @@ def extract_lines(page) -> list[Line]:
                 for r, uri in links:
                     if r.intersects(sb):
                         href = uri; break
-                spans.append(Span(text=t, size=s["size"], bold=bold, italic=ital, sup=sup, sub=sub, strike=strike, link=href))
+                spans.append(Span(text=t, size=s["size"], bold=bold, italic=ital, sup=sup, sub=sub,
+                                  strike=strike, link=href, font=s.get("font", "")))
                 texts.append(t)
                 tot += n; sizes.append((s["size"], n))
                 bold_chars += n if bold else 0; ital_chars += n if ital else 0
@@ -86,6 +87,35 @@ def extract_lines(page) -> list[Line]:
             out.append(Line(text=text.rstrip(), bbox=tuple(ln["bbox"]), size=wsz, bold=tot > 0 and bold_chars / tot > 0.6,
                             italic=tot > 0 and ital_chars / tot > 0.6, spans=spans, source="native", rtl=is_rtl(text)))
     return out
+
+
+def recover_running_text(page, recognized: list[Line], band: float) -> list[Line]:
+    """Replace corroborated OCR in the margins with the original decoded lines."""
+    from rapidfuzz import fuzz
+    from utils.textutil import norm_cmp
+
+    opaque_fonts = {entry[3] for entry in page.get_fonts() if entry[2] == "Type3"}
+    height = page.rect.height
+    threshold = height * band
+    native = [line for line in extract_lines(page)
+              if (line.bbox[1] < threshold or line.bbox[3] > height - threshold)
+              and line.spans and all(span.font not in opaque_fonts for span in line.spans)]
+    if not native:
+        return recognized
+    used = set()
+    merged = []
+    for line in recognized:
+        x0, y0, x1, y1 = line.bbox
+        near = [(i, other) for i, other in enumerate(native) if i not in used
+                and min(y1, other.bbox[3]) > max(y0, other.bbox[1])
+                and min(x1, other.bbox[2]) > max(x0, other.bbox[0])]
+        combined = " ".join(other.text for _, other in sorted(near, key=lambda pair: pair[1].bbox[0]))
+        if combined and fuzz.ratio(norm_cmp(combined), norm_cmp(line.text)) >= 88:
+            merged.extend(other for _, other in near)
+            used.update(i for i, _ in near)
+        else:
+            merged.append(line)
+    return merged
 
 
 def extract_tables(page, settings) -> list[Block]:
@@ -138,6 +168,7 @@ def extract_tables(page, settings) -> list[Block]:
 
 
 def extract_figures(page, settings, table_boxes, lines=None) -> list[Block]:
+    from hashlib import sha256
     import pymupdf
     W, H = page.rect.width, page.rect.height
     figs: list[Block] = []
@@ -145,7 +176,7 @@ def extract_figures(page, settings, table_boxes, lines=None) -> list[Block]:
     def inside_table(r):
         return any(pymupdf.Rect(tb).contains(r) or pymupdf.Rect(tb).intersect(r).get_area() > 0.6 * r.get_area() for tb in table_boxes)
     try:
-        infos = page.get_image_info()
+        infos = page.get_image_info(hashes=True)
     except Exception:
         infos = []
     page_rect = page.rect
@@ -167,7 +198,8 @@ def extract_figures(page, settings, table_boxes, lines=None) -> list[Block]:
             continue
         if r.width < mn or r.height < mn or r.get_area() > 0.92 * W * H or inside_table(r):
             continue
-        figs.append(Block(tag="figure", bbox=tuple(r), kind="figure", alt="", cls="raster"))
+        figs.append(Block(tag="figure", bbox=tuple(r), kind="figure", cls="raster",
+                          fingerprint=i.get("digest", b"").hex()))
     try:
         for r in page.cluster_drawings():
             r = pymupdf.Rect(r)
@@ -178,7 +210,10 @@ def extract_figures(page, settings, table_boxes, lines=None) -> list[Block]:
             ov, nl = text_overlap(r)
             if nl >= 6 and ov > 0.25:                            # frame/box around running text
                 continue
-            figs.append(Block(tag="figure", bbox=tuple(r), kind="figure", alt="", cls="vector"))
+            preview = page.get_pixmap(matrix=pymupdf.Matrix(0.5, 0.5), clip=r,
+                                      colorspace=pymupdf.csGRAY) if r.get_area() < 4_000_000 else None
+            figs.append(Block(tag="figure", bbox=tuple(r), kind="figure", cls="vector",
+                              fingerprint=sha256(preview.samples).hexdigest() if preview else ""))
     except Exception:
         pass
     return figs

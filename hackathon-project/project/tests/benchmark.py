@@ -1,18 +1,44 @@
 """Reproducible benchmark. Only reports numbers it measured; reference data exists for ONE document (the example).
 
-    python tests/benchmark.py --corpus "<Hackathon-Internal-Track>/Data" --out ../docs/benchmark_results.json
+    python tests/benchmark.py --corpus "<Hackathon-Internal-Track>/Data" --out ../storage/windows-benchmark.json
 """
 from __future__ import annotations
-import argparse, glob, json, os, resource, shutil, subprocess, sys, tempfile, time
+import argparse, glob, json, os, platform, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
+import psutil
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+def run_measured(args: list[str]) -> dict:
+    started = time.perf_counter()
+    peak = 0
+    process = psutil.Popen(args)
+    while process.poll() is None:
+        try:
+            processes = [process, *process.children(recursive=True)]
+        except psutil.NoSuchProcess:
+            break
+        total = 0
+        for child in processes:
+            try:
+                total += child.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        peak = max(peak, total)
+        time.sleep(0.05)
+    return {"seconds": round(time.perf_counter() - started, 2), "exit_code": process.wait(),
+            "peak_sampled_process_tree_rss_mib": round(peak / (1024 * 1024), 1)}
+
+
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--corpus", required=True); ap.add_argument("--out", default=str(ROOT.parent / "docs" / "benchmark_results.json"))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--corpus", required=True)
+    ap.add_argument("--out", required=True, help="Path for a new benchmark report")
     a = ap.parse_args(); corpus = Path(a.corpus)
+    if Path(a.out).exists():
+        ap.error("the output report already exists; supply a new filename")
     ex = corpus / "Example Data Set" / "20239005532129"
     work = Path(tempfile.mkdtemp()); inp = work / "in"; out = work / "out"; inp.mkdir()
     for f in glob.glob(str(corpus / "Data Set" / "*" / "*.pdf")) + glob.glob(str(corpus / "Data Set" / "*" / "*.pptx")):
@@ -22,11 +48,11 @@ def main():
         shutil.copy(f, inp)
     res: dict = {}
     # --- cold run (no cache), 1 worker: the conservative number
-    t = time.time()
-    p = subprocess.run([sys.executable, str(ROOT / "main.py"), "--input", str(inp), "--output", str(out), "--workers", "1"], capture_output=True, text=True)
-    res["cold_run"] = {"seconds": round(time.time() - t, 1), "exit_code": p.returncode, "workers": 1,
-                       "cpu_count": os.cpu_count(), "peak_rss_mb_children": round(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024)}
-    rep = json.loads((work / "docsync_run" / "run_report.json").read_text())
+    res["cold_run"] = {
+        **run_measured([sys.executable, str(ROOT / "main.py"), "--input", str(inp), "--output", str(out), "--workers", "1"]),
+        "workers": 1, "cpu_count": os.cpu_count(), "platform": platform.platform(),
+    }
+    rep = json.loads((work / "docsync_run" / "run_report.json").read_text(encoding="utf-8"))
     res["corpus"] = {"documents": rep["documents"], "succeeded": rep["succeeded"], "pages": rep["pages"], "ocr_pages": rep["ocr_pages"],
                      "decks": len(rep["amendments"]), "decks_valid": sum(1 for x in rep["amendments"] if x.get("valid")),
                      "xml_issues": {d["doc_id"]: d["validation"]["issues"] for d in rep["per_document"] if d.get("validation", {}).get("issues")}}

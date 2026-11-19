@@ -68,11 +68,22 @@ def test_end_to_end_deck_repair_and_report(tmp_path, settings, audit):
     prs = Presentation(str(out)); s1 = prs.slides[0]
     box = next(sh for sh in s1.shapes if sh.name == "box1")
     assert "150" in box.text_frame.text and box.text_frame.paragraphs[0].runs[0].font.bold      # corrected, formatting kept
-    assert next(sh for sh in s1.shapes if sh.name == "footer").text_frame.text.endswith("by Networks")
+    assert next(sh for sh in s1.shapes if sh.name == "footer").text_frame.text == "Whale Optimization Algorithm Guided"
     changes = json.loads((tmp_path / "work" / "changes" / "paper_errors.json").read_text())
     for c in changes:
         assert {"document", "original_location", "new_location", "change_type", "old_content", "new_content", "confidence", "recommended_action"} <= set(c)
     assert any(c["change_type"] == "number_error" and c["action"] == "applied" for c in changes)
+    correction = next(c for c in changes if c["action"] == "applied")
+    assert correction["original_location"]["shape_id"] == box.shape_id
+    from lxml import etree
+    xml = etree.parse(str(tmp_path / "out" / "paper.xml"))
+    assert "150" in "".join(xml.xpath(correction["source"]["xml_node"])[0].itertext())
+    from quality.conformance import compare_pptx
+    preservation = compare_pptx(deck, out)
+    assert preservation["slide_order_match"]
+    assert preservation["changed_slides"] == [1]
+    assert not any(preservation["other_parts"].values())
+    assert set(preservation["slides"][0]["diff_counts"]) == {"text"}
     assert deck.read_bytes() != out.read_bytes() and Presentation(str(deck))                  # input is never overwritten
 
 
@@ -81,3 +92,38 @@ def test_compare_documents_reports_added_deleted_modified():
     new = [{"text": "Alpha beta gamma delta epsilon zeta", "page": 1, "idx": 0}, {"text": "Brand new content appears now", "page": 3, "idx": 1}, {"text": "Stable paragraph about nothing", "page": 3, "idx": 2}]
     kinds = {c["change_type"] for c in compare_documents(old, new, "d")}
     assert kinds == {"modified", "deleted", "added", "moved"}
+
+
+def test_version_sync_leaves_repeated_deck_paragraphs_for_review(tmp_path):
+    from powerpoint.sync import synchronize
+
+    before = "This document reports a total of 240 units."
+    after = "This document reports a total of 260 units."
+    deck = Presentation()
+    for _ in range(2):
+        slide = deck.slides.add_slide(deck.slide_layouts[6])
+        slide.shapes.add_textbox(Inches(1), Inches(1), Inches(8), Inches(2)).text = before
+    source, output = tmp_path / "source.pptx", tmp_path / "output.pptx"
+    deck.save(source)
+    report = synchronize(source, output, [{"category": "text", "change_type": "modified",
+                                           "old_content": before, "new_content": after, "can_sync": True}])
+    assert not report["applied"]
+    assert report["review"][0]["reason"] == "More than one deck paragraph matches."
+    assert all(slide.shapes[0].text == before for slide in Presentation(output).slides)
+
+
+def test_batch_reports_invalid_deck_without_publishing_copy(tmp_path):
+    from main import main
+
+    folder = tmp_path / "input"
+    folder.mkdir()
+    make_pdf(folder / "paper.pdf", [lambda page: paragraph(page, 100, SRC, size=11)])
+    source = folder / "paper_errors.pptx"
+    source.write_bytes(b"Invalid deck.")
+    out, work = tmp_path / "out", tmp_path / "work"
+    code = main(["--input", str(folder), "--output", str(out), "--work-dir", str(work), "--no-ocr"])
+    assert code == 1
+    assert not list(out.glob("*.pptx"))
+    assert source.read_bytes() == b"Invalid deck."
+    report = json.loads((work / "run_report.json").read_text(encoding="utf-8"))
+    assert report["amendments"][0]["status"] == "failed" and report["amendments"][0]["output"] is None

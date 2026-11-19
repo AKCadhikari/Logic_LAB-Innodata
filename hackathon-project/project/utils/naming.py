@@ -24,21 +24,24 @@ def _key(p: Path) -> str:
 
 
 def pair_documents(pdfs: list[Path], pptxs: list[Path]) -> list[tuple[Path, Path]]:
-    """Pair every PPTX with the PDF it was derived from (by id in the filename, then by order)."""
+    """Pair decks with uniquely identified PDF sources."""
     pairs, used = [], set()
-    by_key = {_key(p): p for p in pdfs}
     for pp in pptxs:
         k = _key(pp)
-        if k in by_key:
-            pairs.append((by_key[k], pp)); used.add(pp); continue
+        same_name = [pdf for pdf in pdfs if _key(pdf) == k]
+        if len(same_name) == 1:
+            pairs.append((same_name[0], pp)); used.add(pp); continue
+        if same_name:
+            continue
         m = re.fullmatch(r"(?:amendment|input|doc)[_-]?(\d+)", k)
         if m:
-            for cand in pdfs:
-                m2 = re.fullmatch(r"(?:amendment|input|doc)[_-]?(\d+)", _key(cand))
-                if m2 and int(m2.group(1)) == int(m.group(1)):
-                    pairs.append((cand, pp)); used.add(pp); break
+            candidates = [pdf for pdf in pdfs
+                          if (number := re.fullmatch(r"(?:amendment|input|doc)[_-]?(\d+)", _key(pdf)))
+                          and int(number[1]) == int(m[1])]
+            if len(candidates) == 1:
+                pairs.append((candidates[0], pp)); used.add(pp)
     rest_p = sorted(p for p in pptxs if p not in used)
     rest_d = sorted(d for d in pdfs if all(d != a for a, _ in pairs))
-    if rest_p and len(rest_p) == len(rest_d):
+    if len(pdfs) == len(pptxs) == len(rest_p) == len(rest_d) == 1:
         pairs += list(zip(rest_d, rest_p))
     return pairs

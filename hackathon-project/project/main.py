@@ -20,7 +20,7 @@ sys.path.insert(0, str(HERE))
 from config.settings import Settings
 from ingestion.discover import discover, describe, duplicates
 from utils.logs import AuditLog, get_logger
-from utils.naming import pair_documents
+from comparison.pairing import match_presentations
 
 
 def build_parser():
@@ -92,7 +92,6 @@ def main(argv=None) -> int:
     from agents.orchestrator import run_pdfs
     stem_counts = Counter(pdf.stem.casefold() for pdf in pdfs)
     unique = [pdf for pdf in pdfs if stem_counts[pdf.stem.casefold()] == 1]
-    pairs = pair_documents(pdfs, found["pptxs"])
     results = [{"doc_id": pdf.stem, "file": pdf.name, "pages": 0, "ok": False, "status": "failed",
                 "error": "Multiple input PDFs have the same document name.", "outputs": {"xml": None, "pptx": None}}
                for pdf in pdfs if stem_counts[pdf.stem.casefold()] > 1]
@@ -100,6 +99,9 @@ def main(argv=None) -> int:
     with TemporaryDirectory(prefix="extract-", dir=work) as staging:
         extracted = run_pdfs(unique, settings, Path(staging), work, audit, t0)
     by_id = {pdf.stem: pdf for pdf in unique}
+    eligible = [by_id[item["doc_id"]] for item in extracted if item.get("ok")]
+    pairs = (match_presentations(eligible, found["pptxs"], work, explicit_single=len(unique) == 1)
+             if not args.skip_pptx else [])
     for extraction in extracted:
         pdf = by_id[extraction["doc_id"]]
         decks = [deck for source, deck in pairs if source == pdf]

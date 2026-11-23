@@ -41,9 +41,10 @@ def sample_blocks(blocks: list[Block]):
 
 
 def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None) -> bytes:
-    from xml_engine.serializer import _emit, _inline
+    from xml_engine.serializer import _emit, _inline, direction_attributes
 
-    root = etree.Element("document", lang=lang_attr(doc.lang, "name"), reading_order_layout_source="corrected")
+    root = etree.Element("document", lang=lang_attr(doc.lang, "name"), reading_order_layout_source="corrected",
+                         **direction_attributes(doc.language))
     header = etree.SubElement(root, "header")
     title = next((block.text for page in doc.pages for block in page.blocks if block.kind == "title"),
                  doc.meta.get("pdf_metadata", {}).get("title", ""))
@@ -79,7 +80,7 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
         return {key: f"{value:.2f}" for key, value in zip(("x0", "y0", "x1", "y1"), box)} if box else {}
 
     def text_attributes(block, page, prefix, kind):
-        attributes = {"page": str(page.n), "id": identifier(prefix)}
+        attributes = {"page": str(page.n), "id": identifier(prefix), **direction_attributes(block.language)}
         if kind:
             attributes["kind"] = kind
         if block.lang and block.lang != doc.lang:
@@ -87,7 +88,10 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
         if block.bbox:
             attributes.update(geometry(block.bbox))
             x0, _, x1, _ = block.bbox
-            attributes["align"] = "center" if abs(x0 + x1 - page.width) < page.width * 0.025 else "left"
+            if abs(x0 + x1 - page.width) < page.width * 0.025:
+                attributes["align"] = "center"
+            else:
+                attributes["align"] = "right" if block.language.get("base_direction") == "rtl" else "left"
         if block.size > 0:
             attributes["font_size"] = f"{block.size:.1f}"
         return attributes
@@ -109,7 +113,11 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
     for page in doc.pages:
         if page.n > 1:
             front = False
-        etree.SubElement(parent(), "page", num=str(page.n), height=f"{page.height:.2f}", width=f"{page.width:.2f}")
+        page_language = page.language.get("language")
+        attributes = direction_attributes(page.language)
+        if page_language not in {None, "und", doc.lang}:
+            attributes["lang"] = lang_attr(page_language, "name")
+        etree.SubElement(parent(), "page", num=str(page.n), height=f"{page.height:.2f}", width=f"{page.width:.2f}", **attributes)
         for block in sample_blocks(page.blocks):
             text, kind, tag = block.text, block.kind, block.tag
             heading = tag in {"h2", "h3", "h4", "h5", "h6"}

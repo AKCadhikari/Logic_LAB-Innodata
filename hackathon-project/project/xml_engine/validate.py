@@ -2,6 +2,7 @@
 from __future__ import annotations
 import re
 from lxml import etree
+from utils.textutil import norm_ws
 from xml_engine.serializer import ALLOWED, PROFILES
 
 
@@ -18,6 +19,8 @@ def validate_xml(data: bytes, expected_pages: int, settings) -> dict:
         issues.append("root element is not <document>")
     if not root.get("lang"):
         issues.append("<document> has no lang attribute")
+    if any(node.get("dir") not in {None, "ltr", "rtl", "auto"} for node in root.iter()):
+        issues.append("A text direction attribute is invalid.")
     sample = settings.schema_profile == "sample"
     if settings.lang_format == "iso" and not sample:
         if any(not re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", el.get("lang", ""))
@@ -62,3 +65,39 @@ def validate_xml(data: bytes, expected_pages: int, settings) -> dict:
     return {"well_formed": True, "issues": issues, "pages": len(pages), "empty_pages": empty,
             "tables": len(root.findall(".//table")), "figures": len(root.findall(".//figure_wrap" if sample else ".//figure")),
             "headings": sum(len(root.findall(f".//h{i}")) for i in range(1, 7)), "chars": len("".join(root.itertext()))}
+
+
+def verify_unicode(data: bytes, document, locations: dict) -> dict:
+    """Compare logical IR text with the serialized nodes without Unicode normalization."""
+    root = etree.fromstring(data, parser=etree.XMLParser(resolve_entities=False, no_network=True))
+    count, issues = 0, []
+
+    def check(page, key, expected, label):
+        nonlocal count
+        if not expected:
+            return
+        count += 1
+        path = locations.get(key)
+        values = root.xpath(path) if path else []
+        if values:
+            value = values[0]
+            rendered = norm_ws("".join(value.itertext()))
+            # Sample XML can add list labels and use formula image alternate text.
+            if norm_ws(expected) in rendered or any(
+                    norm_ws(expected) in norm_ws(img.get("alt", "")) for img in value.iter("img")):
+                return
+        issues.append({"page": page, "node": path, "kind": label})
+
+    def visit(block, page):
+        check(page, id(block), block.text, block.kind or block.tag)
+        check(page, (id(block), "caption"), block.caption, "caption")
+        for cell in block.cells:
+            check(page, id(cell), cell.text, "table_cell")
+        for child in block.children:
+            visit(child, page)
+
+    for page in document.pages:
+        for block in page.blocks:
+            visit(block, page.n)
+    return {"status": "validation_partial" if issues else "text_preserved", "nodes_checked": count,
+            "unconfirmed_nodes": issues}

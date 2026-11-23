@@ -75,8 +75,31 @@ The [official sample validation](../docs/OFFICIAL_SAMPLE_VALIDATION.md) records 
 the remaining differences, and the command for reproducing the reports. The [repository audit](../docs/REPOSITORY_AUDIT.md)
 and [implementation roadmap](../docs/IMPLEMENTATION_ROADMAP.md) record the earlier Windows verification.
 For a saved bundle, use `project/sample_check.py --export-dir <folder>` with the reference inputs described there.
-The bundled source-region map applies to the exact official PDF and, for slide repairs, the exact original deck.
-Documents outside that match use the general OCR, layout and evidence-based repair pipeline.
+All documents use the same page-level profiling, OCR, layout, and presentation-matching pipeline. The earlier
+source-region map remains available to the offline sample comparison command as historical ground truth.
+
+## Local multilingual verification
+
+The engineering brief requires Arabic, Japanese, Korean, Czech, Slovak, German, Dutch, Italian, French,
+and English. Detection records include script, language, direction, confidence, and method. The workspace
+shows page and block language and flags uncertainty. Downloads from pages with missing text or unresolved
+native text ordering are marked as draft, with the PowerPoint update blocked. Structural validation and
+source accuracy are reported separately.
+
+Each extraction saves `document_profile.json` and `multilingual_validation_report.json` in its
+`profiles/<document-id>` work folder. Dual exports include both reports alongside the XML and PowerPoint.
+Run the local benchmark with the project's virtual environment from this directory.
+
+```powershell
+.\.venv\Scripts\python.exe -B project/language_check.py --out storage/new-language-capabilities
+.\.venv\Scripts\python.exe -B project/unseen_check.py --out storage/new-unseen-validation --capabilities storage/new-language-capabilities/language_support_report.json
+```
+
+The held-out runner uses Playwright, installed Chrome, and (for presentation rendering) LibreOffice.
+It writes the language support matrix and unseen-document report as well as the profiles and validation
+reports. The authored holdout is separate from the official samples. The matrix reports Unicode text,
+font coverage, and text recovered from rendered slides separately. Bidirectional presentation fidelity
+still requires visual review, especially for dates, units, and punctuation.
 
 ## Repository layout
 

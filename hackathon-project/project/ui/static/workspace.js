@@ -97,7 +97,10 @@ async function selectWorkspace(id, reset = true) {
     if (listed) listed.status = job.status;
     const active = job.status === "queued" || job.status === "running";
     const reviewPages = data.pages?.filter(page => page.requires_review).length || 0;
-    statusText((active && processingStatus(job.processing) || (job.status === "completed" ? "PDF processed" : job.status)) +
+    const extractionStatus = data.content_validation?.status === "manual_review_required" ?
+        "Extraction complete · manual review required" : data.content_validation?.status === "validation_partial" ?
+            "Extraction complete · validation partial" : "Extraction complete";
+    statusText((active && processingStatus(job.processing) || (job.status === "completed" ? extractionStatus : job.status)) +
         (job.total ? " · " + job.done + "/" + job.total + " pages" : "") +
         (reviewPages && !active ? " · " + reviewPages + " for review" : ""));
     $("#reproc").disabled = active;
@@ -109,6 +112,16 @@ async function selectWorkspace(id, reset = true) {
     if (active && !W.batch && W.selection === selection) {
         W.timer = setTimeout(() => selectWorkspace(id, false).catch(showError), 800);
     }
+}
+
+const bidiDir = language => language?.base_direction === "rtl" ? "rtl" : language?.base_direction === "ltr" ? "ltr" : "auto";
+
+function languageLabel(profile) {
+    if (!profile?.language) return "";
+    const language = profile.languages?.length > 1 ? profile.languages.join(", ") : profile.language;
+    return [language === "und" ? "Undetermined language" : language, profile.script,
+        profile.direction, profile.confidence == null ? "" :
+            Math.round(profile.confidence * 100) + "% detection confidence"].filter(Boolean).join(" · ");
 }
 
 function workspaceViewer() {
@@ -131,18 +144,21 @@ function workspaceViewer() {
     $("#zoom-in").disabled = W.zoom === 200;
     if (S.vtab === "text") {
         $("#viewer").innerHTML = '<div class="textview">' + page.blocks.map(block => {
-            let details = esc(block.text || block.caption || block.alt);
+            let details = '<div dir="' + bidiDir(block.language) + '">' + esc(block.text || block.caption || block.alt) + '</div>';
             if (block.cells.length) {
                 const rows = new Map();
-                for (const cell of block.cells) {
+                const rtl = bidiDir(block.language) === "rtl";
+                const cells = rtl && block.source === "native" ? [...block.cells].sort((a, b) => a.row - b.row || b.col - a.col) : block.cells;
+                for (const cell of cells) {
                     if (!rows.has(cell.row)) rows.set(cell.row, []);
                     const tag = cell.header ? "th" : "td";
-                    rows.get(cell.row).push('<' + tag + ' rowspan="' + cell.rowspan + '" colspan="' + cell.colspan + '">' +
+                    rows.get(cell.row).push('<' + tag + ' dir="' + bidiDir(cell.language) + '" rowspan="' + cell.rowspan + '" colspan="' + cell.colspan + '">' +
                         esc(cell.text) + '</' + tag + '>');
                 }
-                details += "<table>" + [...rows.values()].map(row => "<tr>" + row.join("") + "</tr>").join("") + "</table>";
+                details += '<table dir="' + bidiDir(block.language) + '">' + [...rows.values()].map(row => "<tr>" + row.join("") + "</tr>").join("") + "</table>";
             }
-            return '<article class="tb"><small>' + esc(block.kind || block.tag) + '</small>' + details + '</article>';
+            return '<article class="tb"><small>' + esc([block.kind || block.tag, languageLabel(block.language)]
+                .filter(Boolean).join(" · ")) + '</small>' + details + '</article>';
         }).join("") + '</div>';
         return;
     }
@@ -159,7 +175,7 @@ function workspaceViewer() {
             return S.vtab === "zoning" ? rectangle(block.bbox, 'fill="' + color + '" fill-opacity=".17" stroke="' +
                 color + '"', block.kind || block.tag) :
                 '<circle cx="' + x + '" cy="' + (y + 8) + '" r="10" fill="' + color + '"/><text x="' + x +
-                '" y="' + (y + 12) + '" text-anchor="middle" fill="white">' + (block.i + 1) + '</text>';
+                '" y="' + (y + 12) + '" text-anchor="middle" fill="white">' + (block.reading_order || block.i + 1) + '</text>';
         }).join("");
     }
     if (W.highlight && S.vtab === "pdf" && !S.rot) {
@@ -192,14 +208,14 @@ function pageDiagnostics(page) {
     const attempts = (ocr?.attempts || []).map(attempt => '<div>' + esc(attempt.model || engineName(attempt.engine)) +
         ' · ' + esc(attempt.status) + (attempt.issues.length ? ' · ' + esc(attempt.issues.join(" ")) : '') + '</div>').join("");
     return '<div class="sec">Page ' + page.n + ' diagnostics</div><div class="card">' +
-        '<div>' + esc(selected) + ' · ' + confidence + '</div>' +
+        '<div>' + esc(selected) + ' · ' + confidence + '</div><div>' + esc(languageLabel(page.language)) + '</div>' +
         '<div>Native text: ' + esc(diag.health || "unknown") +
         (Number.isInteger(diag.native_chars) ? ' · ' + diag.native_chars + ' characters' : '') + '</div>' +
         '<div>' + (diag.ocr_required ? "OCR required" : "OCR not required") +
         (diag.appears_scanned ? ' · scanned page' : '') + '</div>' + attempts +
         (diag.layout ? '<div>Layout: ' + esc(diag.layout.engine) + ' · ' + esc(diag.layout.status) + '</div>' : '') +
         (page.requires_review ? '<strong class="notice">Manual review required</strong>' : '') +
-        '<div>' + esc((diag.reasons || []).join(" ")) + '</div></div>';
+        '<div>' + esc([...(diag.reasons || []), ...(diag.review_reasons || [])].join(" ")) + '</div></div>';
 }
 
 async function reviewPanel() {
@@ -243,7 +259,12 @@ async function reviewPanel() {
         '<div><button class="btn" value="save">Save draft</button> <button class="btn pri" value="approve">Approve</button></div></form>' +
         counts + '<div id="page-diagnostics">' + pageDiagnostics(page) + '</div>' +
         '<div class="sec">Validation</div><div class="card">XML ' +
-        (data.validation.issues.length ? esc(data.validation.issues.join(", ")) : "passed structural checks") + '</div>' +
+        (data.validation.issues.length ? esc(data.validation.issues.join(", ")) : "passed structural checks") +
+        '<div>' + esc(languageLabel(data.language)) + '</div>' +
+        (data.content_validation?.status === "manual_review_required" ?
+            '<strong class="notice">Manual review required before PowerPoint export</strong>' :
+            data.content_validation?.status === "validation_partial" ?
+                '<strong class="notice">Validation partially passed · content review required</strong>' : '') + '</div>' +
         data.warnings.map(warning => '<div class="notice">' + esc(warning) + '</div>').join("") + history;
     const locate = $("#locate");
     if (locate) locate.onclick = () => {
@@ -270,7 +291,10 @@ async function reviewPanel() {
 
 function exportCard(report, links) {
     const statuses = {
-        completed: "XML and PowerPoint export complete",
+        completed: report.content_validation?.status === "validation_partial" ||
+            report.content_validation?.presentation?.status === "manual_review_required" ?
+            "XML and PowerPoint generated · content review required" : "XML and PowerPoint generated",
+        manual_review_required: "Draft XML · manual review required",
         partial: report.outputs.pptx ? "XML and PowerPoint available · ZIP failed" : "XML available · PowerPoint failed",
         failed: "Export failed",
         xml_only: "XML-only export",
@@ -280,7 +304,7 @@ function exportCard(report, links) {
         [["xml", "XML"], ["pptx", "PowerPoint"]].map(([kind, label]) => {
             const file = report.outputs[kind];
             if (!file) return '<div>' + label + ' · unavailable</div>';
-            return '<div class="export-location">' + esc(file.filename) + ' · ' + (file.valid ? "Validated" : "Invalid") +
+            return '<div class="export-location">' + esc(file.filename) + ' · ' + (file.valid ? "Structure validated" : "Invalid") +
                 ' · ' + file.size_bytes.toLocaleString() + ' bytes</div>' +
                 '<a class="workspace-link" href="' + links[kind] + '">Download ' + label + '</a>';
         }).join("") +

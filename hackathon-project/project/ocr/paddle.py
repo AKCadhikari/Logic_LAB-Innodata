@@ -14,7 +14,7 @@ from ocr.engine import render_gray
 from ocr.recognition import Recognition, RecognitionError
 from utils.textutil import is_rtl
 
-LATIN = {"en", "fr", "de", "nl", "it", "cs", "sk", "und", ""}
+LATIN = {"en", "fr", "de", "nl", "it", "cs", "sk"}
 RECOGNIZERS = {"ja": "PP-OCRv5_mobile_rec", "zh": "PP-OCRv5_mobile_rec",
                "ko": "korean_PP-OCRv5_mobile_rec", "ar": "arabic_PP-OCRv3_mobile_rec"}
 

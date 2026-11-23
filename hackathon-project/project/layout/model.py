@@ -43,6 +43,8 @@ class Line:
     source: str = "native"           # native | ocr
     rtl: bool = False
     grp: int = -1                    # OCR paragraph group id (-1 = none)
+    original_text: str | None = None
+    writing_mode: str = "horizontal"
 
 
 @dataclass
@@ -53,6 +55,9 @@ class Cell:
     rowspan: Annotated[int, Field(ge=1)] = 1
     colspan: Annotated[int, Field(ge=1)] = 1
     header: bool = False
+    language: dict = field(default_factory=dict)
+    original_text: str | None = None
+    bbox: Optional[BBox] = None
 
 
 @dataclass
@@ -75,6 +80,12 @@ class Block:
     marker: str = ""                                         # printed marker recovered before list tagging
     ocr_engine: str = ""
     recognition_confidence: Confidence | None = None
+    original_text: str | None = None
+    language: dict = field(default_factory=dict)
+    reading_order: int | None = None
+    source_reference: dict = field(default_factory=dict)
+    validation_status: str = "unverified"
+    writing_mode: str = "horizontal"
 
 
 @dataclass
@@ -88,6 +99,7 @@ class PageIR:
     ocr_engine: str = ""
     layout_engine: str = "reconstruction"
     requires_review: bool = False
+    language: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -97,6 +109,7 @@ class DocIR:
     lang: str = "und"
     pages: list[PageIR] = field(default_factory=list)
     meta: dict = field(default_factory=dict)
+    language: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)

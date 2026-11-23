@@ -10,6 +10,7 @@ TABLE_WORDS = re.compile(r"^\s*(table|tab\.?|tabelle|tabulka|tabuľka|tabella|ta
 PAGENUM_RE = re.compile(r"^[\W_]*(?:page|pg\.?|p\.?|seite|strana|stránka|pagina|página|صفحة)?\s*\d{1,4}(?:\s*(?:/|of|von|z|di|sur)\s*\d{1,4})?[\W_]*$|^[\W_]*[ivxlcdm]{1,6}[\W_]*$", re.I)
 NUMHEAD_RE = re.compile(r"^\s*(\d{1,2}(?:\.\d{1,2}){0,3})\.?\s+([A-ZÀ-ÝĀ-Žا-ي\u3040-\u9fff\uac00-\ud7af])")
 EQ_TAIL = re.compile(r"\(\s*\d{1,2}(?:\.\d{1,2})?\s*\)\s*$")
+SIMPLE_EQUATION = re.compile(r"(?u)\s*[^\W_](?:[\d₀-₉]*)\s*=\s*[\w\s.+−×÷*/^()√≤≥]+")
 BULLET_RE = re.compile(r"^\s*([\u2022\u25cf\u25e6\u25aa\u25a0\u2023\u2043\u00b7•·▪◦○●■□➢➤►–—\-\*])\s+(?=\S)")
 NUM_RE = re.compile(r"^\s*(\(?(?:\d{1,3}|[a-zA-Z]|[ivxIVX]{1,5})[.)])\s+(?=\S)")
 
@@ -132,18 +133,21 @@ def xy_cut(items: list, med_h: float, page_w: float, rtl: bool, depth: int = 0) 
 # ---------------------------------------------------------------- paragraph building
 def _merge_same_row(lines: list[Line]) -> list[Line]:
     out: list[Line] = []
-    for ln in sorted(lines, key=lambda l: (round(l.bbox[1] / 2), l.bbox[0])):
+    for ln in sorted(lines, key=lambda l: (round(l.bbox[1] / 2), -l.bbox[2] if l.rtl else l.bbox[0])):
         if out:
             p = out[-1]
             ov = min(p.bbox[3], ln.bbox[3]) - max(p.bbox[1], ln.bbox[1])
             h = min(p.bbox[3] - p.bbox[1], ln.bbox[3] - ln.bbox[1])
             gap = ln.bbox[0] - p.bbox[2]
-            if h > 0 and ov > 0.55 * h and -2 < gap < 1.6 * max(p.size, 6):
-                a, b = (ln, p) if ln.rtl and p.rtl else (p, ln)
+            if (h > 0 and ov > 0.55 * h and -2 < gap < 1.6 * max(p.size, 6) and not (p.rtl or ln.rtl)
+                    and p.writing_mode == ln.writing_mode == "horizontal"):
+                a, b = p, ln
                 sep = "" if (not a.text.endswith(" ") and gap < 0.15 * max(p.size, 6)) else " "
                 out[-1] = Line(text=a.text + sep + b.text, bbox=(min(p.bbox[0], ln.bbox[0]), min(p.bbox[1], ln.bbox[1]), max(p.bbox[2], ln.bbox[2]), max(p.bbox[3], ln.bbox[3])),
                                size=max(p.size, ln.size), bold=p.bold and ln.bold, italic=p.italic and ln.italic,
-                               spans=a.spans + ([Span(text=sep)] if sep else []) + b.spans, conf=min(p.conf, ln.conf), source=p.source, rtl=p.rtl, grp=p.grp)
+                               spans=a.spans + ([Span(text=sep)] if sep else []) + b.spans, conf=min(p.conf, ln.conf),
+                               source=p.source, rtl=p.rtl, grp=p.grp,
+                               original_text=sep.join(line.original_text if line.original_text is not None else line.text for line in (p, ln)))
                 continue
         out.append(ln)
     return out
@@ -177,6 +181,8 @@ def _group_paragraphs(lines: list[Line], settings) -> list[list[Line]]:
         elif gap > (0.62 if ocr_src else 0.55) * ph:
             new = True
         elif abs(ln.size - prev.size) > size_tol * max(prev.size, 1):
+            new = True
+        elif ln.rtl != prev.rtl or ln.writing_mode != prev.writing_mode:
             new = True
         elif _is_marker(ln.text)[0]:
             new = True
@@ -258,8 +264,6 @@ def build_page(n: int, w: float, h: float, lines: list[Line], tables: list[Block
             (hdr if cy < h / 2 else ftr).append(ln); continue
         if in_box(ln, tboxes):
             continue
-        if in_box(ln, [f.bbox for f in figures if f.bbox and (f.cls == "vector" or source == "ocr")]) and not CAPTION_RE.match(ln.text):
-            continue
         flow.append(ln)
 
     for grp, tag, kind in ((hdr, "header", "publication_metadata"), (ftr, "footer", "publication_metadata")):
@@ -268,7 +272,8 @@ def build_page(n: int, w: float, h: float, lines: list[Line], tables: list[Block
             lines_in_band = _merge_same_row(lines_in_band)
         for ln in lines_in_band:
             page.blocks.append(Block(tag=tag, text=xml_safe(ln.text.strip()), bbox=ln.bbox, kind=kind,
-                                     spans=ln.spans, source=ln.source, size=ln.size, conf=ln.conf))
+                                     spans=ln.spans, source=ln.source, size=ln.size, conf=ln.conf,
+                                     original_text=ln.original_text or ln.text, writing_mode=ln.writing_mode))
     if ftr:   # footers go last
         page.blocks = [b for b in page.blocks if b.tag == "header"] + [b for b in page.blocks if b.tag == "footer"]
     head_blocks = [b for b in page.blocks if b.tag == "header"]
@@ -279,6 +284,7 @@ def build_page(n: int, w: float, h: float, lines: list[Line], tables: list[Block
     heights = [l.bbox[3] - l.bbox[1] for l in flow] or [10.0]
     med_h = statistics.median(heights)
     regions = xy_cut(items, med_h, w, doc_rtl) if items else []
+    page.diag["reading_regions"] = len(regions)
 
     blocks: list[Block] = []
     for reg in regions:
@@ -326,13 +332,17 @@ def _lines_to_blocks(lines: list[Line], ctx, settings, body: float, hsizes: list
         mk, mlen = _is_marker(text)
         alpha = [c for c in text if c.isalpha()]
         caps = bool(alpha) and sum(c.isupper() for c in alpha) / len(alpha) > 0.85 and len(alpha) >= 3
-        blk = Block(tag="p", text=text, bbox=bbox, spans=spans, conf=conf, source=source, size=size)
+        blk = Block(tag="p", text=text, bbox=bbox, spans=spans, conf=conf, source=source, size=size,
+                    original_text="\n".join(line.original_text or line.text for line in para),
+                    writing_mode=first.writing_mode)
         sym = sum(1 for c in text if not (c.isalpha() or c.isspace()))
         numbered_formula = EQ_TAIL.search(text) or re.search(r"\(\d+\.\d+\)", text)
         if not numbered_formula and x0 > 0.26 * w and "=" in text:
             numbered_formula = re.search(r"(?<![\d.])\d{2}\)$", text)
         is_eq = bool(numbered_formula and len(para) <= 5 and nwords <= 36 and (
             sym / max(len(text), 1) > 0.22 or (x0 > 0.20 * w and re.search(r"[=±×÷√∑∫]", text))))
+        is_eq |= (len(para) == 1 and nwords <= 10 and SIMPLE_EQUATION.fullmatch(text) is not None
+                  and re.search(r"[×÷√^]", text) is not None)
         mnum = NUMHEAD_RE.match(text)
         # footnote: small text in the lower part of the page
         if is_eq:

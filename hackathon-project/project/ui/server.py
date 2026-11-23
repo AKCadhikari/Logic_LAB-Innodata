@@ -44,13 +44,10 @@ def _ir(doc_id: str) -> dict:
     return json.loads((CFG["run"] / "ir" / f"{doc_id}.json").read_text(encoding="utf-8"))
 
 
-def _pdf_path(doc_id: str, ir: dict) -> Path:
+def _pdf_path(ir: dict) -> Path:
     p = Path(ir.get("path", ""))
-    if p.exists():
+    if p.is_file():
         return p
-    cand = list(CFG["input"].rglob(f"{doc_id}.pdf"))
-    if cand:
-        return cand[0]
     abort(404)
 
 
@@ -125,7 +122,7 @@ def doc(doc_id):
 @app.get("/api/doc/<doc_id>/page/<int:n>.png")
 def page_png(doc_id, n):
     ir = _ir(doc_id)
-    return render_page(_pdf_path(doc_id, ir), n)
+    return render_page(_pdf_path(ir), n)
 
 
 @app.get("/api/documents/<document_id>/page/<int:n>.png")
@@ -226,21 +223,22 @@ def reprocess(doc_id):
     from main import publish_batch_document
     from reporting.report import write_reports
     from utils.logs import AuditLog
-    from utils.naming import pair_documents
+    from comparison.pairing import match_presentations
 
     with _lock:
         from time import monotonic
 
         started = monotonic()
-        pdf = _pdf_path(doc_id, ir).resolve()
+        pdf = _pdf_path(ir).resolve()
         prior = _report()
         current = _document_report(doc_id)
         settings = Settings(**prior["settings"]) if prior.get("settings") else Settings.load()
         audit = AuditLog(CFG["run"] / "audit.jsonl")
         inputs = discover(CFG["input"])
-        decks = [deck for source, deck in pair_documents(inputs["pdfs"], inputs["pptxs"]) if source.resolve() == pdf]
         with TemporaryDirectory(prefix="extract-", dir=CFG["run"]) as staging:
             extraction = process_pdf(pdf, settings, Path(staging), CFG["run"], audit)
+        decks = [deck for source, deck in match_presentations(inputs["pdfs"], inputs["pptxs"], CFG["run"])
+                 if source.resolve() == pdf]
         res, amendment = publish_batch_document(pdf, extraction, decks, CFG["output"], CFG["run"], settings, audit,
                                                 xml_only=current.get("status") == "xml_only")
         documents = [entry for entry in prior.get("per_document", []) if entry["doc_id"] != doc_id] + [res]

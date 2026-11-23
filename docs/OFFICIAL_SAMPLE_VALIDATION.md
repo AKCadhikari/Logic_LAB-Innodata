@@ -1,5 +1,8 @@
 # Official hackathon sample validation
 
+This report describes a historical run. The current extraction and export pipeline uses the same processing
+for all inputs. The source-region map below is retained for offline reference comparison.
+
 ## Fidelity and archive validation
 
 The supplied QA deck promotes ten shapes out of PowerPoint markup-compatibility branches. The original deck retains

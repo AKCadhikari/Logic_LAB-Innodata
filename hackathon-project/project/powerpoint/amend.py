@@ -54,10 +54,13 @@ class Match:
 
 
 def load_ir(pdf: Path, work: Path, settings: Settings, audit: AuditLog) -> DocIR:
+    from utils.cache import file_key
+
     path = work / "ir" / f"{pdf.stem}.json"
     if path.exists():
         ir = ir_from_dict(json.loads(path.read_text(encoding="utf-8")))
-        if Path(ir.path).resolve() == pdf.resolve():
+        if (Path(ir.path).resolve() == pdf.resolve() and ir.meta.get("ocr_metadata_version") == 2
+                and ir.meta.get("source_sha256") == file_key(pdf)):
             return ir
     from agents.orchestrator import process_pdf
 
@@ -87,7 +90,8 @@ def build_evidence(ir: DocIR, settings: Settings) -> list[Unit]:
                 text = " ".join(content.split())
                 if len(text) < 6 or key not in locations:
                     continue
-                reliable = (block.source == "native" and page.diag.get("health") == "healthy"
+                reliable = (block.source == "native" and block.validation_status != "manual_review_required"
+                            and page.diag.get("health") == "healthy"
                             and not page.diag.get("error") and confidence >= 80)
                 evidence.append(Unit(text, ws_lower(text), page.n, locations[key], confidence,
                                      block.source, reliable, block.ocr_engine))
@@ -288,7 +292,6 @@ def source_pages(slide, total: int) -> set[int]:
 
 
 def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Settings) -> dict:
-    from layout.verified import evidence_for
     from powerpoint.numbering import numbering
 
     evidence = build_evidence(ir, settings)
@@ -298,12 +301,6 @@ def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Setting
     records = []
     edits = defaultdict(list)
     checked_pages = {}
-    pictures = defaultdict(list)
-    verified = evidence_for(Path(ir.path), source)
-    protected = set()
-    if verified:
-        apply_source_repairs(deck, ir, verified, edits, pictures, records, protected)
-
     for number, slide in enumerate(deck.slides, 1):
         hints = source_pages(slide, len(ir.pages)) if settings.amend_use_notes else set()
         hinted = [unit for unit in evidence if unit.page in hints]
@@ -312,8 +309,6 @@ def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Setting
             if is_furniture(shape) or shape.name.lower().startswith("breadcrumb") or not shape.has_text_frame:
                 continue
             for index, paragraph in enumerate(shape.text_frame.paragraphs, 1):
-                if (number, shape.shape_id, index) in protected:
-                    continue
                 if not editable_paragraph(paragraph):
                     continue
                 text = para_text(paragraph)
@@ -374,67 +369,10 @@ def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Setting
                             "old_content": item["old"], "new_content": item["new"],
                             "reason": "Updated the cached number in the existing slide-number field or shape.",
                             "source": {"part": item["part"], "expected_number": item["expected"]}})
-    write_deck(source, target, edits, len(deck.slides), pictures)
+    write_deck(source, target, edits, len(deck.slides))
     return {"slides": len(deck.slides), "applied": [r for r in records if r["action"] == "applied"],
             "review": [r for r in records if r["action"] == "review"], "records": records,
-            "slide_numbering": numbering(open_deck(target)), "status": "updated" if edits or pictures else "unchanged"}
-
-
-def apply_source_repairs(deck, ir, verified, edits, pictures, records, protected):
-    import pymupdf
-    from pptx.shapes.shapetree import SlideShapeFactory
-    from pptx.text.text import _Paragraph
-    from powerpoint.package import MC, prepare_picture
-
-    for slide_no, shape_id, index, page, box, old, new in verified["editable_fixes"]:
-        slide = deck.slides[slide_no - 1]
-        element = next(node for choice in slide._element.iter(f"{{{MC}}}Choice") for node in choice.iter(qn("p:sp"))
-                       if next(node.iter(qn("p:cNvPr"))).get("id") == str(shape_id))
-        shape = SlideShapeFactory(element, slide.shapes)
-        paragraph = _Paragraph(list(element.iter(qn("a:p")))[index - 1], shape.text_frame)
-        before = para_text(paragraph)
-        if before.count(old) != 1:
-            raise ValueError("The verified pseudocode line differs from the expected source deck.")
-        after = before.replace(old, new, 1)
-        record_text_edit(slide, paragraph, after, edits)
-        record = change_record(ir, slide_no, shape, index, before, after, 1, "applied",
-                               "Corrected the editable pseudocode cross-reference using PDF page 6.")
-        record.update(change_type="pseudocode_reference", source={"page": page, "bbox": box, "text": new})
-        records.append(record)
-
-    for slide_no, shape_id, index, page, box, old, new in verified["slide_text"]:
-        slide = deck.slides[slide_no - 1]
-        shape = next(shape for shape in slide.shapes if shape.shape_id == shape_id)
-        paragraph = shape.text_frame.paragraphs[index - 1]
-        text = para_text(paragraph)
-        if text.count(old) != 1:
-            raise ValueError("The verified sample paragraph differs from the expected source deck.")
-        updated = text.replace(old, new, 1)
-        record_text_edit(slide, paragraph, updated, edits)
-        protected.add((slide_no, shape_id, index))
-        record = change_record(ir, slide_no, shape, index, text, updated, 1, "applied",
-                               "Exact wording verified against the source PDF.")
-        record["source"] = {"page": page, "bbox": box, "text": new}
-        records.append(record)
-
-    with pymupdf.open(ir.path) as pdf:
-        populated = set()
-        for slide_no, slot, page, box, frame, description in verified["slide_crops"]:
-            slide = deck.slides[slide_no - 1]
-            pix = pdf[page - 1].get_pixmap(dpi=220, clip=pymupdf.Rect(box), alpha=False)
-            fallback = slide_no in verified["editable_slides"]
-            picture, patch = prepare_picture(slide, pix.tobytes("png"), frame, (pix.width, pix.height), description,
-                                             slot=slot, fallback=fallback, preserve_id=(slide_no, slot) not in populated)
-            populated.add((slide_no, slot))
-            pictures[str(slide.part.partname).lstrip("/")].append(patch)
-            reason = ("Preserved editable content and populated its blank compatibility fallback from the source PDF."
-                      if fallback else "Replaced the equation-containing alternate shape with its verified source PDF crop.")
-            record = change_record(ir, slide_no, picture, 0, "" if fallback else "Existing equation alternate content",
-                                   description, 1, "applied", reason)
-            record.update(change_type="source_fallback" if fallback else "source_region",
-                          source={"page": page, "bbox": box, "reference_shape_id": slot,
-                                  "representation": "source_pdf_crop", "alternate_fallback": fallback})
-            records.append(record)
+            "slide_numbering": numbering(open_deck(target)), "status": "updated" if edits else "unchanged"}
 
 
 def change_record(ir: DocIR, slide: int, shape, paragraph: int, old: str, new: str, confidence: float,

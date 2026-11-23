@@ -144,19 +144,21 @@ def view(ir: DocIR) -> dict:
                            "bbox": block.bbox if aligned else None, "source": block.source,
                            "conf": block.recognition_confidence if block.ocr_engine else block.conf,
                            "ocr_engine": block.ocr_engine, "lang": block.lang, "caption": block.caption, "alt": block.alt,
-                           "cells": [vars(cell) for cell in block.cells],
+                           "cells": [vars(cell) for cell in block.cells], "language": block.language,
+                           "reading_order": block.reading_order, "validation_status": block.validation_status,
+                           "writing_mode": block.writing_mode, "source_reference": block.source_reference,
                            "n_items": len(block.children) or len(block.cells)})
             if block.kind == "title" and title is None:
                 title = {"value": block.text, "page": page.n, "bbox": block.bbox if aligned else None,
                          "confidence": None if block.ocr_engine == "glm-ocr" else block.conf}
         diag = {key: page.diag[key] for key in ("health", "decision", "reasons", "ocr", "confidence", "rotation",
                                               "layout", "native_chars", "has_native_text", "short_native_text",
-                                              "appears_scanned", "has_images", "ocr_required")
+                                              "appears_scanned", "has_images", "ocr_required", "review_reasons")
                 if key in page.diag}
         pages.append({"n": page.n, "w": page.width, "h": page.height, "source": page.source,
                       "diag": diag, "blocks": blocks, "ocr_engine": page.ocr_engine,
-                      "requires_review": page.requires_review})
-    return {"pages": pages, "title": title, "lang": ir.lang, "warnings": warnings}
+                      "requires_review": page.requires_review, "language": page.language})
+    return {"pages": pages, "title": title, "lang": ir.lang, "language": ir.language, "warnings": warnings}
 
 
 @api.get("/documents/<document_id>")
@@ -170,7 +172,8 @@ def document(document_id: str):
         ir, _, result = extracted
         content = view(ir)
         info.update(content, validation=result["validation"], quality=result["quality"], seconds=result["seconds"],
-                    processing_counts=result.get("processing_counts"))
+                    processing_counts=result.get("processing_counts"),
+                    content_validation=result.get("multilingual_validation", {}))
     return jsonify(info)
 
 
@@ -227,8 +230,10 @@ def xml(document_id: str):
     if not validation["well_formed"] or validation["issues"]:
         return fail("XML validation failed. " + " ".join(validation["issues"]), 422)
     if download:
+        extracted = ws.extracted(document_id)
+        draft = bool(extracted and extracted[2].get("multilingual_validation", {}).get("blocking_pages"))
         return send_file(io.BytesIO(data), mimetype="application/xml", as_attachment=True,
-                         download_name=f'{Path(info["filename"]).stem}.xml')
+                         download_name=f'{Path(info["filename"]).stem}{"_draft" if draft else ""}.xml')
     return Response(data, mimetype="text/plain; charset=utf-8")
 
 
@@ -297,6 +302,8 @@ def sync_deck(document_id: str):
     if not extracted or info["jobs"][0]["status"] != "completed":
         return fail("Finish processing the PDF before exporting.", 409)
     ir, settings, extraction = extracted
+    if ir.meta.get("ocr_metadata_version") != 2:
+        return fail("Retry PDF extraction to generate current language and source validation before exporting.", 409)
     settings = replace(settings, schema_profile="sample")
     previous = None
     if mode == "version":
@@ -304,6 +311,8 @@ def sync_deck(document_id: str):
             previous = ws.extracted(previous_id)
         if previous is None:
             return fail("Choose two different processed documents.", 409)
+        if previous[0].meta.get("ocr_metadata_version") != 2:
+            return fail("Retry extraction for the previous PDF before applying version changes.", 409)
     uploaded, error = upload_file("pptx", ".pptx")
     if error:
         return fail(error, 400)

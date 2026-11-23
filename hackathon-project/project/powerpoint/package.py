@@ -12,6 +12,7 @@ from zipfile import ZipFile
 from lxml import etree
 from pptx import Presentation
 from pptx.oxml.ns import qn
+from powerpoint.language import shape_paragraph
 
 REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 TYPES = "http://schemas.openxmlformats.org/package/2006/content-types"
@@ -154,6 +155,7 @@ def write_deck(source: Path, target: Path, edits: dict[str, list[RunEdit]], slid
                     data = original.read(entry)
                 if entry.filename in edits:
                     slide = parse(data)
+                    paragraphs = set()
                     for edit in edits[entry.filename]:
                         node = slide.find(edit.path)
                         if node is None or node.tag != "{http://schemas.openxmlformats.org/drawingml/2006/main}t":
@@ -161,6 +163,10 @@ def write_deck(source: Path, target: Path, edits: dict[str, list[RunEdit]], slid
                         if (node.text or "") != edit.old:
                             raise ValueError(f"The slide run has unexpected text in {entry.filename}.")
                         node.text = edit.new
+                        if node.getparent().tag == qn("a:r"):
+                            paragraphs.add(node.getparent().getparent())
+                    for paragraph in paragraphs:
+                        shape_paragraph(paragraph)
                     data = serialize(slide)
                 output.writestr(entry, data)
             for name, data in patches.items():

@@ -2,7 +2,7 @@
 from __future__ import annotations
 import re
 from collections import Counter
-from utils.textutil import script_counts, detect_lang
+from utils.textutil import language_profile
 
 _VOWELS = set("aeiouyáéíóúýäöüàèìòùâêîôûåæøœāēīōūěůi")
 _MOJI = re.compile(r"Ã[\x80-\xbf¡-¿]|â€|Â[\xa0-\xbf]|ï¿½|Ð[\x80-\xbf]")
@@ -34,7 +34,7 @@ def text_health(text: str) -> dict:
             "wordlike": wl, "latin_tokens": len(toks)}
 
 
-def analyze_page(page, settings) -> dict:
+def analyze_page(page, settings, metadata_language: str = "und") -> dict:
     text = page.get_text("text") or ""
     stripped = text.strip()
     h = text_health(stripped)
@@ -44,9 +44,13 @@ def analyze_page(page, settings) -> dict:
     except Exception:
         imgs = []
     cov = min(1.0, sum(max(0.0, (i["bbox"][2] - i["bbox"][0]) * (i["bbox"][3] - i["bbox"][1])) for i in imgs) / area)
-    sc = script_counts(stripped)
+    language = language_profile(stripped, metadata_language)
+    shaped_glyphs = sum(0xFB50 <= ord(char) <= 0xFDFF or 0xFE70 <= ord(char) < 0xFEFF for char in stripped)
+    bidi_risk = language["direction"] == "mixed" and any(
+        language_profile(line)["direction"] == "mixed" for line in stripped.splitlines())
+    decoding_risk = shaped_glyphs >= 3 or bidi_risk
     reasons, decision, health = [], "native", "healthy"
-    if len(stripped) < settings.native_min_chars:
+    if not stripped or (len(stripped) < settings.native_min_chars and cov >= 0.2):
         health, decision = ("absent", "ocr")
         reasons.append(f"only {len(stripped)} native chars" + (f", image coverage {cov:.0%}" if imgs else ""))
     elif h["ctrl"] > settings.native_ctrl_ratio_corrupt:
@@ -67,6 +71,10 @@ def analyze_page(page, settings) -> dict:
             sus.append(f"word-likeness {h['wordlike']:.0%}")
         if h["moji"]:
             sus.append(f"{h['moji']} mojibake sequences")
+        if shaped_glyphs >= 3:
+            sus.append("The PDF exposes shaped glyphs. Logical Unicode and mixed-direction order require verification.")
+        if bidi_risk:
+            sus.append("Opposing text directions share a native line. Verify logical order, punctuation and numbers against the source.")
         if sus:
             health = "suspicious"; decision = "compare" if settings.compare_suspicious else "native"; reasons += sus
     mixed = bool(stripped) and cov >= settings.native_mixed_min_image_coverage and len(stripped) <= settings.native_mixed_max_chars
@@ -82,6 +90,8 @@ def analyze_page(page, settings) -> dict:
         "ocr_required": decision in ("ocr", "compare"),
         "ctrl_ratio": round(h["ctrl"], 4), "pua_ratio": round(h["pua"], 4), "mojibake": h["moji"],
         "wordlike": round(h["wordlike"], 3), "n_images": len(imgs), "image_coverage": round(cov, 3),
-        "scripts": dict(sc.most_common(3)), "health": health, "decision": decision, "reasons": reasons,
-        "lang_hint": detect_lang(stripped) if health == "healthy" else "und",
+        "scripts": language["scripts"], "health": health, "decision": decision, "reasons": reasons,
+        "native_language": language,
+        "native_decoding_risk": decoding_risk,
+        "lang_hint": language["language"] if health == "healthy" else "und",
     }

@@ -57,7 +57,7 @@ class Settings:
     # --- runtime ------------------------------------------------------------------
     workers: int = 0                       # 0 = auto
     time_budget_s: int = 6600              # 110 min safety margin below the 2h hard limit
-    use_cache: bool = True
+    use_cache: bool = False
     cache_dir: str = ".docusync_cache"
     resume: bool = False
     # --- amendment -----------------------------------------------------------------

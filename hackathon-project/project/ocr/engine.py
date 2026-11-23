@@ -7,7 +7,6 @@ import cv2
 from layout.model import Line
 from utils.textutil import ISO_TO_TESS, join_words, is_rtl
 
-_SCRIPT_TO_LANG = {"Latin": "eng", "Arabic": "ara", "Japanese": "jpn", "Hangul": "kor", "Han": "jpn", "Cyrillic": "eng"}
 LATIN_ALL = "eng+deu+fra+ita+nld+ces+slk"
 
 
@@ -140,9 +139,7 @@ def ocr_image(img: np.ndarray, langs: str, dpi: int, settings, psm: int | None =
     lines: list[Line] = []
     par_ids: dict[tuple, int] = {}
     for key in sorted(groups):
-        ws = sorted(groups[key], key=lambda w: w[0])
-        if is_rtl(" ".join(w[5] for w in ws)):
-            ws = ws[::-1]                      # RTL line: logical order is right-to-left
+        ws = groups[key]  # Keep recognizer order. Coordinates describe layout.
         text = join_words([w[5] for w in ws])
         x0 = min(w[0] for w in ws); y0 = min(w[1] for w in ws)
         x1 = max(w[0] + w[2] for w in ws); y1 = max(w[1] + w[3] for w in ws)
@@ -154,7 +151,8 @@ def ocr_image(img: np.ndarray, langs: str, dpi: int, settings, psm: int | None =
     return lines
 
 
-_SCRIPT_PACK = {"Arabic": "ara+eng", "Japanese": "jpn+eng", "Hangul": "kor+eng", "Han": "jpn+eng"}
+_SCRIPT_PACK = {"Arabic": "ara+eng", "Japanese": "jpn+eng", "Hangul": "kor+eng", "Latin": LATIN_ALL,
+                "Hebrew": "heb+eng", "Devanagari": "hin+eng", "Sinhala": "sin+eng", "Tamil": "tam+eng"}
 
 
 def ocr_page(page, lang_code: str, dpi: int, settings, installed: set[str] | None = None, orient: bool = True, deskew: bool = True) -> tuple[list[Line], dict]:
@@ -162,11 +160,10 @@ def ocr_page(page, lang_code: str, dpi: int, settings, installed: set[str] | Non
     gray = render_gray(page, dpi)
     img, info = preprocess(gray, settings, orient=orient, deskew=deskew)
     info["dpi"] = dpi
+    if lang_code not in ISO_TO_TESS or (installed is not None and ISO_TO_TESS[lang_code] not in installed):
+        info["reason"] = "No language identified with an installed Tesseract pack."
+        return [], info
     langs = tess_langs(lang_code, installed)
-    if info.get("osd_script") in _SCRIPT_PACK:
-        langs = _SCRIPT_PACK[info["osd_script"]]
-        if installed:
-            langs = "+".join(l for l in langs.split("+") if l in installed) or "eng"
     info["langs"] = langs
     if info.get("rotate"):
         info["note"] = "page rotated by OCR preprocessing; bbox are in rotated space"
@@ -182,27 +179,15 @@ def pick_language(page, settings, installed: set[str] | None, dpi: int = 130) ->
     from utils.textutil import detect_lang
     gray = render_gray(page, dpi)
     img, info = preprocess(gray, settings, orient=True, deskew=False)
-    routed = _SCRIPT_PACK.get(info.get("osd_script", ""), None)
-    cands = []
-    other = ["ara+eng", LATIN_ALL] if routed else ["ara+eng", LATIN_ALL, "jpn+eng", "kor+eng"]
-    for pk in ([routed] if routed else []) + other:
-        pk = "+".join(l for l in pk.split("+") if not installed or l in installed)
-        if pk and pk not in cands:
-            cands.append(pk)
-    best, best_score, best_text = None, -1.0, ""
-    for pk in cands:
-        try:
-            lines = ocr_image(img, pk, dpi, settings)
-        except Exception:
-            continue
-        words = sum(len(l.text.split()) for l in lines)
-        conf = sum(l.conf for l in lines) / len(lines) if lines else 0.0
-        score = conf * min(1.0, words / 25.0)
-        if score > best_score:
-            best, best_score, best_text = pk, score, " ".join(l.text for l in lines)
-    if not best:
+    routed = _SCRIPT_PACK.get(info.get("osd_script", ""))
+    if not routed:
         return "und"
-    lg = detect_lang(best_text)
-    if lg != "und":
-        return lg
-    return {"ara+eng": "ar", "jpn+eng": "ja", "kor+eng": "ko"}.get(best, "en")
+    packs = [pack for pack in routed.split("+") if installed is None or pack in installed]
+    if not packs or (routed != LATIN_ALL and packs[0] != routed.split("+")[0]):
+        return "und"
+    try:
+        lines = ocr_image(img, "+".join(packs), dpi, settings)
+    except (OSError, RuntimeError, ValueError):
+        return "und"
+    detected = detect_lang(" ".join(line.text for line in lines))
+    return detected if ISO_TO_TESS.get(detected) in packs else "und"

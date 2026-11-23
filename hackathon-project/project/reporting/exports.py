@@ -11,12 +11,12 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import pymupdf
 
 from powerpoint.package import validate_deck
-from layout.verified import apply_verified_content
+from powerpoint.language import presentation_language_report
 from xml_engine.assets import inspect_assets, relative_path, validate_archive
 from quality.conformance import tree
 from lxml import etree
 from xml_engine.serializer import to_xml
-from xml_engine.validate import validate_xml
+from xml_engine.validate import validate_xml, verify_unicode
 
 
 def output_stem(filename: str) -> str:
@@ -91,17 +91,22 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
               "status": "failed", "xml_profile": settings.schema_profile}
     assets = {}
     corrections = []
+    quality = extraction.get("multilingual_validation", {})
     staged = xml_path.with_suffix(".tmp")
     try:
         if not extraction.get("ok"):
             raise ValueError("The source PDF extraction did not pass validation.")
-        apply_verified_content(ir)
         ir.meta["asset_stem"] = stem
-        data = to_xml(ir, settings, assets=assets)
+        locations = {}
+        data = to_xml(ir, settings, locations=locations, assets=assets)
         staged.write_bytes(data)
         validation["xml"].update(validate_xml(staged.read_bytes(), len(ir.pages), settings))
         if not validation["xml"]["well_formed"] or validation["xml"]["issues"]:
             raise ValueError("The document XML failed structural validation.")
+        unicode_check = verify_unicode(data, ir, locations)
+        quality = {**quality, "xml": unicode_check}
+        if unicode_check["unconfirmed_nodes"] and quality.get("status") != "manual_review_required":
+            quality["status"] = "validation_partial"
         if assets:
             data = materialize_assets(data, assets, ir.path, folder)
             staged.write_bytes(data)
@@ -123,7 +128,12 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
     finally:
         staged.unlink(missing_ok=True)
 
-    if outputs["xml"] and xml_only:
+    if outputs["xml"] and quality.get("blocking_pages"):
+        outputs["xml"]["draft"] = True
+        result.update(status="manual_review_required",
+                      error="The XML is a draft. Resolve missing or corrupt source text before updating PowerPoint.")
+        validation["pptx"]["status"] = "blocked_by_source_review"
+    elif outputs["xml"] and xml_only:
         result["status"] = "xml_only"
         validation["pptx"]["status"] = "skipped"
     elif outputs["xml"]:
@@ -133,6 +143,7 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
             outputs["pptx"] = file_info(deck_path)
             validation["pptx"].update(valid=True, slides=slide_count)
             validation["pptx"]["slide_numbering"] = presentation.get("slide_numbering", [])
+            quality = {**quality, "presentation": presentation_language_report(deck_path)}
             result.update({key: value for key, value in presentation.items() if key not in {"status", "records"}})
             records = presentation.get("records")
             if records is None:
@@ -148,6 +159,7 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
             deck_path.unlink(missing_ok=True)
 
     result["validation"] = validation
+    result["content_validation"] = quality
     result["xml_assets"] = validation["xml"]["assets"]["files"] if outputs["xml"] else []
     result["archive"] = None
     reports = {
@@ -159,6 +171,8 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
                     for page in extraction.get("page_log", [])],
             "semantic_comparison": result.get("analysis"),
         },
+        "document_profile.json": extraction.get("document_profile", {}),
+        "multilingual_validation_report.json": quality,
     }
     if result["status"] == "completed":
         archive = folder / f"{stem}.zip"

@@ -71,11 +71,13 @@ def related_pair(changes: list[dict]) -> tuple[dict, dict] | None:
 
 def annotate(changes: list[dict], settings: Settings, audit: AuditLog) -> dict:
     model = settings.ollama_model
+    inference_attempted = False
 
     def report(status: str, count: int = 0, reason: str | None = None) -> dict:
         if status not in {"disabled", "skipped"}:
             audit.event("comparison", "assistance_" + status, model=model, reviewed=count, reason=reason)
-        return {"status": status, "model": model, "reviewed": count, "reason": reason}
+        return {"status": status, "model": model, "reviewed": count, "reason": reason,
+                "document_inference_attempted": inference_attempted}
 
     candidates = []
     for change in changes:
@@ -123,6 +125,8 @@ def annotate(changes: list[dict], settings: Settings, audit: AuditLog) -> dict:
         ],
     }
     try:
+        inference_attempted = True
+        audit.event("comparison", "document_inference_requested", model=model)
         data = request_json(settings, "/api/chat", payload)
         if data.get("done") is not True or data.get("done_reason") not in {"stop", None}:
             raise ValueError("Qwen did not complete the response.")

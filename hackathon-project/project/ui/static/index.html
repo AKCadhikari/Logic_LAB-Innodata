@@ -6,6 +6,7 @@
 <header class="top">
  <div class="logo"><span class="brand-mark" aria-hidden="true"></span><h1>DocuSync AI</h1></div>
  <button class="btn" id="settings"><span id="reviewer-label"></span>Settings</button>
+ <button class="btn" id="startup-button">AI startup</button>
 </header>
 <aside class="library" aria-labelledby="library-heading">
  <h2 id="library-heading">Documents</h2>
@@ -64,6 +65,13 @@
 <dialog id="settings-dialog" aria-labelledby="settings-heading">
  <div class="dialog-heading"><h2 id="settings-heading">Workspace settings</h2><form method="dialog"><button class="btn">Close</button></form></div>
  <p id="settings-info"></p>
+ <section id="startup-status" aria-labelledby="startup-heading">
+  <div class="dialog-heading"><h3 id="startup-heading">AI execution audit</h3>
+   <button type="button" class="btn" id="startup-retry">Retry model startup</button></div>
+  <div id="startup-details" aria-live="polite"></div>
+  <p id="document-ai-audit"></p>
+  <p>Startup checks use synthetic input. Document OCR and Qwen review are reported in the workspace and export audit.</p>
+ </section>
  <form id="profile-form" class="workspace-tools"><label for="profile-name">Local reviewer</label>
   <input id="profile-name" maxlength="80" required><button class="btn pri">Save profile</button><output id="profile-status"></output>
  </form></dialog>

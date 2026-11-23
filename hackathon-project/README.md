@@ -38,10 +38,44 @@ See [local OCR setup](docs/LOCAL_OCR.md) for PaddleOCR, Docling, Tesseract verif
 
 ## Local review workspace
 
-```powershell
-.\.venv\Scripts\python.exe -B project\ui\server.py
-# open http://127.0.0.1:8765
+On Windows, double-click **[Start_DocuSync_AI.bat](Start_DocuSync_AI.bat)**. The launcher finds or starts Ollama,
+warms each configured model in turn, and verifies which models Ollama keeps loaded. It then starts the existing
+workspace, checks the backend and frontend, and opens [DocuSync AI](http://127.0.0.1:8765/) in the default browser.
+Open **AI startup** in the workspace to see each model's installation, residency and synthetic inference status.
+
+The launcher uses the built-in defaults. To override them, copy `.env.example` to `.env`. Both the launcher and the
+application read the same settings. When supplied, a JSON configuration is loaded first, then `.env`, then the
+process environment. A running workspace with changed settings needs a launcher restart.
+
+| Startup mode | Behavior |
+| --- | --- |
+| `all` (default) | Warms each model in turn and checks that both remain resident. |
+| `ocr-only` | Warms GLM-OCR and leaves Qwen to load when document review first uses it. |
+| `sequential` | Tests both models and releases the first model if it was loaded by this startup. |
+
+The default startup residency is 30 minutes. Ollama can evict a model sooner under memory pressure. If it does,
+the workspace reports the model's current state. `OLLAMA_KEEP_ALIVE` in `.env` also controls retention after
+document inference. The launcher leaves already-running Ollama services in place.
+
+**Troubleshooting.** If the workspace opens in degraded mode, read the specific error under **AI startup**.
+Missing models show their exact tags and a manual installation command. Install only the missing model, then
+select **Retry model startup**. If there is a port conflict, check which application owns the port or configure a
+different Ollama endpoint. If memory is tight, use `OLLAMA_STARTUP_MODE=ocr-only` or `sequential`.
+See `logs/startup.log` for startup events, `logs/backend.log` for Flask output and `logs/ollama-11434.log`
+for output from an Ollama server started by the launcher.
+
+For controlled shutdown or restart, run one of these from the project directory. Shutdown leaves a workspace
+with active requests or document jobs running. Repeat the command after the work completes.
+
+```cmd
+Start_DocuSync_AI.bat -Action Stop
+Start_DocuSync_AI.bat -Action Restart
 ```
+
+If you originally started the backend directly from a terminal, close it from that terminal before using the
+launcher. `-NoBrowser` suppresses the browser for smoke tests. Advanced commands can supply `-Port`, `-Config`,
+`-Storage` and `-Logs`. Use separate storage and logs when testing a second workspace.
+
 Upload one PDF at a time. The local workspace stores each original and its processing attempts under `storage/`
 and shows job progress, native-text diagnostics, OCR attempts, layout status, and pages flagged for review.
 Review a page in Source PDF, Text, Zoning or Reading Order, correct the title or language,

@@ -461,8 +461,71 @@ $("#batch").onclick = async () => {
     try { if (W.batch) await init(); else await loadWorkspace(); }
     catch (error) { showError(error); }
 };
+let startupRefresh;
+
+async function loadStartupStatus() {
+    const details = $("#startup-details"), retry = $("#startup-retry"), indicator = $("#startup-button");
+    const documentAttempts = (S.data?.pages || []).flatMap(page => page.diag?.ocr?.attempts || []);
+    const glmCalls = documentAttempts.filter(attempt => attempt.document_inference_attempted === true).length;
+    const qwen = W.changes?.analysis?.document_inference_attempted;
+    $("#document-ai-audit").textContent = S.data?.pages ?
+        "Selected document · GLM-OCR requests recorded " + glmCalls +
+        (qwen ? " · Qwen document review requested" : "") : "Select a processed document to check its inference activity.";
+    clearTimeout(startupRefresh);
+    try {
+        const report = await workspaceFetch("/api/startup");
+        const flag = value => value == null ? "Unverified" : value ? "Yes" : "No";
+        const checking = report.retrying || report.status === "warming";
+        const incomplete = report.models?.some(model => model.error || model.runtime_error ||
+            model.warmup === "passed" && !model.loaded && !model.released_by_policy);
+        const labels = {ready: "AI ready", degraded: "AI degraded", warming: "AI warming",
+            failed: "AI startup failed", startup_disabled: "AI startup disabled", no_models_required: "AI optional",
+            not_run: "AI startup", stopped: "AI stopped"};
+        indicator.textContent = checking ? "AI warming" : report.status === "ready" && incomplete ?
+            "AI review needed" : labels[report.status] || "AI startup";
+        const services = (report.services || []).map(service => '<div>' + esc(service.url) + ' · Server running ' +
+            flag(service.running) + ' · API healthy ' + flag(service.healthy) + ' · ' +
+            esc(service.error || service.source || "") + '</div>').join("");
+        details.innerHTML = '<div>Ollama installed ' + flag(report.ollama_installed) + '</div>' +
+            '<div>Backend ready ' + flag(report.backend_ready) + ' · Frontend ready ' + flag(report.frontend_ready) + '</div>' +
+            services + (report.error ? '<p class="notice">' + esc(report.error) + '</p>' : "") +
+            (report.models || []).map(model => {
+                const hardware = model.residency?.size_vram;
+                const bytes = model.residency?.size;
+                return '<div class="card"><strong>' + esc(model.label + " · " + model.name) + '</strong>' +
+                    '<div>Installed ' + flag(model.installed) + ' · Loaded during startup ' + flag(model.loaded_during_startup) +
+                    ' · Loaded now ' + flag(model.loaded) + ' · Warm-up ' +
+                    esc(({passed: "Passed", failed: "Failed", on_demand: "On demand"})[model.warmup] || "Not run") + '</div>' +
+                    (typeof hardware === "number" ? '<div>GPU memory reported by Ollama ' +
+                        Math.round(hardware / 1048576) + ' MB</div>' : '') +
+                    (typeof bytes === "number" ? '<div>Model memory ' + Math.round(bytes / 1048576) + ' MB</div>' : '') +
+                    (model.error || model.runtime_error ? '<div class="notice">' + esc(model.error || model.runtime_error) + '</div>' : '') +
+                    (model.installation ? '<code>' + esc(model.installation) + '</code>' : '') + '</div>';
+            }).join("");
+        retry.disabled = checking;
+        if ($("#settings-dialog").open || checking) startupRefresh = setTimeout(loadStartupStatus, checking ? 1200 : 15000);
+    } catch (error) {
+        details.textContent = error.message;
+        retry.disabled = false;
+    }
+}
+
+$("#startup-retry").onclick = async () => {
+    $("#startup-retry").disabled = true;
+    try {
+        await workspaceFetch("/api/startup/retry", {
+            method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"
+        });
+        await loadStartupStatus();
+    } catch (error) {
+        $("#startup-details").textContent = error.message;
+        $("#startup-retry").disabled = false;
+    }
+};
+
 $("#settings").onclick = () => {
     $("#settings-dialog").showModal();
+    loadStartupStatus();
     $("#settings-info").textContent = "Checking local processing settings…";
     $("#profile-status").textContent = "";
     const name = $("#profile-name"), save = $("#profile-form button");
@@ -486,6 +549,11 @@ $("#settings").onclick = () => {
         ].join(" · ");
     }).catch(error => { $("#settings-info").textContent = error.message; });
 };
+$("#startup-button").onclick = () => {
+    $("#settings").click();
+    $("#startup-status").scrollIntoView({block: "nearest"});
+};
+loadStartupStatus();
 $("#profile-form").onsubmit = async event => {
     event.preventDefault();
     try {

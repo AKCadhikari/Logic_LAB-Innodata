@@ -4,12 +4,14 @@
 """
 from __future__ import annotations
 import argparse, json, sys, threading
+from hmac import compare_digest
+import os
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from flask import Flask, abort, jsonify, request, send_file, send_from_directory, Response
+from flask import Flask, abort, g, jsonify, request, send_file, send_from_directory, Response
 
 app = Flask(__name__, static_folder=str(HERE / "static"))
 CFG: dict = {}
@@ -31,6 +33,54 @@ def reject_cross_site_writes():
         workspace = app.extensions.get("workspace")
         if workspace is None or not workspace.owns_batch(browser_owner()):
             return jsonify(error="Batch review belongs to the local workspace's original browser session."), 404
+
+
+@app.before_request
+def track_managed_requests():
+    lifecycle = app.extensions.get("launcher_lifecycle")
+    if lifecycle is not None and request.path != "/api/startup/shutdown":
+        with lifecycle["lock"]:
+            if lifecycle["draining"]:
+                return jsonify(error="DocuSync is shutting down."), 503
+            lifecycle["active"] += 1
+            g.managed_request = True
+
+
+@app.teardown_request
+def release_managed_request(_error):
+    if g.pop("managed_request", False):
+        lifecycle = app.extensions["launcher_lifecycle"]
+        with lifecycle["lock"]:
+            lifecycle["active"] -= 1
+
+
+@app.get("/api/startup/identity")
+def startup_identity():
+    from startup import settings_id, workspace_id
+
+    ws = app.extensions.get("workspace")
+    if ws is None:
+        return jsonify(backend_ready=False), 503
+    return jsonify(backend_ready=True, workspace=workspace_id(ws.root), settings=settings_id(ws.settings), pid=os.getpid())
+
+
+@app.post("/api/startup/shutdown")
+def managed_shutdown():
+    lifecycle = app.extensions.get("launcher_lifecycle")
+    key = request.headers.get("X-DocuSync-Launcher-Key", "")
+    if not lifecycle or not compare_digest(key.encode(), lifecycle["key"].encode()):
+        abort(403)
+    with lifecycle["lock"]:
+        ws = app.extensions["workspace"]
+        with ws.db() as db:
+            busy = db.execute("SELECT 1 FROM jobs WHERE status IN ('queued', 'running') LIMIT 1").fetchone()
+        retry = app.extensions.get("startup_retry")
+        if lifecycle["active"] or busy or (retry and retry.is_alive()):
+            return jsonify(error="Finish active workspace requests and processing before shutdown."), 409
+        lifecycle["draining"] = True
+    response = jsonify(status="stopping")
+    response.call_on_close(lambda: threading.Thread(target=lifecycle["server"].shutdown, daemon=True).start())
+    return response
 
 
 def _ids() -> list[str]:
@@ -257,12 +307,28 @@ def main():
     ap.add_argument("--output", default=str(HERE.parents[1] / "phase-1" / "output"))
     ap.add_argument("--storage", default=str(HERE.parents[1] / "storage"))
     ap.add_argument("--config", help="Path to local document processing settings")
+    ap.add_argument("--startup-logs", type=Path, default=HERE.parents[1] / "logs")
     ap.add_argument("--port", type=int, default=8765)
     a = ap.parse_args()
     CFG.update(run=Path(a.run_dir).resolve(), input=Path(a.input).resolve(), output=Path(a.output).resolve())
     configure_workspace(Path(a.storage).resolve(), a.config, CFG["output"])
+    app.extensions["startup_logs"] = a.startup_logs.resolve()
+    app.extensions["startup_port"] = a.port
     print(f"DocuSync review UI on http://127.0.0.1:{a.port}  (run dir: {CFG['run']})")
-    app.run(host="127.0.0.1", port=a.port, debug=False, threaded=True)
+    key = os.environ.pop("DOCUSYNC_LAUNCHER_KEY", "")
+    if not key:
+        app.run(host="127.0.0.1", port=a.port, debug=False, threaded=True)
+        return
+    from werkzeug.serving import make_server
+
+    server = make_server("127.0.0.1", a.port, app, threaded=True)
+    app.extensions["launcher_lifecycle"] = {"server": server, "key": key, "lock": threading.Lock(),
+                                            "active": 0, "draining": False}
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        app.extensions["workspace"].worker.shutdown(wait=True)
 
 
 def configure_workspace(storage: Path, config: str | None = None, output: Path | None = None):

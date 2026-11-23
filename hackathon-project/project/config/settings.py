@@ -72,32 +72,61 @@ class Settings:
     ollama_model: str = "qwen3:4b"
     ollama_timeout_s: int = 300
     ollama_keep_alive: str = "0"
+    ollama_startup_enabled: bool = True
+    ollama_startup_mode: str = "all"
+    ollama_startup_timeout: int = 300
+    ollama_model_timeout: int = 300
+    ollama_startup_keep_alive: str = "30m"
+    ollama_startup_reserve_mb: int = 1536
+    ollama_executable: str = ""
     # --- naming ----------------------------------------------------------------------
     pptx_suffix_rule: str = "auto"         # auto | amendment_out | transformed_QA
 
     @classmethod
-    def load(cls, path: str | None = None, **overrides) -> "Settings":
+    def load(cls, path: str | None = None, *, env_file: Path | None = None, **overrides) -> "Settings":
         s = cls()
         if path:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("The DocuSync JSON configuration must be an object.")
             for k, v in data.items():
                 if hasattr(s, k):
                     setattr(s, k, v)
-        for f in fields(s):
-            env = os.environ.get("DOCUSYNC_" + f.name.upper())
-            if env is not None:
-                cur = getattr(s, f.name)
-                setattr(s, f.name, env.lower() in ("1", "true", "yes") if isinstance(cur, bool) else type(cur)(env))
-        for name, targets, convert in (
+        env_values = {}
+        env_file = env_file if env_file is not None else Path(__file__).resolve().parents[2] / ".env"
+        if env_file.is_file():
+            for line in env_file.read_text(encoding="utf-8-sig").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    key, equals, value = line.partition("=")
+                    if not equals:
+                        raise ValueError(f"Invalid setting in {env_file.name}: expected NAME=value.")
+                    value = value.strip()
+                    env_values[key.strip()] = value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'} else value
+        aliases = (
             ("OLLAMA_BASE_URL", ("glm_ocr_url", "ollama_url"), str),
             ("OLLAMA_TIMEOUT", ("glm_ocr_timeout_s", "ollama_timeout_s"), int),
             ("OLLAMA_KEEP_ALIVE", ("glm_ocr_keep_alive", "ollama_keep_alive"), str),
             ("GLM_OCR_MODEL", ("glm_ocr_model",), str),
             ("QWEN_MODEL", ("ollama_model",), str),
-        ):
-            if name in os.environ:
-                for target in targets:
-                    setattr(s, target, convert(os.environ[name]))
+            ("OLLAMA_STARTUP_ENABLED", ("ollama_startup_enabled",), lambda value: value.casefold() in {"1", "true", "yes"}),
+            ("OLLAMA_STARTUP_MODE", ("ollama_startup_mode",), str),
+            ("OLLAMA_STARTUP_TIMEOUT", ("ollama_startup_timeout",), int),
+            ("OLLAMA_MODEL_TIMEOUT", ("ollama_model_timeout",), int),
+            ("OLLAMA_EXECUTABLE", ("ollama_executable",), str),
+        )
+        for source in (env_values, os.environ):
+            for f in fields(s):
+                env = source.get("DOCUSYNC_" + f.name.upper())
+                if env is not None:
+                    cur = getattr(s, f.name)
+                    setattr(s, f.name, env.lower() in ("1", "true", "yes") if isinstance(cur, bool) else type(cur)(env))
+            for name, targets, convert in aliases:
+                if name in source:
+                    for target in targets:
+                        setattr(s, target, convert(source[name]))
+            if "OLLAMA_KEEP_ALIVE" in source:
+                s.ollama_startup_keep_alive = source["OLLAMA_KEEP_ALIVE"]
         for k, v in overrides.items():
             if v is not None and hasattr(s, k):
                 setattr(s, k, v)

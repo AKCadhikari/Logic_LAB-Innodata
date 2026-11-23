@@ -35,12 +35,14 @@ class OCRRouter:
                 started = time.monotonic()
                 result = None
                 failure_status = "rejected"
+                inference_attempted = False
                 try:
                     if engine == "glm-ocr":
                         if self.glm_status is None:
                             self.glm_status = glm.model_info(self.settings)
                         if not self.glm_status["ready"]:
                             raise RecognitionError(self.glm_status["reason"], unavailable=True)
+                        inference_attempted = True
                         result = glm.recognise(page, dpi, self.settings)
                     elif engine == "paddleocr":
                         if language == "und" and observed.get("glm-ocr"):
@@ -65,6 +67,8 @@ class OCRRouter:
                     model = result.raw.get("model") or model
                 attempt = {"engine": engine, "model": model, "status": "accepted" if not issues else failure_status,
                            "issues": issues, "seconds": round(time.monotonic() - started, 2)}
+                if engine == "glm-ocr":
+                    attempt["document_inference_attempted"] = inference_attempted
                 attempts.append(attempt)
                 if result is not None:
                     try:

@@ -22,12 +22,23 @@ class NoRedirect(HTTPRedirectHandler):
 _inference = Lock()
 
 
-def request_json(url: str, path: str, payload: dict | None, timeout: int) -> dict:
-    endpoint = urlsplit(url)
+def local_endpoint(url: str):
+    try:
+        if not isinstance(url, str):
+            raise ValueError
+        endpoint = urlsplit(url)
+        port = endpoint.port
+    except ValueError as error:
+        raise OllamaError("Configure a loopback HTTP endpoint for Ollama.", "unavailable") from error
     if (endpoint.scheme != "http" or endpoint.hostname not in {"127.0.0.1", "::1", "localhost"}
             or endpoint.username is not None or endpoint.password is not None
-            or endpoint.path not in {"", "/"} or endpoint.query or endpoint.fragment):
+            or endpoint.path not in {"", "/"} or endpoint.query or endpoint.fragment or port == 0):
         raise OllamaError("Configure a loopback HTTP endpoint for Ollama.", "unavailable")
+    return endpoint
+
+
+def request_json(url: str, path: str, payload: dict | None, timeout: int, *, detailed: bool = False) -> dict:
+    endpoint = local_endpoint(url)
     request = Request(f"http://{endpoint.netloc}{path}",
                       data=json.dumps(payload).encode() if payload is not None else None,
                       headers={"Content-Type": "application/json"})
@@ -47,7 +58,15 @@ def request_json(url: str, path: str, payload: dict | None, timeout: int) -> dic
     except HTTPError as error:
         hints = {404: " Check that the configured model is installed.", 500: " Check the Ollama server log."}
         status = "unavailable" if error.code in {404, 503} else "error"
-        raise OllamaError(f"Ollama returned HTTP {error.code}.{hints.get(error.code, '')}", status) from error
+        reason = ""
+        if detailed:
+            try:
+                value = json.loads(error.read(4096))
+                if isinstance(value, dict) and isinstance(value.get("error"), str):
+                    reason = " " + " ".join(value["error"].split())[:600]
+            except (ValueError, OSError):
+                pass
+        raise OllamaError(f"Ollama returned HTTP {error.code}.{reason or hints.get(error.code, '')}", status) from error
     except (TimeoutError, URLError, OSError) as error:
         if isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError):
             raise OllamaError("Ollama inference timed out." if payload is not None

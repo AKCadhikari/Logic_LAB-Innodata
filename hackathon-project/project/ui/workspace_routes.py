@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import re
+from threading import Lock, Thread
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path, PureWindowsPath
@@ -22,6 +23,7 @@ from utils.textutil import xml_safe
 
 api = Blueprint("workspace", __name__, url_prefix="/api")
 SESS_COOKIE = "docusync_workspace"
+_retry_lock = Lock()
 
 
 def workspace() -> Workspace:
@@ -90,6 +92,58 @@ def health():
                    ocr_backend=ws.settings.ocr_backend, qwen={**qwen, "enabled": ws.settings.ollama_enabled},
                    glm_ocr=glm_info, paddle_ocr=paddle.readiness(ws.settings),
                    docling=layout_readiness(ws.settings))
+
+
+@api.get("/startup")
+def startup_status():
+    from startup import ROOT, StartupManager, configured_models
+
+    ws = workspace()
+    manager = StartupManager(ws.settings, ws.root, current_app.extensions.get("startup_logs", ROOT / "logs"),
+                             current_app.extensions.get("startup_port", 8765))
+    report = manager.report or {"status": "not_run", "models": configured_models(ws.settings)}
+    if report["status"] != "warming":
+        manager.refresh_residency(report.get("models", []), {item["url"]: item for item in report.get("services", [])},
+                                  live=True)
+    retry = current_app.extensions.get("startup_retry")
+    return jsonify(**{**report, "backend_ready": True, "frontend_ready": True,
+                      "retrying": bool(retry and retry.is_alive())})
+
+
+@api.post("/startup/retry")
+def retry_startup_models():
+    from startup import ROOT, StartupBusy, StartupManager, startup_lock
+
+    if not request.is_json:
+        return fail("Request startup retry from the local workspace.", 415)
+    app = current_app._get_current_object()
+    ws = workspace()
+    folder = app.extensions.get("startup_logs", ROOT / "logs")
+    with ws.db() as db:
+        if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued', 'running') LIMIT 1").fetchone():
+            return fail("Wait until document processing finishes before warming models again.", 409)
+
+    def prepare():
+        try:
+            with startup_lock(folder):
+                manager = StartupManager(ws.settings, ws.root, folder, app.extensions.get("startup_port", 8765))
+                manager.event("startup", "retry_requested")
+                try:
+                    manager.prepare()
+                except (OSError, RuntimeError, ValueError) as error:
+                    manager.event("startup", "retry_failed", error=str(error))
+                    manager.publish(status="failed", error=str(error))
+        except StartupBusy:
+            return
+
+    with _retry_lock:
+        thread = app.extensions.get("startup_retry")
+        if thread and thread.is_alive():
+            return fail("Model startup is already being checked.", 409)
+        thread = Thread(target=prepare, daemon=True)
+        app.extensions["startup_retry"] = thread
+        thread.start()
+    return jsonify(status="checking"), 202
 
 
 @api.get("/documents")

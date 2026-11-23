@@ -2,61 +2,32 @@
 from __future__ import annotations
 
 import base64
-import json
 import re
-from urllib.error import HTTPError
-from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from typing import Literal
 
 from lxml import etree, html
 
 from config.settings import Settings
 from layout.model import Block, Cell, Span
 from ocr.recognition import Recognition, RecognitionError
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
+from utils import ollama
 
 
 def request_json(settings: Settings, path: str, payload: dict | None = None) -> dict:
-    endpoint = urlsplit(settings.glm_ocr_url)
-    if (endpoint.scheme != "http" or endpoint.hostname not in {"127.0.0.1", "::1", "localhost"}
-            or endpoint.username or endpoint.password or endpoint.path not in {"", "/"}
-            or endpoint.query or endpoint.fragment):
-        raise RecognitionError("GLM-OCR requires a local Ollama HTTP endpoint.", unavailable=True)
-    request = Request(f"http://{endpoint.netloc}{path}",
-                      data=json.dumps(payload).encode() if payload is not None else None,
-                      headers={"Content-Type": "application/json"})
-    opener = build_opener(ProxyHandler({}), NoRedirect())
     try:
-        with opener.open(request, timeout=max(1, settings.glm_ocr_timeout_s) if payload is not None else 3) as response:
-            data = json.loads(response.read(1024 * 1024 + 1))
-    except HTTPError as error:
-        raise RecognitionError(f"Local Ollama returned HTTP {error.code}.", unavailable=error.code == 404) from error
-    except TimeoutError as error:
-        raise RecognitionError("GLM-OCR timed out.") from error
-    except OSError as error:
-        raise RecognitionError("Local Ollama is unreachable.", unavailable=True) from error
-    except ValueError as error:
-        raise RecognitionError("Ollama returned invalid JSON.") from error
-    if not isinstance(data, dict):
-        raise RecognitionError("Ollama returned an unexpected payload.")
-    return data
+        return ollama.request_json(settings.glm_ocr_url, path, payload,
+                                   max(1, settings.glm_ocr_timeout_s) if payload is not None else 3)
+    except ollama.OllamaError as error:
+        raise RecognitionError(str(error), status=error.status) from error
 
 
 def model_info(settings: Settings) -> dict:
     model = settings.glm_ocr_model
-    target = model if ":" in model else model + ":latest"
     try:
-        models = request_json(settings, "/api/tags").get("models", [])
-        match = next((item for item in models if isinstance(item, dict) and item.get("name") == target
-                      and not item.get("remote_host") and "cloud" not in target.casefold()), None)
-        return {"ready": bool(match), "model": model, "digest": match.get("digest") if match else None,
-                "reason": None if match else "The configured local GLM-OCR model is not installed."}
-    except (RecognitionError, ValueError, TypeError) as error:
-        return {"ready": False, "model": model, "reason": str(error)}
+        models = ollama.installed_models(request_json(settings, "/api/tags"))
+        return {"connected": True, **ollama.model_info(model, models, capability="vision")}
+    except (RecognitionError, ollama.OllamaError, ValueError) as error:
+        return {"connected": False, "ready": False, "model": model, "reason": str(error)}
 
 
 TABLE = re.compile(r"<table\b[^>]*>.*?</table\s*>", re.I | re.S)
@@ -200,13 +171,28 @@ def parse(page: int, data: dict) -> Recognition:
     return result
 
 
+RecognitionMode = Literal["text", "table", "formula"]
+PROMPTS = {"text": "Text Recognition:", "table": "Table Recognition:", "formula": "Formula Recognition:"}
+
+
+def recognise_image(image: bytes, page: int, settings: Settings, mode: RecognitionMode = "text") -> Recognition:
+    payload = {"model": settings.glm_ocr_model, "prompt": PROMPTS[mode], "stream": False,
+               "images": [base64.b64encode(image).decode("ascii")], "keep_alive": settings.glm_ocr_keep_alive,
+               "options": {"temperature": 0, "num_gpu": 0,
+                           "num_ctx": max(8192, settings.glm_ocr_tokens + 4096),
+                           "num_predict": settings.glm_ocr_tokens}}
+    data = request_json(settings, "/api/generate", payload)
+    result = parse(page, data)
+    if mode == "table" and not any(block.tag == "table" for block in result.blocks):
+        result.issues.append("GLM-OCR did not return a recognised table.")
+    if mode == "formula" and not any(block.kind == "equation" for block in result.blocks):
+        result.issues.append("GLM-OCR did not return a recognised formula.")
+    return result
+
+
 def recognise(page, dpi: int, settings: Settings) -> Recognition:
     import pymupdf
 
     scale = min(dpi / 72, max(256, settings.glm_ocr_max_edge) / max(page.rect.width, page.rect.height))
     raster = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), colorspace=pymupdf.csGRAY, alpha=False)
-    image = base64.b64encode(raster.tobytes("png")).decode("ascii")
-    payload = {"model": settings.glm_ocr_model, "prompt": "Text Recognition:", "stream": False,
-               "images": [image], "keep_alive": "45s", "options": {"temperature": 0, "num_gpu": 0,
-               "num_ctx": max(8192, settings.glm_ocr_tokens + 4096), "num_predict": settings.glm_ocr_tokens}}
-    return parse(page.number + 1, request_json(settings, "/api/generate", payload))
+    return recognise_image(raster.tobytes("png"), page.number + 1, settings)

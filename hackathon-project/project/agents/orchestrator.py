@@ -64,10 +64,12 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
     cache = Cache(work_dir / settings.cache_dir, settings.use_cache)
     router = OCRRouter(settings, work_dir / "recognition" / doc_id)
     layout = DoclingLayout(settings)
+    counts = {"required": 0, "glm_ocr": 0, "paddle_ocr": 0, "failed": 0, "review": 0}
+    res["processing_counts"] = counts
 
     def stage(name: str, **values) -> None:
         if processing:
-            processing({"stage": name, **values})
+            processing({"stage": name, "counts": dict(counts), **values})
 
     fkey = file_key(pdf)
     try:
@@ -99,6 +101,7 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
         except Exception as e:
             diags.append({"page": i + 1, "health": "error", "decision": "native", "reasons": [str(e)], "native_chars": 0, "width": 595, "height": 842})
             audit.event("analysis", "page_error", doc=doc_id, page=i + 1, error=str(e))
+    counts["required"] = sum(bool(d.get("ocr_required")) for d in diags)
     usable = " ".join(doc[i].get_text()[:3000] for i in range(n) if diags[i]["health"] in ("healthy", "suspicious"))[:24000]
     lang = detect_lang(usable)
     audit.event("analysis", "doc_language", doc=doc_id, lang=lang, healthy_pages=sum(d["health"] == "healthy" for d in diags),
@@ -116,6 +119,7 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
             decision = d["decision"]
             if fast and decision == "compare":
                 decision = "native"; d["reasons"].append("fast mode: compare skipped")
+                d["ocr"] = {"engine": None, "status": "skipped", "requires_review": True}
             if decision != "native" and settings.ocr_enabled and settings.ocr_backend == "glm-ocr":
                 result, info = router.recognise(page, lang, dpi, d,
                                                lambda engine: stage("ocr", page=i + 1, engine=engine))
@@ -208,6 +212,11 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
                     pass
         raw.append(rec)
         ocr_info = d.get("ocr", {})
+        for engine, key in (("glm-ocr", "glm_ocr"), ("paddleocr", "paddle_ocr")):
+            counts[key] += ocr_info.get("engine") == engine and ocr_info.get("status") == "accepted"
+        counts["failed"] += bool(d.get("ocr_required") and
+                                 (d.get("error") or ocr_info.get("status") == "review_required"))
+        counts["review"] += bool(ocr_info.get("requires_review") or d.get("error"))
         unread_scan = (d["decision"] == "ocr" and not rec["lines"] and d.get("image_coverage", 0) > 0.5
                        and (ocr_info.get("status") != "accepted" or "error" in d))
         res["page_log"].append({"page": i + 1, "source": rec["source"], "health": d["health"],
@@ -215,6 +224,7 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
                                 "ocr": ocr_info, "seconds": round(time.time() - tp, 2), "unread_scan": unread_scan})
         if progress:
             progress(i + 1, n)
+        stage("extracted", page=i + 1)
     doc.close()
     router.close()
     # ---- Layout Reconstruction agent ------------------------------------------------------------------
@@ -236,11 +246,14 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
             except Exception as e:
                 audit.event("layout", "page_error", doc=doc_id, page=rp["n"], error=str(e), trace=traceback.format_exc()[-600:])
                 pg = PageIR(n=rp["n"], width=rp["w"], height=rp["h"], source=rp["source"])
-                pg.blocks = [Block(tag="p", text=" ".join(l.text for l in rp["lines"]), kind="body")] if rp["lines"] else []
+                pg.blocks = rp["blocks"] or ([Block(tag="p", text=" ".join(l.text for l in rp["lines"]),
+                                                    kind="body", source=rp["source"])] if rp["lines"] else [])
+                rp["diag"].setdefault("review_reasons", []).append("Layout reconstruction failed.")
             pg.diag = rp["diag"]
             ocr_info = pg.diag.get("ocr", {})
-            pg.ocr_engine = ocr_info.get("engine") or ""
-            pg.requires_review = bool(ocr_info.get("requires_review") or pg.diag.get("error"))
+            pg.ocr_engine = (ocr_info.get("engine") or "") if pg.source == "ocr" else ""
+            pg.requires_review = bool(ocr_info.get("requires_review") or pg.diag.get("error")
+                                      or pg.diag.get("review_reasons"))
             layout_status, regions = layout.enrich(pdf, pg)
             pg.diag["layout"] = {"engine": "Docling" if layout_status == "applied" else "reconstruction",
                                  "status": layout_status, "regions": len(regions)}
@@ -258,6 +271,7 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
             page_result.update(layout=pg.diag["layout"], review_required=pg.requires_review,
                                confidence=pg.diag["confidence"])
             pages.append(pg)
+        counts["review"] = sum(page.requires_review for page in pages)
     finally:
         layout.close()
     dir_ = DocIR(doc_id=doc_id, path=str(pdf), lang=lang, pages=pages, meta={"settings": settings.schema_profile})

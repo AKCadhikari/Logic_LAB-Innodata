@@ -50,14 +50,16 @@ def upload_file(field: str, extension: str, magic: bytes):
 @api.get("/health")
 def health():
     from ocr.engine import available_langs
-    from comparison.ollama import health as ollama_health
+    from comparison.ollama import model_info as qwen_info
     from ocr import glm, paddle
     from layout.docling_adapter import readiness as layout_readiness
     ws = workspace()
+    glm_info, qwen = glm.model_info(ws.settings), qwen_info(ws.settings)
     return jsonify(status="ok", runtime="local CPU", ocr_enabled=ws.settings.ocr_enabled,
                    ocr_languages=sorted(available_langs(ws.settings)), xml_profile=ws.settings.schema_profile,
-                   ollama=ollama_health(ws.settings), ocr_backend=ws.settings.ocr_backend,
-                   glm_ocr=glm.model_info(ws.settings), paddle_ocr=paddle.readiness(ws.settings),
+                   ollama="connected" if glm_info["connected"] or qwen["connected"] else "unavailable",
+                   ocr_backend=ws.settings.ocr_backend, qwen={**qwen, "enabled": ws.settings.ollama_enabled},
+                   glm_ocr=glm_info, paddle_ocr=paddle.readiness(ws.settings),
                    docling=layout_readiness(ws.settings))
 
 
@@ -138,7 +140,8 @@ def document(document_id: str):
     if extracted:
         ir, _, result = extracted
         content = view(ir)
-        info.update(content, validation=result["validation"], quality=result["quality"], seconds=result["seconds"])
+        info.update(content, validation=result["validation"], quality=result["quality"], seconds=result["seconds"],
+                    processing_counts=result.get("processing_counts"))
     return jsonify(info)
 
 
@@ -226,12 +229,21 @@ def compare(document_id: str):
     changes = version_changes(document_id, request.args.get("previous_id", ""))
     if changes is None:
         return fail("Choose two different processed documents.", 409)
+    changes, analysis = assess_changes(document_id, changes)
+    return jsonify(changes=changes, analysis=analysis) if request.args.get("include_analysis") == "1" else jsonify(changes)
+
+
+def assess_changes(document_id: str, changes: list[dict]) -> tuple[list[dict], dict]:
+    ws = workspace()
+    audit = ws.source(document_id).parent / "comparison.jsonl"
+    return ws.worker.submit(run_assessment, changes, ws.settings, audit).result()
+
+
+def run_assessment(changes, settings, audit_path):
     from comparison.ollama import annotate
     from utils.logs import AuditLog
-    ws = workspace()
-    annotate(changes, ws.settings, AuditLog(ws.source(document_id).parent / "comparison.jsonl")
-             if ws.settings.ollama_enabled else AuditLog())
-    return jsonify(changes)
+
+    return changes, annotate(changes, settings, AuditLog(audit_path))
 
 
 @api.post("/documents/<document_id>/presentations")
@@ -274,7 +286,9 @@ def sync_deck(document_id: str):
             report = ws.worker.submit(repair_presentation, ir, source, output, settings).result()
             report.pop("records")
         else:
+            changes, analysis = assess_changes(document_id, changes)
             report = synchronize(source, output, changes)
+            report["analysis"] = analysis
         (target / "evidence.xml").write_bytes(to_xml(ir, settings))
     except (BadZipFile, KeyError, ValueError, XMLSyntaxError):
         return fail("The presentation could not be read or validated.", 422)

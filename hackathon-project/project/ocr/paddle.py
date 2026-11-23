@@ -115,7 +115,7 @@ class PaddleOCR:
     def _receive(self, deadline: float) -> dict:
         if not self.connection.poll(max(0, deadline - time.monotonic())):
             self.close()
-            raise RecognitionError("PaddleOCR timed out.")
+            raise RecognitionError("PaddleOCR timed out.", status="timeout")
         try:
             payload = self.connection.recv()
         except EOFError as error:

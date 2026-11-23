@@ -1,8 +1,9 @@
 # Technical approach
 
 The batch pipeline and the Flask workspace share the same [local OCR pipeline](docs/LOCAL_OCR.md).
-GLM-OCR uses the loopback Ollama API when a page requires recognition. Browser version comparison can also
-request optional local Ollama hints for uncertain pairs.
+GLM-OCR uses the loopback Ollama API when a page requires recognition. The workspace uses Qwen3 4B to
+classify selected version changes and suggest review priorities. Deterministic source and slide matches
+control PowerPoint edits.
 
 The current [official sample validation](../docs/OFFICIAL_SAMPLE_VALIDATION.md) records the evidence-based
 PowerPoint changes and the legacy XML sample profile. The historical repair rules described below
@@ -27,7 +28,7 @@ predate the package-preserving repair engine.
 | Layout | `layout/docling_adapter.py`, `layout/reconstruct.py`, `layout/kinds.py` | Docling regions and reading order, native geometry, deterministic reconstruction |
 | Shared IR | `layout/model.py` | Pydantic document, page, block, cell, span, coordinates, extraction method and confidence |
 | XML | `xml_engine/` | `lxml` serializer and validation for the brief and sample profiles |
-| Comparison | `comparison/differ.py` | token alignment engine + version comparison (added/deleted/modified/moved) |
+| Comparison | `comparison/differ.py`, `comparison/ollama.py` | deterministic token alignment and version changes with validated Qwen3 review |
 | PowerPoint | `powerpoint/amend.py` | evidence matching, run-level edits, footer/breadcrumb/slide-number repair, missing-box restoration |
 | Quality | `quality/` | heuristic confidence, XML checks, evaluators against reference XML/PPTX |
 | Orchestrator | `agents/orchestrator.py` | shared state, delegation, time budget, parallelism, failure isolation |
@@ -63,8 +64,8 @@ inferred from the single example. Output names: `<pdf name>.xml`; decks follow t
 ## 5. Declarations
 * **AI tools used for development**: Claude (Anthropic) was used as a coding/design assistant for this project. *Edit this line
   to list exactly the assistants your team used, as the rules require.*
-* **Runtime models** are GLM-OCR, the provisioned PaddleOCR recognizer and detector, and optional Docling layout and table
-  weights. Tesseract language data support the legacy OCR backend and independent deck-edit verification.
+* **Runtime models** are GLM-OCR, Qwen3 4B, the provisioned PaddleOCR recognizer and detector, and optional Docling layout
+  and table weights. Tesseract language data support the legacy OCR backend and independent deck-edit verification.
 * **Third-party components and licences**: PyMuPDF (AGPL-3.0 or commercial - acknowledge and confirm acceptability with the
   organisers), Tesseract + tessdata (Apache-2.0), OpenCV (Apache-2.0), python-pptx (MIT), lxml (BSD), RapidFuzz (MIT),
   NumPy (BSD), Flask (BSD), pytest (MIT).

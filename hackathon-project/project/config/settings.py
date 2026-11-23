@@ -15,9 +15,10 @@ class Settings:
     # --- diagnostics / OCR -----------------------------------------------------
     ocr_enabled: bool = True
     ocr_backend: str = "glm-ocr"           # glm-ocr with Paddle fallback, or explicit legacy tesseract
-    glm_ocr_url: str = "http://127.0.0.1:11434"
+    glm_ocr_url: str = "http://localhost:11434"
     glm_ocr_model: str = "glm-ocr:q8_0"
-    glm_ocr_timeout_s: int = 90
+    glm_ocr_timeout_s: int = 300
+    glm_ocr_keep_alive: str = "0"
     glm_ocr_retries: int = 0
     glm_ocr_max_edge: int = 1800
     glm_ocr_tokens: int = 4096
@@ -66,10 +67,11 @@ class Settings:
     amend_nonlatin_auto: bool = False      # auto-apply non-number corrections in Arabic/CJK/Hangul text (default: review only)
     amend_use_notes: bool = True          # use source page notes as search hints
     # --- optional version comparison assistance ---------------------------------
-    ollama_enabled: bool = False
-    ollama_url: str = "http://127.0.0.1:11434"
+    ollama_enabled: bool = True
+    ollama_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:4b"
-    ollama_timeout_s: int = 12
+    ollama_timeout_s: int = 300
+    ollama_keep_alive: str = "0"
     # --- naming ----------------------------------------------------------------------
     pptx_suffix_rule: str = "auto"         # auto | amendment_out | transformed_QA
 
@@ -86,6 +88,16 @@ class Settings:
             if env is not None:
                 cur = getattr(s, f.name)
                 setattr(s, f.name, env.lower() in ("1", "true", "yes") if isinstance(cur, bool) else type(cur)(env))
+        for name, targets, convert in (
+            ("OLLAMA_BASE_URL", ("glm_ocr_url", "ollama_url"), str),
+            ("OLLAMA_TIMEOUT", ("glm_ocr_timeout_s", "ollama_timeout_s"), int),
+            ("OLLAMA_KEEP_ALIVE", ("glm_ocr_keep_alive", "ollama_keep_alive"), str),
+            ("GLM_OCR_MODEL", ("glm_ocr_model",), str),
+            ("QWEN_MODEL", ("ollama_model",), str),
+        ):
+            if name in os.environ:
+                for target in targets:
+                    setattr(s, target, convert(os.environ[name]))
         for k, v in overrides.items():
             if v is not None and hasattr(s, k):
                 setattr(s, k, v)

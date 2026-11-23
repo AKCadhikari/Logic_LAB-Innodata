@@ -1,11 +1,12 @@
 # DocuSync AI - Innodata AI Catalyst 2026 (Internal Track)
 
 Turns scanned / corrupted / multilingual PDFs into structured XML and proof-reads the matching PowerPoint decks
-against the source document. CPU-first and local. Optional comparison hints use a locally installed Ollama model.
+against the source document. CPU-first and local. Qwen3 4B provides advisory review of document-version changes.
 
 ```
 PDF -> PyMuPDF diagnostics -> native text or GLM-OCR (PaddleOCR fallback)
     -> Docling or local layout reconstruction -> validated document IR -> XML (<name>.xml)
+PDF versions -> deterministic changes -> Qwen3 review -> verified PowerPoint version sync
 PPTX + source PDF -> evidence alignment -> targeted, formatting-preserving fixes -> corrected deck + change report
 ```
 
@@ -17,6 +18,7 @@ python -m venv .venv ; .\.venv\Scripts\Activate.ps1
 pip install -r project\requirements.txt
 # With Ollama running:
 ollama pull glm-ocr:q8_0
+ollama pull qwen3:4b
 
 python project\main.py --input phase-1\input --output phase-1\output
 ```
@@ -43,7 +45,7 @@ Review a page in Source PDF, Text, Zoning or Reading Order, correct the title or
 then approve and export XML. Locate an extracted title in the PDF when the source region is available. Use Changes
 to compare two versions and apply matching text updates to an uploaded PowerPoint deck.
 Use **Repair against source PDF** in Changes to proofread a deck using the selected PDF and download evidence XML.
-The settings dialog saves a local reviewer name for attribution.
+The settings dialog shows local model availability and saves a reviewer name for attribution.
 
 Select **Batch review** to open the original dashboard. It uses the Phase 1 folders by default and accepts
 `--run-dir`, `--input` and `--output` for other batch runs. Use a dedicated `--storage` path for each running
@@ -51,7 +53,7 @@ workspace instance. The server binds to loopback for local single-user review.
 
 The project can discover a portable Tesseract under `.venv/tesseract/` on Windows. Other installations can use
 `TESSERACT_CMD` or the pipeline settings file. Settings in the workspace show the available language packs.
-Optional Ollama comparison hints use the local endpoint in `project/config/default.example.json` and are disabled by default.
+Qwen3 review is enabled by default. Set `DOCUSYNC_OLLAMA_ENABLED=false` to disable it.
 
 ## Tests and benchmark
 

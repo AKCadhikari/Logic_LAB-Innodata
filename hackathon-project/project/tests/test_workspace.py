@@ -15,6 +15,7 @@ from ui.server import app, configure_workspace
 def workspace(tmp_path_factory):
     root = tmp_path_factory.mktemp("workspace")
     configure_workspace(root)
+    app.extensions["workspace"].settings.ollama_enabled = False
     app.config["TESTING"] = True
     with app.test_client() as client:
         yield client, root
@@ -63,6 +64,7 @@ def test_upload_review_export_compare_and_sync(workspace):
     assert client.get(old + "/pdf").data == old_data
     assert (root / doc["id"] / "source.pdf").exists()
     assert doc["pages"][0]["source"] == "native"
+    assert doc["processing_counts"] == {"required": 0, "glm_ocr": 0, "paddle_ocr": 0, "failed": 0, "review": 0}
     assert doc["title"]["bbox"] and doc["title"]["page"] == 1
     assert str(root) not in client.get(new).text
     assert client.get(new + "/page/1.png").data.startswith(b"\x89PNG")
@@ -80,9 +82,11 @@ def test_upload_review_export_compare_and_sync(workspace):
     assert document_xml.findtext("page/h1") == "Reviewed title"
     assert document_xml.find("page").get("n") == "1"
 
-    delta = client.get(new + "/compare", query_string={"previous_id": old_doc["id"]})
+    delta = client.get(new + "/compare", query_string={"previous_id": old_doc["id"], "include_analysis": 1})
     assert delta.status_code == 200
-    assert any(change["old_content"] == before and change["new_content"] == after for change in delta.json)
+    assert delta.json["analysis"]["status"] == "disabled"
+    change = next(change for change in delta.json["changes"] if change["old_content"] == before)
+    assert change["new_content"] == after and change["numerical_change"] == {"before": ["240"], "after": ["260"]}
     deck = Presentation()
     slide = deck.slides.add_slide(deck.slide_layouts[6])
     from pptx.util import Inches

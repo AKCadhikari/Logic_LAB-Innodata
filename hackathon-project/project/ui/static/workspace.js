@@ -7,10 +7,19 @@ const processingStatus = step => {
     if (!step) return "";
     if (step.stage === "diagnostics") return "Inspecting PDF pages";
     if (step.stage === "ocr") return engineName(step.engine) + " · page " + step.page;
+    if (step.stage === "extracted") return "Extracted page " + step.page;
     if (step.stage === "layout") return "Reconstructing layout · page " + step.page;
     if (step.stage === "validation") return "Validating document and XML";
     return "";
 };
+const processingCounts = counts => counts ? '<div class="card" aria-live="polite">' +
+    '<div>OCR required on ' + counts.required + ' pages</div>' +
+    '<div>GLM-OCR ' + counts.glm_ocr + ' · PaddleOCR ' + counts.paddle_ocr +
+    ' · OCR failures ' + counts.failed + '</div>' +
+    '<div>Manual review ' + counts.review + '</div></div>' : "";
+const analysisStatus = analysis => analysis ? '<p role="status">' + esc(analysis.model) + ' · ' +
+    esc(analysis.status) + (analysis.reviewed ? ' · ' + analysis.reviewed + ' assessments' : '') +
+    (analysis.reason ? ' · ' + esc(analysis.reason) : '') + '</p>' : "";
 const showError = error => {
     statusText(error.message);
     const notice = document.createElement("p");
@@ -178,7 +187,7 @@ function pageDiagnostics(page) {
     const diag = page.diag, ocr = diag.ocr;
     const confidence = diag.confidence == null ? "Confidence unavailable" : badge(diag.confidence * 100);
     const selected = page.source === "ocr" ? engineName(page.ocr_engine || ocr?.engine) || "OCR" : "Native PDF";
-    const attempts = (ocr?.attempts || []).map(attempt => '<div>' + esc(engineName(attempt.engine)) +
+    const attempts = (ocr?.attempts || []).map(attempt => '<div>' + esc(attempt.model || engineName(attempt.engine)) +
         ' · ' + esc(attempt.status) + (attempt.issues.length ? ' · ' + esc(attempt.issues.join(" ")) : '') + '</div>').join("");
     return '<div class="sec">Page ' + page.n + ' diagnostics</div><div class="card">' +
         '<div>' + esc(selected) + ' · ' + confidence + '</div>' +
@@ -217,8 +226,9 @@ async function reviewPanel() {
     const history = '<div class="sec">Processing history</div>' + data.jobs.map(attempt =>
         '<div class="card"><div>' + esc(attempt.status) + ' · ' + esc(new Date(attempt.created).toLocaleString()) +
         '</div>' + (attempt.error ? '<div class="notice">' + esc(attempt.error) + '</div>' : '') + '</div>').join("");
+    const counts = processingCounts(job.processing?.counts || data.processing_counts);
     if (!data.pages) {
-        panel.innerHTML = history;
+        panel.innerHTML = counts + history;
         return;
     }
     const page = data.pages[W.page - 1], title = data.title;
@@ -229,7 +239,7 @@ async function reviewPanel() {
         '<div class="fld"><label for="review-lang">Document language</label>' +
         '<input id="review-lang" required maxlength="35" value="' + esc(data.lang) + '"></div>' +
         '<div><button class="btn" value="save">Save draft</button> <button class="btn pri" value="approve">Approve</button></div></form>' +
-        '<div id="page-diagnostics">' + pageDiagnostics(page) + '</div>' +
+        counts + '<div id="page-diagnostics">' + pageDiagnostics(page) + '</div>' +
         '<div class="sec">Validation</div><div class="card">XML ' +
         (data.validation.issues.length ? esc(data.validation.issues.join(", ")) : "passed structural checks") + '</div>' +
         data.warnings.map(warning => '<div class="notice">' + esc(warning) + '</div>').join("") + history;
@@ -275,11 +285,16 @@ function changesPanel(data) {
         '<article class="card"><div class="h">' + esc(change.category) + ' · ' + esc(change.change_type) +
         ' · ' + (change.original_location?.page || "—") + ' → ' + (change.new_location?.page || "—") +
         ' · ' + badge(change.confidence * 100) + '</div><div>' + esc(change.old_content) + '</div><div>' +
-        esc(change.new_content) + '</div>' + (change.assistance ? '<div>Local model: ' + esc(change.assistance.relation) +
-        ' · candidate on page ' + esc(change.assistance.candidate.page) + '</div>' : '') +
+        esc(change.new_content) + '</div>' + (change.numerical_change ? '<div>Values · ' +
+        esc(change.numerical_change.before.join(", ") || "—") + ' → ' +
+        esc(change.numerical_change.after.join(", ") || "—") + '</div>' : '') +
+        (change.assistance ? '<div>Qwen review · ' + esc(change.assistance.classification) +
+        ' · ' + esc(change.assistance.relation) + (change.assistance.candidate ? ' · candidate on page ' +
+        esc(change.assistance.candidate.page) : '') + '</div><div>' + esc(change.assistance.explanation) + '</div>' : '') +
         (change.reason ? '<div>' + esc(change.reason) + '</div>' : '') +
         '</article>').join("") : '<p>No changes detected.</p>';
-    if (W.changes) $("#comparison-results").innerHTML = changeList(W.changes);
+    if (W.changes) $("#comparison-results").innerHTML =
+        analysisStatus(W.changes.analysis) + changeList(W.changes.changes);
     const renderExports = async () => {
         const url = docUrl() + "/presentations";
         const reports = await workspaceFetch(url);
@@ -302,15 +317,20 @@ function changesPanel(data) {
         $("#comparison-results").textContent = "";
         updateControls();
     };
-    $("#compare").onclick = async () => {
+    $("#compare").onclick = async event => {
         const previous = W.previous;
+        const button = event.currentTarget;
+        button.disabled = true;
+        $("#comparison-results").innerHTML = '<p role="status">Comparing documents and requesting Qwen review…</p>';
         try {
-            const changes = await workspaceFetch(docUrl() + "/compare?previous_id=" + encodeURIComponent(previous));
+            const result = await workspaceFetch(docUrl() + "/compare?include_analysis=1&previous_id=" +
+                encodeURIComponent(previous));
             if (S.data === data && S.stab === "deck" && previous === W.previous) {
-                W.changes = changes;
-                $("#comparison-results").innerHTML = changeList(changes);
+                W.changes = result;
+                $("#comparison-results").innerHTML = analysisStatus(result.analysis) + changeList(result.changes);
             }
         } catch (error) { showError(error); }
+        finally { if (button.isConnected) updateControls(); }
     };
     $("#deck-upload").onsubmit = async event => {
         event.preventDefault();
@@ -320,11 +340,14 @@ function changesPanel(data) {
         form.append("mode", button.value);
         if (button.value === "version") form.append("previous_id", W.previous);
         button.disabled = true;
+        if (button.value === "version") {
+            $("#comparison-results").innerHTML = '<p role="status">Checking version changes for PowerPoint…</p>';
+        }
         try {
             const url = docUrl() + "/presentations";
             const report = await workspaceFetch(url, {method: "POST", body: form});
             if (S.data !== data || S.stab !== "deck") return;
-            $("#comparison-results").innerHTML = '<p><a class="workspace-link" href="' + url + '/' +
+            $("#comparison-results").innerHTML = analysisStatus(report.analysis) + '<p><a class="workspace-link" href="' + url + '/' +
                 esc(report.id) + '">Download validated presentation</a> · ' + report.applied.length +
                 ' edits · ' + report.review.length + ' changes for review</p>' +
                 '<p><a class="workspace-link" href="' + url + '/' + esc(report.id) +
@@ -390,12 +413,17 @@ $("#settings").onclick = () => {
         name.disabled = save.disabled = false;
     }).catch(error => { $("#profile-status").textContent = error.message; });
     workspaceFetch("/api/health").then(health => {
-        const ocr = !health.ocr_enabled ? "OCR disabled" : health.ocr_backend === "tesseract" ?
-            "Tesseract languages: " + health.ocr_languages.join(", ") :
-            "GLM-OCR " + (health.glm_ocr?.ready ? "ready" : "unavailable") +
-            " · PaddleOCR " + (health.paddle_ocr?.ready ? "ready" : "unavailable");
-        $("#settings-info").textContent = health.runtime + " · " + health.xml_profile +
-            " XML profile · " + ocr + " · Docling " + (health.docling?.ready ? "ready" : "unavailable");
+        const readiness = model => model.ready ? "ready" : model.reason || "unavailable";
+        $("#settings-info").textContent = [
+            health.runtime + " · " + health.xml_profile + " XML profile",
+            "Ollama " + health.ollama,
+            "GLM-OCR " + health.glm_ocr.model + " · " + readiness(health.glm_ocr),
+            "Qwen " + health.qwen.model + " · " + readiness(health.qwen) + (health.qwen.enabled ? "" : " · review disabled"),
+            !health.ocr_enabled ? "OCR disabled" : health.ocr_backend === "tesseract" ?
+                "Tesseract languages " + health.ocr_languages.join(", ") : "OCR backend " + engineName(health.ocr_backend),
+            "PaddleOCR " + (health.paddle_ocr?.ready ? "ready" : "unavailable"),
+            "Docling " + (health.docling?.ready ? "ready" : "unavailable"),
+        ].join(" · ");
     }).catch(error => { $("#settings-info").textContent = error.message; });
 };
 $("#profile-form").onsubmit = async event => {

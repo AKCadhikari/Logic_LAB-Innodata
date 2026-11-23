@@ -30,7 +30,7 @@ class OCRRouter:
             for _ in range(repeats):
                 started = time.monotonic()
                 result = None
-                unavailable = False
+                failure_status = "rejected"
                 try:
                     if engine == "glm-ocr":
                         if self.glm_status is None:
@@ -42,19 +42,26 @@ class OCRRouter:
                         result = self.paddle.recognise(page, language, dpi)
                     issues = validate_recognition(result, page_number, diag, self.settings)
                     observed[engine] = result.text()
-                    self._save(result, len(attempts) + 1)
                 except RecognitionError as error:
                     issues = [str(error)]
-                    unavailable = error.unavailable
+                    failure_status = error.status
                 except (OSError, ValueError, RuntimeError, TypeError, KeyError, IndexError):
                     issues = [f"{engine} returned an invalid result or stopped."]
-                attempts.append({"engine": engine, "status": ("accepted" if not issues else
-                                                               "unavailable" if unavailable else "rejected"),
-                                 "issues": issues, "seconds": round(time.monotonic() - started, 2)})
+                model = self.settings.glm_ocr_model if engine == "glm-ocr" else None
+                if result is not None:
+                    model = result.raw.get("model") or model
+                attempt = {"engine": engine, "model": model, "status": "accepted" if not issues else failure_status,
+                           "issues": issues, "seconds": round(time.monotonic() - started, 2)}
+                attempts.append(attempt)
+                if result is not None:
+                    try:
+                        self._save(result, len(attempts))
+                    except OSError:
+                        attempt["evidence_error"] = "Could not write the raw OCR response to the run folder."
                 if result is not None and not issues:
                     info = {"engine": engine, "status": "accepted", "attempts": attempts,
                             "confidence": result.confidence, "requires_review": False,
-                            "model": result.raw.get("model")}
+                            "model": model}
                     if engine == "paddleocr" and observed.get("glm-ocr"):
                         from rapidfuzz import fuzz
                         from utils.textutil import norm_cmp
@@ -65,7 +72,7 @@ class OCRRouter:
                             info["requires_review"] = True
                             info["review_reason"] = "GLM-OCR and the PaddleOCR fallback disagree."
                     return result, info
-                if unavailable:
+                if failure_status == "unavailable":
                     break
         return None, {"engine": None, "status": "review_required", "attempts": attempts, "requires_review": True}
 

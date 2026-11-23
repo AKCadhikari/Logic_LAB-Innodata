@@ -30,6 +30,7 @@ See [local OCR setup](docs/LOCAL_OCR.md) for PaddleOCR, Docling, Tesseract verif
   `<pdf stem>.xml`, `<pdf stem>_updated.pptx`, and processing, OCR, and validation reports. The XML
   uses the organizer sample profile and passes local structural validation. A failed or missing deck leaves the validated
   XML and reports in place and produces a nonzero batch exit code.
+  Complete exports also contain an extracted-and-verified ZIP with linked assets, correction evidence, and AI execution details.
 * **Run folder** (`<output>/../docsync_run`): audit log (`audit.jsonl`), manifest, per-document IR, change reports
   (`changes/*.json`), `run_report.json`, `report.html`, OCR cache. It is separate so the output folder stays clean.
 * Useful flags: `--workers N`, `--profile brief|sample|example`, `--no-ocr`, `--skip-pptx`, `--time-budget SECONDS`, `--config file.json`
@@ -73,6 +74,9 @@ Design, limitations and tool/AI declarations: `TECHNICAL_APPROACH.md`.
 The [official sample validation](../docs/OFFICIAL_SAMPLE_VALIDATION.md) records the source and reference comparisons,
 the remaining differences, and the command for reproducing the reports. The [repository audit](../docs/REPOSITORY_AUDIT.md)
 and [implementation roadmap](../docs/IMPLEMENTATION_ROADMAP.md) record the earlier Windows verification.
+For a saved bundle, use `project/sample_check.py --export-dir <folder>` with the reference inputs described there.
+The bundled source-region map applies to the exact official PDF and, for slide repairs, the exact original deck.
+Documents outside that match use the general OCR, layout and evidence-based repair pipeline.
 
 ## Repository layout
 

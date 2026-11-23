@@ -271,7 +271,7 @@ async function reviewPanel() {
 function exportCard(report, links) {
     const statuses = {
         completed: "XML and PowerPoint export complete",
-        partial: "XML available · PowerPoint failed",
+        partial: report.outputs.pptx ? "XML and PowerPoint available · ZIP failed" : "XML available · PowerPoint failed",
         failed: "Export failed",
         xml_only: "XML-only export",
     };

@@ -1,0 +1,78 @@
+{
+  "pdf_sha256": "6b3f97304970c76403b64fab51705c929268e5c36906e3a7211becb3d1206ec6",
+  "deck_sha256": "351794c6687a24800a7e50e3c6e9d164845daa5589309a06f30890f35c652cda",
+  "equations": {
+    "4": [["2.1", [199, 428, 443, 445]], ["2.2", [196, 461, 443, 480]], ["2.3", [212, 537, 443, 553]], ["2.4", [227, 570, 443, 586]]],
+    "5": [["2.5", [186, 143, 443, 160]], ["2.6", [143, 258, 443, 289]], ["2.7", [211, 389, 443, 406]], ["2.8", [200, 422, 443, 440]]],
+    "7": [["4.1", [119, 434, 443, 450]], ["4.2", [146, 485, 443, 513]], ["4.3", [159, 550, 443, 565]], ["4.4", [153, 601, 443, 623.5]]]
+  },
+  "figures": [
+    [4, 1, [147.36, 59.28, 353.76, 195.24], "Figure 1: Bubble-net feeding behavior of humpback whales. Source (Mirjalili and Lewis, 2016)"],
+    [8, 2, [88.55, 220.58, 412.57, 463.60], "Figure 2: Average performance comparison between traditional and proposal strategy in experiments"]
+  ],
+  "equation_conflicts": [
+    {"slide": 19, "shape_id": 5, "page": 4, "label": "2.1", "difference": "The PDF uses a difference inside absolute-value bars. The editable deck uses addition."},
+    {"slide": 19, "shape_id": 5, "page": 4, "label": "2.2", "difference": "The PDF includes the product with D after A."},
+    {"slide": 20, "shape_id": 5, "page": 4, "label": "2.4", "difference": "The multiplier in the source is 2. The editable deck uses 3."},
+    {"slide": 21, "shape_id": 5, "page": 5, "label": "2.5 context", "difference": "The source puts l in [-1, 1]. The editable deck gives [-3, 3]."},
+    {"slide": 22, "shape_id": 5, "page": 5, "label": "2.6", "difference": "The upper branch in the source includes the product with D."},
+    {"slide": 23, "shape_id": 5, "page": 5, "label": "2.8", "difference": "The source includes the product with D after A."}
+  ],
+  "algorithm": {
+    "page": 6,
+    "box": [58, 232, 443, 594],
+    "lines": [
+      "Algorithm 1 Pseudocode of proposed method during whale optimization algorithm",
+      "Initialization of the whales population",
+      "Initialization of a small-world network",
+      "Allocation of each whale to a random node in the small-world network",
+      "Initialization of variables a, A, C, I and p",
+      "Fitness calculation of each agent in population",
+      "X* ← agent with best fitness",
+      "while it < MaxIterations do",
+      "  for each agent do",
+      "    if p < 0.5 then:",
+      "      if |A| < 1 then:",
+      "        Update the position of the current search agent by the equation (1)",
+      "      else if |A| ≥ 1 then:",
+      "        X_rand ← neighbour of current agent with best fitness",
+      "        Update the position of the current search agent by the equation (3)",
+      "      end if",
+      "    else if p >= 0.5 then:",
+      "      Update the position of the current search agent by the equation (2)",
+      "    end if",
+      "  end for",
+      "  Fitness calculation of each agent in population again",
+      "  Update X* if a better solution is found",
+      "  it ← it + 1",
+      "  Update variables a, A, C, I and p",
+      "end while",
+      "return X*"
+    ]
+  },
+  "editable_slides": [26, 27, 28, 33],
+  "editable_fixes": [
+    [26, 4, 12, 6, [119, 383, 410, 400], "equation (2)", "equation (1)"]
+  ],
+  "slide_crops": [
+    [19, 5, 4, [58, 359, 443, 481], [0.60, 1.405, 12.133, 4.863], "Equations 2.1–2.2 and original context"],
+    [20, 5, 4, [58, 483, 443, 587], [0.60, 1.405, 12.133, 3.30], "Equations 2.3–2.4 and original context"],
+    [21, 5, 5, [58, 60, 443, 212], [0.60, 1.405, 12.133, 4.80], "Equation 2.5 and bubble-net definitions"],
+    [22, 5, 5, [58, 221, 443, 290], [0.60, 1.405, 12.133, 2.40], "Piecewise equation 2.6 and its probability statement"],
+    [23, 5, 5, [58, 322, 443, 441], [0.60, 1.405, 12.133, 4.20], "Equations 2.7–2.8 and exploration context"],
+    [26, 4, 6, [58, 232, 443, 468], [0.60, 1.405, 12.133, 5.258], "Algorithm 1, lines 1–17"],
+    [27, 4, 6, [58, 469, 443, 594], [0.60, 1.405, 12.133, 2.90], "Algorithm 1, lines 18–26"],
+    [28, 4, 7, [58, 75, 443, 239], [0.60, 1.405, 12.133, 5.128], "Source continuation about partner selection and rewiring"],
+    [30, 4, 7, [58, 400, 443, 624], [0.60, 1.405, 12.133, 5.258], "Benchmark functions and equations 4.1–4.4"],
+    [33, 4, 8, [58, 514, 443, 640], [0.60, 1.405, 12.133, 3.31], "Figure 2 interpretation and optimization results"],
+    [33, 4, 9, [58, 59, 443, 141], [0.60, 4.75, 12.133, 2.05], "Continuation and Bukin results"]
+  ],
+  "slide_text": [
+    [1, 3, 1, 1, [60, 137, 470, 151], "CARLOS A DEGADO S", "CARLOS A DELGADO S"],
+    [1, 3, 1, 1, [60, 137, 470, 151], "KAREN L. MENDOZA", "KAREN L. MARTINEZ-MENDOZA"],
+    [4, 4, 1, 1, [81, 385, 421, 400], "bio optimization", "bio inspired optimization"],
+    [4, 4, 6, 1, [81, 489, 406, 499], "Artificial Intelligence, Network optimization", "Artificial Intelligence, Whale Optimization Algorithm, Network optimization"],
+    [4, 4, 7, 1, [81, 506, 410, 516], "90B40 , 69T20.", "90B40."],
+    [31, 4, 2, 8, [72, 61, 171, 74], "Population size: 200", "Population size: 150"]
+  ]
+}

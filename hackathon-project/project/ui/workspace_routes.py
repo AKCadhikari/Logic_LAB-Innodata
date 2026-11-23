@@ -400,12 +400,27 @@ def download_bundle(document_id: str, export_id: UUID):
     if not found or found[1]["status"] != "completed":
         return fail("A complete export is required to download the ZIP.", 404)
     folder, report = found
-    files = [report["outputs"][kind]["filename"] for kind in ("xml", "pptx")] + report["xml_assets"]
+    if info := report.get("archive"):
+        archive = export_file(folder, info["filename"])
+        if not archive:
+            return fail("The validated ZIP is missing from the output folder.", 404)
+        return send_file(archive, mimetype="application/zip", as_attachment=True, download_name=archive.name)
+
+    from xml_engine.assets import inspect_assets, validate_archive
+
+    xml_name, deck_name = (report["outputs"][kind]["filename"] for kind in ("xml", "pptx"))
+    assets = inspect_assets((folder / xml_name).read_bytes(), folder)
+    if not assets["valid"]:
+        return fail("The XML has unresolved assets. Re-export this document to rebuild the ZIP.", 422)
+    files = [xml_name, deck_name, *assets["files"]]
     if not all(export_file(folder, name) for name in files):
         return fail("An export file is missing.", 404)
     archive = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
     try:
         write_zip(archive, folder, files)
+        if not validate_archive(archive, xml_name, deck_name)["valid"]:
+            archive.close()
+            return fail("ZIP validation failed.", 422)
         archive.seek(0)
         return send_file(archive, mimetype="application/zip", as_attachment=True,
                          download_name=f"{folder.parent.name}.zip")

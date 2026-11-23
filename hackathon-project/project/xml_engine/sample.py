@@ -56,7 +56,7 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
     front = True
     top_number = 0
     last_reference = None
-    name = Path(doc.path).stem or doc.doc_id
+    name = doc.meta.get("asset_stem") or Path(doc.path).stem or doc.doc_id
 
     def section(depth, kind, level):
         while sections and sections[-1][0] >= depth:
@@ -152,10 +152,12 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                 if formula:
                     attributes["type"] = "formula"
                 if block.text or block.alt:
-                    attributes["alt"] = xml_safe(block.text or block.alt)
+                    label = f"({block.marker}) " if formula and block.marker else ""
+                    description = "Equation from source PDF" if block.source == "pdf_crop" else block.text or block.alt
+                    attributes["alt"] = xml_safe(label + description)
                 etree.SubElement(figure, "img", **attributes)
                 if assets is not None and block.bbox:
-                    assets[source] = (page.n, block.bbox)
+                    assets[source] = (page.n, tuple(float(value) for value in geometry(block.bbox).values()))
                 if block.caption:
                     caption = etree.SubElement(figure, "figcaption", **text_attributes(block, page, "FC", "figure_caption"))
                     text_node(caption, block.caption, [])
@@ -212,7 +214,11 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                 if tag in {"h2", "h3", "h4", "h5", "h6"}:
                     attrs["level"] = tag[1]
                 element = etree.SubElement(target, tag, **attrs)
-                text_node(element, text, block.spans)
+                if kind == "pseudocode":
+                    element.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                    element.text = xml_safe(text)
+                else:
+                    text_node(element, text, block.spans)
                 nodes[id(block)] = element
     if locations is not None:
         tree = root.getroottree()

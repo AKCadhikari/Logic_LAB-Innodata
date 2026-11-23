@@ -278,6 +278,9 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
     dir_ = DocIR(doc_id=doc_id, path=str(pdf), lang=lang, pages=pages,
                  meta={"settings": settings.schema_profile, "pdf_metadata": metadata})
     kinds.assign_kinds(dir_)
+    from layout.verified import apply_verified_content
+
+    apply_verified_content(dir_)
     stage("validation")
     dir_ = ir_from_dict(dir_.to_dict())
     # ---- XML Generation + QA agents -----------------------------------------------------------------------

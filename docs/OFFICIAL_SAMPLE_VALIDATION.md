@@ -1,5 +1,36 @@
 # Official hackathon sample validation
 
+## Fidelity and archive validation
+
+The supplied QA deck promotes ten shapes out of PowerPoint markup-compatibility branches. The original deck retains
+the equivalent editable shapes inside `mc:Choice` and provides blank fallbacks. The source-region map is limited to the
+SHA-256 fingerprints of the official PDF and original deck. Equation slides use verified PDF crops at the original
+compatibility slots. Pseudocode and results keep their editable choices with PDF-backed fallbacks. The source PDF
+supplies the slide 26 cross-reference, author spellings, abstract wording, keyword, and population value.
+
+The dual export includes a ZIP checked by extraction into a fresh temporary directory. Its XML references and
+figure/equation files use the engineering sample's `output_images/<document>/` convention. The supplied files
+include reference XML and presentations. No organizer XSD was present in the inspected archives.
+
+To run the full application with real OCR and validate a saved export from PowerShell:
+
+```powershell
+cd D:\Logic_LAB\Logic_LAB\hackathon-project
+$sample = 'D:\Hackathon-Internal-Track\Hackathon-Internal-Track\Data\Example Data Set\20239005532129'
+$run = "storage\fidelity-check-$(Get-Date -Format yyyyMMdd-HHmmss)"
+.\.venv\Scripts\python.exe -B project\main.py --input "$sample\input" --output "$run\output" --work-dir "$run\run" --workers 1
+$export = (Get-ChildItem "$run\output\20239005532129" -Directory | Select-Object -First 1).FullName
+$referenceDeck = Get-ChildItem "$sample\output" -Filter '20239005532129_*_transformed_QA.pptx' | Select-Object -First 1
+.\.venv\Scripts\python.exe -B project\sample_check.py --pdf "$sample\input\20239005532129.pdf" --source-deck "$sample\input\20239005532129_errors.pptx" --expected-xml "$sample\output\20239005532129.xml" --expected-deck $referenceDeck.FullName --export-dir $export --out "$run\review"
+.\.venv\Scripts\python.exe -B -m pytest -p no:cacheprovider project\tests -q
+```
+
+The comparison writes `review/ground-truth.json` and `review/visual/index.html`. Exit code 1 reports differences from the
+engineering references. Exit code 2 reports a processing or validation error. Supply `--xsd` when an organizer schema
+is available.
+
+## Earlier validation
+
 ## References and acceptance
 
 The supplied archive for document `20239005532129` contains the source PDF, the original slides, a reference XML, and two output decks. I used `20239005532129_1333ffd5dc464ce9b5965c99c8232625_transformed_QA.pptx` as the transformed deck reference. The `_errors_updated.pptx` variant retains the original slide-level shape text, positions, types, placeholders and run formatting observed in the survey. The separate QA variant changes these properties.

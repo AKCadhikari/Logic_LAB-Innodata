@@ -32,6 +32,9 @@ def validate_xml(data: bytes, expected_pages: int, settings) -> dict:
             issues.append("The sample format uses a document header followed by a body.")
         if any(len(page) or (page.text or "").strip() for page in pages):
             issues.append("Sample-format page milestones must be empty.")
+        valid_pages = {str(number) for number in range(1, expected_pages + 1)}
+        if any(node.get("page") not in valid_pages for node in root.iter() if node.get("page") is not None):
+            issues.append("A sample-format element refers to a page outside the source PDF.")
     else:
         pages = root.findall("page")
         page_attr = cfg["page_attr"]

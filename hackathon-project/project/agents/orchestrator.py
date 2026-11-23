@@ -225,6 +225,7 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
         if progress:
             progress(i + 1, n)
         stage("extracted", page=i + 1)
+    metadata = {key: value for key, value in (doc.metadata or {}).items() if value}
     doc.close()
     router.close()
     # ---- Layout Reconstruction agent ------------------------------------------------------------------
@@ -274,7 +275,8 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
         counts["review"] = sum(page.requires_review for page in pages)
     finally:
         layout.close()
-    dir_ = DocIR(doc_id=doc_id, path=str(pdf), lang=lang, pages=pages, meta={"settings": settings.schema_profile})
+    dir_ = DocIR(doc_id=doc_id, path=str(pdf), lang=lang, pages=pages,
+                 meta={"settings": settings.schema_profile, "pdf_metadata": metadata})
     kinds.assign_kinds(dir_)
     stage("validation")
     dir_ = ir_from_dict(dir_.to_dict())

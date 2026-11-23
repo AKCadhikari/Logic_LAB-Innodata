@@ -36,8 +36,9 @@ def connect(root: Path):
 
 
 class Workspace:
-    def __init__(self, root: Path, settings: Settings):
+    def __init__(self, root: Path, settings: Settings, output: Path | None = None):
         self.root = root
+        self.output = output if output is not None else root / "output"
         self.root.mkdir(parents=True, exist_ok=True)
         self.settings = settings
         self.worker = ProcessPoolExecutor(max_workers=1)
@@ -64,6 +65,10 @@ class Workspace:
                     created TEXT NOT NULL, reviewer TEXT NOT NULL, approved INTEGER NOT NULL
                 );
             """)
+            if "owner" not in {row["name"] for row in db.execute("PRAGMA table_info(documents)")}:
+                db.execute("ALTER TABLE documents ADD COLUMN owner TEXT")
+            if "batch_owner" not in {row["name"] for row in db.execute("PRAGMA table_info(local_profile)")}:
+                db.execute("ALTER TABLE local_profile ADD COLUMN batch_owner TEXT")
             db.execute("UPDATE jobs SET status='failed', finished=?, error=? WHERE status IN ('queued','running')",
                        (now(), "Processing was interrupted. Retry to start a new attempt."))
 
@@ -73,12 +78,12 @@ class Workspace:
     def source(self, document_id: str) -> Path:
         return self.root / document_id / "source.pdf"
 
-    def upload(self, filename: str, stream: BinaryIO, previous_id: str | None) -> str:
+    def upload(self, filename: str, stream: BinaryIO, previous_id: str | None, owner: str) -> str:
         document_id = uuid4().hex
         source = self.source(document_id)
         with self.db() as db:
-            db.execute("INSERT INTO documents(id, filename, created, previous_id) VALUES (?, ?, ?, ?)",
-                       (document_id, filename, now(), previous_id))
+            db.execute("INSERT INTO documents(id, filename, created, previous_id, owner) VALUES (?, ?, ?, ?, ?)",
+                       (document_id, filename, now(), previous_id, owner))
             source.parent.mkdir()
             try:
                 with source.open("xb") as output:
@@ -92,15 +97,26 @@ class Workspace:
         self._submit(document_id, job)
         return document_id
 
-    def documents(self) -> list[dict]:
+    def owns(self, document_id: str, owner: str | None) -> bool:
         with self.db() as db:
+            return db.execute("SELECT 1 FROM documents WHERE id=? AND owner=?", (document_id, owner)).fetchone() is not None
+
+    def owns_batch(self, owner: str | None) -> bool:
+        with self.db() as db:
+            return db.execute("SELECT 1 FROM local_profile WHERE id=1 AND batch_owner=?", (owner,)).fetchone() is not None
+
+    def documents(self, owner: str) -> list[dict]:
+        with self.db() as db:
+            # Workspaces created before browser ownership were local to one user.
+            db.execute("UPDATE local_profile SET batch_owner=? WHERE id=1 AND batch_owner IS NULL", (owner,))
+            db.execute("UPDATE documents SET owner=? WHERE owner IS NULL", (owner,))
             return [dict(row) for row in db.execute("""
                 SELECT d.id, d.filename, d.created, d.previous_id, d.approved,
                        j.status, j.done, j.total
                 FROM documents d JOIN jobs j ON j.id =
                     (SELECT MAX(id) FROM jobs WHERE document_id=d.id)
-                ORDER BY d.created DESC
-            """)]
+                WHERE d.owner=? ORDER BY d.created DESC
+            """, (owner,))]
 
     def get(self, document_id: str) -> dict | None:
         with self.db() as db:
@@ -123,7 +139,9 @@ class Workspace:
                 if stage_data:
                     state["processing"] = json.loads(stage_data)
                 public_jobs.append(state)
-            return {**dict(row), "jobs": public_jobs, "review": dict(review) if review else None}
+            document = dict(row)
+            document.pop("owner")
+            return {**document, "jobs": public_jobs, "review": dict(review) if review else None}
 
     def enqueue(self, document_id: str) -> bool:
         with self.db() as db:
@@ -214,7 +232,7 @@ class Workspace:
             if title is not None:
                 if title.text != row["title"]:
                     title.source = "reviewed"
-                title.text, title.spans = row["title"], []
+                    title.text, title.spans = row["title"], []
             elif row["title"]:
                 ir.pages[0].blocks.insert(0, Block(tag="h1", kind="title", text=row["title"], source="reviewed"))
         return ir, Settings(**json.loads(row["settings"])), json.loads(row["result"])

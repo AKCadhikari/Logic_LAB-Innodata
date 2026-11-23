@@ -28,6 +28,16 @@ def open_deck(source: Path):
     return Presentation(source)
 
 
+def validate_deck(path: Path, expected_slides: int) -> int:
+    with ZipFile(path) as archive:
+        if archive.testzip():
+            raise ValueError("The updated presentation contains a corrupt package part.")
+    slides = len(open_deck(path).slides)
+    if slides != expected_slides or slides < 1:
+        raise ValueError("The updated presentation has an invalid slide count.")
+    return slides
+
+
 def write_deck(source: Path, target: Path, edits: dict[str, list[RunEdit]], slide_count: int) -> None:
     if source.resolve() == target.resolve() or (target.exists() and target.samefile(source)):
         raise ValueError("Choose an output path different from the original presentation.")
@@ -51,7 +61,5 @@ def write_deck(source: Path, target: Path, edits: dict[str, list[RunEdit]], slid
                         node.text = edit.new
                     data = etree.tostring(slide, encoding="UTF-8", xml_declaration=True)
                 output.writestr(entry, data)
-        with ZipFile(staged) as output:
-            if output.testzip() or len(Presentation(staged).slides) != slide_count:
-                raise ValueError("The updated presentation failed validation.")
+        validate_deck(staged, slide_count)
         staged.replace(target)

@@ -105,10 +105,12 @@ function side(){
   bd.innerHTML=`<pre class="xml">`+esc(S.xml).replace(/(&lt;\/?)([\w:-]+)/g,'$1<span class="t">$2</span>').replace(/ ([\w:-]+)=(&quot;.*?&quot;)/g,' <span class="a">$1</span>=<span class="v">$2</span>')+`</pre>`;return}
  if(S.stab==="deck"){const cs=S.changes.filter(c=>S.cfilter==="all"||c.action===S.cfilter);
   sb.innerHTML=`<select id="cf" style="min-width:0">${["all","applied","review"].map(v=>`<option ${S.cfilter===v?"selected":""} value="${v}">${v}</option>`).join("")}</select><span style="color:var(--mute)">${cs.length} of ${S.changes.length} changes</span><span style="margin-left:auto"><a class="btn" href="/api/doc/${encodeURIComponent(d.id)}/deck">Deck</a></span>`;
-  bd.innerHTML=cs.length?cs.slice(0,400).map(c=>`<div class="card"><div class="h"><b>Slide ${c.original_location.slide}</b><span>${esc(c.change_type.replace(/_/g," "))}</span>${badge(c.confidence*100)}<span style="margin-left:auto">${c.action}</span></div>
+  const fileBase="/api/doc/"+encodeURIComponent(d.id);
+  const outputs=d.outputs?exportCard(d,{xml:fileBase+"/xml?download=1",pptx:fileBase+"/deck"}):"";
+  bd.innerHTML=outputs+(cs.length?cs.slice(0,400).map(c=>`<div class="card"><div class="h"><b>Slide ${c.original_location.slide}</b><span>${esc(c.change_type.replace(/_/g," "))}</span>${badge(c.confidence*100)}<span style="margin-left:auto">${c.action}</span></div>
    ${c.old_content||c.new_content?`<div>${c.old_content?`<span class="del">${esc(c.old_content.slice(0,160))}</span>`:""} ${c.new_content?`<span class="ins">${esc(c.new_content.slice(0,200))}</span>`:""}</div>`:""}
    <div style="color:var(--mute);font-size:12px;margin-top:5px">${esc(c.reason)}</div>
-   <div class="acts"><button class="btn ${c.decision==="accepted"?"on":""}" data-r="${c.id}|accepted">Accept</button><button class="btn ${c.decision==="rejected"?"on":""}" data-r="${c.id}|rejected">Reject</button></div></div>`).join(""):`<div class="empty">No deck changes for this document.</div>`;
+   <div class="acts"><button class="btn ${c.decision==="accepted"?"on":""}" data-r="${c.id}|accepted">Accept</button><button class="btn ${c.decision==="rejected"?"on":""}" data-r="${c.id}|rejected">Reject</button></div></div>`).join(""):`<div class="empty">No deck changes for this document.</div>`);
   $("#cf").onchange=e=>{S.cfilter=e.target.value;side()};
   bd.querySelectorAll("[data-r]").forEach(b=>b.onclick=async()=>{const [id,dec]=b.dataset.r.split("|"),c=S.changes.find(x=>x.id===id);const nd=c.decision===dec?"":dec;await J("/api/review",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,decision:nd})});c.decision=nd;side()});return}
  // metadata

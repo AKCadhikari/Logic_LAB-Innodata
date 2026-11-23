@@ -4,19 +4,24 @@ from __future__ import annotations
 import io
 import json
 import re
+from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path, PureWindowsPath
-from uuid import uuid4
+from secrets import token_hex
+from tempfile import SpooledTemporaryFile, TemporaryDirectory
+from uuid import UUID, uuid4
 
-from flask import Blueprint, Response, current_app, jsonify, request, send_file
-from lxml.etree import XMLSyntaxError
+from flask import Blueprint, Response, current_app, g, jsonify, request, send_file
 from werkzeug.exceptions import HTTPException
 
 from comparison.differ import compare_ir
 from layout.model import DocIR
+from reporting.exports import output_stem, publish_document, write_zip
 from ui.workspace import Workspace, now
 from utils.textutil import xml_safe
 
 api = Blueprint("workspace", __name__, url_prefix="/api")
+SESS_COOKIE = "docusync_workspace"
 
 
 def workspace() -> Workspace:
@@ -27,12 +32,36 @@ def fail(message: str, status: int):
     return jsonify(error=message), status
 
 
+def browser_owner(*, create: bool = False) -> str | None:
+    token = g.get("workspace_token") or request.cookies.get(SESS_COOKIE, "")
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
+        if not create:
+            return None
+        token = g.workspace_token = token_hex(32)
+    return sha256(token.encode()).hexdigest()
+
+
+@api.before_request
+def authorize_document():
+    document_id = (request.view_args or {}).get("document_id")
+    if document_id is not None and not workspace().owns(document_id, browser_owner()):
+        return fail("Document not found.", 404)
+
+
+@api.after_request
+def set_browser_cookie(response):
+    if token := g.get("workspace_token"):
+        response.set_cookie(SESS_COOKIE, token, httponly=True, samesite="Strict", max_age=365 * 24 * 3600)
+    response.cache_control.no_store = True
+    return response
+
+
 @api.errorhandler(HTTPException)
 def http_error(error: HTTPException):
     return fail(error.description, error.code)
 
 
-def upload_file(field: str, extension: str, magic: bytes):
+def upload_file(field: str, extension: str, magic: bytes | None = None):
     files = request.files.getlist(field)
     if len(files) != 1 or sum(len(values) for _, values in request.files.lists()) != 1:
         return None, "Select exactly one file."
@@ -41,7 +70,7 @@ def upload_file(field: str, extension: str, magic: bytes):
     if (Path(filename).suffix.lower() != extension or len(filename) > 255
             or any(ord(char) < 32 for char in filename)):
         return None, f"Select a valid {extension} file."
-    if file.stream.read(len(magic)) != magic:
+    if magic is not None and file.stream.read(len(magic)) != magic:
         return None, f"The file does not have a valid {extension} header."
     file.stream.seek(0)
     return (filename, file.stream), None
@@ -65,7 +94,7 @@ def health():
 
 @api.get("/documents")
 def documents():
-    return jsonify(workspace().documents())
+    return jsonify(workspace().documents(browser_owner(create=True)))
 
 
 @api.route("/profile", methods=["GET", "PATCH"])
@@ -87,10 +116,10 @@ def create_document():
         return fail(error, 400)
     ws = workspace()
     previous = request.form.get("previous_id") or None
-    if previous and workspace().get(previous) is None:
+    if previous and not ws.owns(previous, browser_owner()):
         return fail("The previous document version does not exist.", 400)
     filename, stream = uploaded
-    document_id = ws.upload(filename, stream, previous)
+    document_id = ws.upload(filename, stream, previous, browser_owner(create=True))
     return jsonify(ws.get(document_id)), 202
 
 
@@ -203,11 +232,13 @@ def xml(document_id: str):
     return Response(data, mimetype="text/plain; charset=utf-8")
 
 
-def version_changes(document_id: str, previous_id: str, current=None) -> list[dict] | None:
+def version_changes(document_id: str, previous_id: str, current=None, previous=None) -> list[dict] | None:
     from xml_engine.serializer import to_xml
 
     ws = workspace()
-    old, new = ws.extracted(previous_id), current or ws.extracted(document_id)
+    if not ws.owns(previous_id, browser_owner()):
+        return None
+    old, new = previous or ws.extracted(previous_id), current or ws.extracted(document_id)
     if not old or not new or previous_id == document_id:
         return None
     ir, settings, _ = new
@@ -246,90 +277,138 @@ def run_assessment(changes, settings, audit_path):
     return changes, annotate(changes, settings, AuditLog(audit_path))
 
 
+def export_root(document_id: str) -> Path:
+    ws = workspace()
+    return ws.output / output_stem(ws.get(document_id)["filename"])
+
+
 @api.post("/documents/<document_id>/presentations")
 def sync_deck(document_id: str):
-    from zipfile import BadZipFile
     from powerpoint.amend import repair_presentation
     from powerpoint.sync import synchronize
-    from xml_engine.serializer import to_xml
 
+    ws = workspace()
     previous_id = request.form.get("previous_id") or None
     mode = request.form.get("mode", "version")
-    ws = workspace()
-    if mode == "source":
-        extracted = ws.extracted(document_id, reviewed=False)
-        if extracted is None:
-            return fail("Process the source PDF before repairing a presentation.", 409)
-    elif mode == "version":
-        extracted = ws.extracted(document_id)
-        if not extracted:
-            return fail("Process the current PDF before synchronizing a presentation.", 409)
-        changes = version_changes(document_id, previous_id or "", extracted)
-        if changes is None:
-            return fail("Choose two different processed documents.", 409)
-    else:
+    if mode not in {"source", "version"}:
         return fail("Choose source repair or version synchronization.", 400)
-    uploaded, error = upload_file("pptx", ".pptx", b"PK")
+    info = ws.get(document_id)
+    extracted = ws.extracted(document_id)
+    if not extracted or info["jobs"][0]["status"] != "completed":
+        return fail("Finish processing the PDF before exporting.", 409)
+    ir, settings, extraction = extracted
+    settings = replace(settings, schema_profile="sample")
+    previous = None
+    if mode == "version":
+        if previous_id and previous_id != document_id and ws.owns(previous_id, browser_owner()):
+            previous = ws.extracted(previous_id)
+        if previous is None:
+            return fail("Choose two different processed documents.", 409)
+    uploaded, error = upload_file("pptx", ".pptx")
     if error:
         return fail(error, 400)
     filename, stream = uploaded
     export_id = uuid4()
-    target = ws.source(document_id).parent / "presentations" / export_id.hex
-    target.mkdir(parents=True)
-    source, output = target / "source.pptx", target / "output.pptx"
+    stem = output_stem(info["filename"])
+
+    def transform(output: Path) -> dict:
+        with TemporaryDirectory(prefix="presentation-", dir=ws.source(document_id).parent) as temp:
+            source = Path(temp) / "source.pptx"
+            with source.open("xb") as file:
+                while chunk := stream.read(1024 * 1024):
+                    file.write(chunk)
+            if mode == "source":
+                return ws.worker.submit(repair_presentation, ir, source, output, settings).result()
+            changes = version_changes(document_id, previous_id, (ir, settings, extraction), previous)
+            reviewed, analysis = assess_changes(document_id, changes)
+            return {**synchronize(source, output, reviewed), "analysis": analysis}
+
     try:
-        with source.open("xb") as file:
-            while chunk := stream.read(1024 * 1024):
-                file.write(chunk)
-        ir, settings, _ = extracted
-        if mode == "source":
-            report = ws.worker.submit(repair_presentation, ir, source, output, settings).result()
-            report.pop("records")
-        else:
-            changes, analysis = assess_changes(document_id, changes)
-            report = synchronize(source, output, changes)
-            report["analysis"] = analysis
-        (target / "evidence.xml").write_bytes(to_xml(ir, settings))
-    except (BadZipFile, KeyError, ValueError, XMLSyntaxError):
-        return fail("The presentation could not be read or validated.", 422)
-    summary = {"id": str(export_id), "filename": filename, "previous_id": previous_id, "mode": mode,
-               "created": now(), **report}
-    pending = target / "report.tmp"
-    pending.write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
-    pending.replace(target / "report.json")
-    return jsonify(summary), 201
+        summary = publish_document(ws.output / stem / export_id.hex, stem, ir, settings, extraction,
+                                   {"id": str(export_id), "document_id": document_id, "filename": filename,
+                                    "previous_id": previous_id, "mode": mode, "created": now()}, transform)
+    except OSError:
+        current_app.logger.exception("Could not finalize the export report")
+        return fail("The output folder could not be written. Check its location and available space.", 500)
+    return jsonify(summary), 201 if summary["status"] == "completed" else 422
 
 
 @api.get("/documents/<document_id>/presentations")
 def presentations(document_id: str):
-    ws = workspace()
-    if ws.get(document_id) is None:
-        return fail("Document not found.", 404)
-    root = ws.source(document_id).parent / "presentations"
-    reports = [json.loads(path.read_text(encoding="utf-8")) for path in root.glob("*/report.json")]
+    reports = []
+    for path in export_root(document_id).glob("*/processing_report.json"):
+        report = json.loads(path.read_text(encoding="utf-8"))
+        if report.get("document_id") == document_id:
+            report.pop("metadata", None)
+            reports.append(available_outputs(path.parent, report))
+    legacy = workspace().source(document_id).parent / "presentations"
+    reports.extend(json.loads(path.read_text(encoding="utf-8")) for path in legacy.glob("*/report.json"))
     return jsonify(sorted(reports, key=lambda report: report["created"], reverse=True))
 
 
+def export_file(folder: Path, relative: str) -> Path | None:
+    file = (folder / relative).resolve()
+    return file if file.is_relative_to(folder.resolve()) and file.is_file() else None
+
+
+def available_outputs(folder: Path, report: dict) -> dict:
+    missing = False
+    for kind, item in report["outputs"].items():
+        if item and not export_file(folder, item["filename"]):
+            report["outputs"][kind] = None
+            missing = True
+    if missing:
+        report["status"] = "partial" if report["outputs"]["xml"] else "failed"
+        report["error"] = "An exported file is missing from the output folder."
+    return report
+
+
+def bundle(document_id: str, export_id: UUID):
+    folder = export_root(document_id) / export_id.hex
+    manifest = folder / "processing_report.json"
+    if manifest.is_file():
+        report = json.loads(manifest.read_text(encoding="utf-8"))
+        if report.get("document_id") == document_id and report.get("id") == str(export_id):
+            return folder, available_outputs(folder, report)
+    return None
+
+
 @api.get("/documents/<document_id>/presentations/<uuid:export_id>")
-def download_deck(document_id: str, export_id):
-    ws = workspace()
-    if ws.get(document_id) is None:
-        return fail("Document not found.", 404)
-    target = ws.source(document_id).parent / "presentations" / export_id.hex
-    report_file = target / "report.json"
-    if not report_file.is_file():
-        return fail("Presentation export not found.", 404)
-    name = Path(json.loads(report_file.read_text(encoding="utf-8"))["filename"]).stem
-    return send_file(target / "output.pptx", as_attachment=True, download_name=f"{name}_updated.pptx")
-
-
+@api.get("/documents/<document_id>/presentations/<uuid:export_id>/xml")
 @api.get("/documents/<document_id>/presentations/<uuid:export_id>/evidence.xml")
-def presentation_evidence(document_id: str, export_id):
-    ws = workspace()
-    if ws.get(document_id) is None:
-        return fail("Document not found.", 404)
-    target = ws.source(document_id).parent / "presentations" / export_id.hex
-    evidence = target / "evidence.xml"
-    if not (target / "report.json").is_file() or not evidence.is_file():
-        return fail("Presentation evidence not found.", 404)
-    return send_file(evidence, as_attachment=True, download_name="source-evidence.xml")
+def download_export(document_id: str, export_id: UUID):
+    kind = "xml" if request.path.endswith(("/xml", "/evidence.xml")) else "pptx"
+    if found := bundle(document_id, export_id):
+        folder, report = found
+        item = report["outputs"].get(kind)
+        if item and item["valid"] and (file := export_file(folder, item["filename"])):
+            return send_file(file, as_attachment=True, download_name=item["filename"])
+    else:
+        legacy = workspace().source(document_id).parent / "presentations" / export_id.hex
+        report_file = legacy / "report.json"
+        file = legacy / ("evidence.xml" if kind == "xml" else "output.pptx")
+        if report_file.is_file() and file.is_file():
+            name = output_stem(json.loads(report_file.read_text(encoding="utf-8"))["filename"])
+            return send_file(file, as_attachment=True, download_name="source-evidence.xml" if kind == "xml"
+                             else f"{name}_updated.pptx")
+    return fail("Requested export file not found.", 404)
+
+
+@api.get("/documents/<document_id>/presentations/<uuid:export_id>/zip")
+def download_bundle(document_id: str, export_id: UUID):
+    found = bundle(document_id, export_id)
+    if not found or found[1]["status"] != "completed":
+        return fail("A complete export is required to download the ZIP.", 404)
+    folder, report = found
+    files = [report["outputs"][kind]["filename"] for kind in ("xml", "pptx")] + report["xml_assets"]
+    if not all(export_file(folder, name) for name in files):
+        return fail("An export file is missing.", 404)
+    archive = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    try:
+        write_zip(archive, folder, files)
+        archive.seek(0)
+        return send_file(archive, mimetype="application/zip", as_attachment=True,
+                         download_name=f"{folder.parent.name}.zip")
+    except BaseException:
+        archive.close()
+        raise

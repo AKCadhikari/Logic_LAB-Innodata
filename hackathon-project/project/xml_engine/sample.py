@@ -45,7 +45,8 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
 
     root = etree.Element("document", lang=lang_attr(doc.lang, "name"), reading_order_layout_source="corrected")
     header = etree.SubElement(root, "header")
-    title = next((block.text for page in doc.pages for block in page.blocks if block.kind == "title"), "")
+    title = next((block.text for page in doc.pages for block in page.blocks if block.kind == "title"),
+                 doc.meta.get("pdf_metadata", {}).get("title", ""))
     if title:
         etree.SubElement(header, "title").text = xml_safe(title)
     body = etree.SubElement(root, "body")
@@ -145,10 +146,13 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                 figure = etree.SubElement(target, "figure_wrap", kind=figure_kind)
                 image_id = identifier(f"P{page.n}_{'FORMULA' if formula else 'IMG'}")
                 source = f"output_images/{name}/{name}_{image_id}.png"
-                attributes = {"src": source, "id": image_id, "page": str(page.n),
-                              "kind": figure_kind, **geometry(block.bbox)}
+                attributes = {"id": image_id, "page": str(page.n), "kind": figure_kind, **geometry(block.bbox)}
+                if block.bbox:
+                    attributes["src"] = source
                 if formula:
                     attributes["type"] = "formula"
+                if block.text or block.alt:
+                    attributes["alt"] = xml_safe(block.text or block.alt)
                 etree.SubElement(figure, "img", **attributes)
                 if assets is not None and block.bbox:
                     assets[source] = (page.n, block.bbox)
@@ -201,6 +205,7 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                 nodes[id(block)] = listing
             elif tag == "table":
                 _emit(target, block, {}, doc.lang, settings, nodes)
+                nodes[id(block)].set("page", str(page.n))
             else:
                 prefixes = {"p": "P", "page_header": "PH", "page_footer": "PF", "reference": "R"}
                 attrs = text_attributes(block, page, prefixes.get(tag, "H" if tag[0] == "h" else tag.upper()), kind)

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import io
+import json
 import time
+from pathlib import Path
+from zipfile import ZipFile
 
 import pymupdf
 import pytest
 from lxml import etree
 from pptx import Presentation
 
-from ui.server import app, configure_workspace
+from ui.server import CFG, app, configure_workspace
 
 
 @pytest.fixture(scope="module")
@@ -16,8 +19,11 @@ def workspace(tmp_path_factory):
     root = tmp_path_factory.mktemp("workspace")
     configure_workspace(root)
     app.extensions["workspace"].settings.ollama_enabled = False
+    app.extensions["workspace"].settings.docling_enabled = False
     app.config["TESTING"] = True
-    with app.test_client() as client:
+    with pytest.MonkeyPatch.context() as patch, app.test_client() as client:
+        for key in ("run", "input", "output"):
+            patch.setitem(CFG, key, root / key)
         yield client, root
     app.extensions["workspace"].worker.shutdown()
 
@@ -51,6 +57,8 @@ def wait_for_attempt(client, url):
 
 def test_upload_review_export_compare_and_sync(workspace):
     client, root = workspace
+    assert client.get("/api/documents").status_code == 200
+    assert client.get("/api/summary").status_code == 200
     before = "The report records an audited total of 240 units."
     after = "The report records an audited total of 260 units."
     old_data = pdf_with_text(before)
@@ -103,14 +111,42 @@ def test_upload_review_export_compare_and_sync(workspace):
         "previous_id": old_doc["id"], "pptx": (contents, "summary.pptx")
     })
     assert response.status_code == 201, response.data
-    assert len(response.json["applied"]) == 1
-    exported = client.get(new + "/presentations/" + response.json["id"])
+    report = response.json
+    assert report["status"] == "completed" and len(report["applied"]) == 1
+    files = report["outputs"]
+    folder = Path(report["output_folder"])
+    assert folder.parent.name == "report"
+    for kind, filename in (("xml", "report.xml"), ("pptx", "report_updated.pptx")):
+        item = files[kind]
+        path = folder / filename
+        assert item == {"filename": filename, "path": str(path), "valid": True, "size_bytes": path.stat().st_size}
+    for name in ("processing_report", "validation_report", "ocr_report"):
+        assert json.loads((folder / f"{name}.json").read_text(encoding="utf-8"))
+    url = new + "/presentations/" + report["id"]
+    xml = client.get(url + "/xml")
+    assert xml.data == (folder / "report.xml").read_bytes()
+    assert "report.xml" in xml.headers["Content-Disposition"]
+    exported_xml = etree.fromstring(xml.data)
+    assert exported_xml.findtext("header/title") == "Reviewed title"
+    assert exported_xml.find(".//page").get("num") == "1"
+    assert exported_xml.get("lang") == "german"
+    exported = client.get(url)
     assert exported.status_code == 200
     final = Presentation(io.BytesIO(exported.data))
     assert final.slides[0].shapes[0].text == after
     assert final.slides[0].shapes[0].text_frame.paragraphs[0].runs[0].font.bold
     assert final.slides[1].shapes[0].text == "Keep this slide"
-    assert client.get(new + "/presentations").json[0]["id"] == response.json["id"]
+    assert "report_updated.pptx" in exported.headers["Content-Disposition"]
+    with ZipFile(io.BytesIO(client.get(url + "/zip").data)) as archive:
+        assert archive.read("report.xml") == xml.data
+        assert archive.read("report_updated.pptx") == exported.data
+    assert client.get(new + "/presentations").json[0]["outputs"] == files
+    assert client.get(old + "/presentations/" + report["id"] + "/xml").status_code == 404
+    other = app.test_client()
+    assert other.get("/api/documents").json == []
+    assert other.get("/api/summary").status_code == 404
+    for suffix in ("", "/xml", "/zip"):
+        assert other.get(url + suffix).status_code == 404
 
     repair = io.BytesIO()
     deck.save(repair)
@@ -118,11 +154,49 @@ def test_upload_review_export_compare_and_sync(workspace):
     response = client.post(new + "/presentations", data={"mode": "source", "pptx": (repair, "summary.pptx")})
     assert response.status_code == 201, response.data
     result = response.json
-    assert result["mode"] == "source" and result["status"] == "updated"
+    assert result["mode"] == "source" and result["status"] == "completed" and result["presentation_status"] == "updated"
+    assert result["output_folder"] != report["output_folder"]
     assert len(result["applied"]) == 1 and result["applied"][0]["source"]["page"] == 1
     evidence = client.get(f'{new}/presentations/{result["id"]}/evidence.xml')
     corrected = etree.fromstring(evidence.data).xpath(result["applied"][0]["source"]["xml_node"])[0]
     assert "".join(corrected.itertext()) == after
+    assert client.post(new + "/retry").status_code == 202
+    assert wait_for_attempt(client, new)["jobs"][0]["status"] == "completed"
+    assert client.get(url).data == exported.data
+    assert client.get(url + "/xml").data == xml.data
+
+
+def test_invalid_deck_preserves_verified_xml(workspace):
+    client, _ = workspace
+    url = upload(client, pdf_with_text("The extraction supplies verified document evidence."), "actual.pdf")
+    assert wait_for_attempt(client, url)["jobs"][0]["status"] == "completed"
+    result = client.post(url + "/presentations", data={"mode": "source", "pptx": (io.BytesIO(b"bad archive"), "bad.pptx")})
+    assert result.status_code == 422
+    report = result.json
+    assert report["status"] == "partial" and report["outputs"]["pptx"] is None
+    xml = Path(report["outputs"]["xml"]["path"])
+    assert xml.name == "actual.xml" and xml.is_file()
+    saved = json.loads((xml.parent / "validation_report.json").read_text(encoding="utf-8"))
+    assert saved["xml"]["valid"] and not saved["pptx"]["valid"]
+    download = url + "/presentations/" + report["id"]
+    assert client.get(download + "/xml").data == xml.read_bytes()
+    assert client.get(download).status_code == client.get(download + "/zip").status_code == 404
+
+
+def test_invalid_xml_stops_powerpoint_export(workspace, monkeypatch):
+    from reporting import exports
+    from powerpoint import amend
+
+    client, _ = workspace
+    url = upload(client, pdf_with_text("Invalid export XML is never published."), "invalid.xml.pdf")
+    assert wait_for_attempt(client, url)["jobs"][0]["status"] == "completed"
+    monkeypatch.setattr(exports, "to_xml", lambda *args, **kwargs: b"<invalid")
+    monkeypatch.setattr(amend, "repair_presentation", lambda *args: pytest.fail("Deck work must wait for valid XML."))
+    response = client.post(url + "/presentations", data={"mode": "source", "pptx": (io.BytesIO(b"PK"), "deck.pptx")})
+    assert response.status_code == 422 and response.json["status"] == "failed"
+    assert response.json["outputs"] == {"xml": None, "pptx": None}
+    folder = Path(response.json["output_folder"])
+    assert not list(folder.glob("*.xml")) and not list(folder.glob("*.pptx"))
 
 
 def test_reject_invalid_upload_and_retry_corrupt_pdf(workspace):

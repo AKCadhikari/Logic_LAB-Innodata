@@ -33,7 +33,9 @@ async function workspaceFetch(url, options, asText = false) {
     const response = await fetch(url, options);
     if (!response.ok) {
         const body = await response.json().catch(() => ({}));
-        throw new Error(body.error || "Request failed (" + response.status + ").");
+        const error = new Error(body.error || "Request failed (" + response.status + ").");
+        if (body.outputs) error.exportReport = body;
+        throw error;
     }
     return asText ? response.text() : response.json();
 }
@@ -95,7 +97,7 @@ async function selectWorkspace(id, reset = true) {
     if (listed) listed.status = job.status;
     const active = job.status === "queued" || job.status === "running";
     const reviewPages = data.pages?.filter(page => page.requires_review).length || 0;
-    statusText((active && processingStatus(job.processing) || job.status) +
+    statusText((active && processingStatus(job.processing) || (job.status === "completed" ? "PDF processed" : job.status)) +
         (job.total ? " · " + job.done + "/" + job.total + " pages" : "") +
         (reviewPages && !active ? " · " + reviewPages + " for review" : ""));
     $("#reproc").disabled = active;
@@ -266,6 +268,32 @@ async function reviewPanel() {
     };
 }
 
+function exportCard(report, links) {
+    const statuses = {
+        completed: "XML and PowerPoint export complete",
+        partial: "XML available · PowerPoint failed",
+        failed: "Export failed",
+        xml_only: "XML-only export",
+    };
+    return '<article class="card export-card"><strong>' + esc(statuses[report.status] || report.status) + '</strong>' +
+        '<div class="export-location">' + esc(report.output_folder || "") + '</div>' +
+        [["xml", "XML"], ["pptx", "PowerPoint"]].map(([kind, label]) => {
+            const file = report.outputs[kind];
+            if (!file) return '<div>' + label + ' · unavailable</div>';
+            return '<div class="export-location">' + esc(file.filename) + ' · ' + (file.valid ? "Validated" : "Invalid") +
+                ' · ' + file.size_bytes.toLocaleString() + ' bytes</div>' +
+                '<a class="workspace-link" href="' + links[kind] + '">Download ' + label + '</a>';
+        }).join("") +
+        (report.status === "completed" && links.zip ? '<div><a class="workspace-link" href="' +
+            links.zip + '">Download both as ZIP</a></div>' : '') +
+        (report.error ? '<div class="notice">' + esc(report.error) + '</div>' : '') + '</article>';
+}
+
+function presentationLinks(base, id) {
+    const url = base + "/" + encodeURIComponent(id);
+    return {xml: url + "/xml", pptx: url, zip: url + "/zip"};
+}
+
 function changesPanel(data) {
     const alternatives = W.documents.filter(doc => doc.id !== data.id && doc.status === "completed");
     W.previous ||= data.previous_id || alternatives[0]?.id || "";
@@ -277,8 +305,8 @@ function changesPanel(data) {
         '<button id="compare" class="btn pri">Compare versions</button>' +
         '<form id="deck-upload" class="workspace-tools"><label for="deck-file">Related PowerPoint</label>' +
         '<input id="deck-file" type="file" accept=".pptx" required>' +
-        '<button class="btn" value="source">Repair against source PDF</button>' +
-        '<button class="btn" value="version">Apply version changes</button></form></div>' +
+        '<button class="btn" value="source">Repair and export XML + PowerPoint</button>' +
+        '<button class="btn" value="version">Apply version changes and export</button></form></div>' +
         '<div id="comparison-results"></div><div id="presentation-history"></div>';
     $("#previous").value = W.previous;
     const changeList = changes => changes.length ? changes.map(change =>
@@ -295,13 +323,14 @@ function changesPanel(data) {
         '</article>').join("") : '<p>No changes detected.</p>';
     if (W.changes) $("#comparison-results").innerHTML =
         analysisStatus(W.changes.analysis) + changeList(W.changes.changes);
-    const renderExports = async () => {
+    const renderExports = async (displayedId = null) => {
         const url = docUrl() + "/presentations";
-        const reports = await workspaceFetch(url);
+        const reports = (await workspaceFetch(url)).filter(report => report.id !== displayedId);
         const history = $("#presentation-history");
-        if (!history || S.data !== data || S.stab !== "deck" || W.batch || !reports.length) return;
-        history.innerHTML = '<div class="sec">Presentation exports</div>' + reports.map(report =>
-            '<div class="card"><a class="workspace-link" href="' + url + '/' + esc(report.id) + '">' +
+        if (!history || S.data !== data || S.stab !== "deck" || W.batch) return;
+        history.innerHTML = (reports.length ? '<div class="sec">Export history</div>' : '') + reports.map(report => report.outputs ?
+            exportCard(report, presentationLinks(url, report.id)) :
+            '<div class="card"><a class="workspace-link" href="' + presentationLinks(url, report.id).pptx + '">' +
             esc(report.filename) + '</a> · ' + report.applied.length + ' edits · ' +
             esc(new Date(report.created).toLocaleString()) + '</div>').join("");
     };
@@ -339,25 +368,32 @@ function changesPanel(data) {
         const button = event.submitter;
         form.append("mode", button.value);
         if (button.value === "version") form.append("previous_id", W.previous);
-        button.disabled = true;
-        if (button.value === "version") {
-            $("#comparison-results").innerHTML = '<p role="status">Checking version changes for PowerPoint…</p>';
-        }
+        const buttons = event.currentTarget.querySelectorAll("button");
+        buttons.forEach(item => { item.disabled = true; });
+        $("#comparison-results").innerHTML = '<p role="status">Generating and validating export files…</p>';
         try {
             const url = docUrl() + "/presentations";
-            const report = await workspaceFetch(url, {method: "POST", body: form});
+            const report = await workspaceFetch(url, {method: "POST", body: form}).catch(error => {
+                if (error.exportReport) return error.exportReport;
+                throw error;
+            });
             if (S.data !== data || S.stab !== "deck") return;
-            $("#comparison-results").innerHTML = analysisStatus(report.analysis) + '<p><a class="workspace-link" href="' + url + '/' +
-                esc(report.id) + '">Download validated presentation</a> · ' + report.applied.length +
-                ' edits · ' + report.review.length + ' changes for review</p>' +
-                '<p><a class="workspace-link" href="' + url + '/' + esc(report.id) +
-                    '/evidence.xml">Download source evidence XML</a></p>' +
+            $("#comparison-results").innerHTML = analysisStatus(report.analysis) +
+                exportCard(report, presentationLinks(url, report.id)) +
+                (report.status === "completed" ? '<p>' + report.applied.length + ' edits · ' +
+                    report.review.length + ' changes for review</p>' : '') +
                 report.applied.map(edit => '<div class="card"><b>Slide ' + edit.slide + '</b> · ' + esc(edit.shape) +
                     (edit.source ? '<div>PDF page ' + edit.source.page + ' · ' + esc(edit.source.xml_node) + '</div>' : '') +
-                    '<div>' + esc(edit.old) + '</div><div>' + esc(edit.new) + '</div></div>').join("") + changeList(report.review);
-            await renderExports();
+                    '<div>' + esc(edit.old) + '</div><div>' + esc(edit.new) + '</div></div>').join("") +
+                (report.status === "completed" ? changeList(report.review) : '');
+            await renderExports(report.id);
         } catch (error) { showError(error); }
-        finally { button.disabled = false; }
+        finally {
+            if (button.isConnected) {
+                buttons.forEach(item => { item.disabled = false; });
+                updateControls();
+            }
+        }
     };
 }
 

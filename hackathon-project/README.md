@@ -26,8 +26,10 @@ python project\main.py --input phase-1\input --output phase-1\output
 See [local OCR setup](docs/LOCAL_OCR.md) for PaddleOCR, Docling, Tesseract verification, and runtime controls.
 
 * **Input**: any folder containing `*.pdf` (and optionally `*.pptx`). Nothing is hard-coded to file names.
-* **Output** (`--output`): `<pdf name>.xml` for every PDF, and one corrected deck per PPTX
-  (`amendment<N>.pptx` -> `amendment_out<N>.pptx`; otherwise `<id>_transformed_QA.pptx`, the pattern used by the example data).
+* **Output** (`--output`): each export has its own `<pdf stem>/<export id>/` folder containing
+  `<pdf stem>.xml`, `<pdf stem>_updated.pptx`, and processing, OCR, and validation reports. The XML
+  uses the organizer sample profile and passes local structural validation. A failed or missing deck leaves the validated
+  XML and reports in place and produces a nonzero batch exit code.
 * **Run folder** (`<output>/../docsync_run`): audit log (`audit.jsonl`), manifest, per-document IR, change reports
   (`changes/*.json`), `run_report.json`, `report.html`, OCR cache. It is separate so the output folder stays clean.
 * Useful flags: `--workers N`, `--profile brief|sample|example`, `--no-ocr`, `--skip-pptx`, `--time-budget SECONDS`, `--config file.json`
@@ -44,7 +46,12 @@ and shows job progress, native-text diagnostics, OCR attempts, layout status, an
 Review a page in Source PDF, Text, Zoning or Reading Order, correct the title or language,
 then approve and export XML. Locate an extracted title in the PDF when the source region is available. Use Changes
 to compare two versions and apply matching text updates to an uploaded PowerPoint deck.
-Use **Repair against source PDF** in Changes to proofread a deck using the selected PDF and download evidence XML.
+Use **Repair and export XML + PowerPoint** in Changes to proofread a deck against the selected PDF,
+or **Apply version changes and export** to synchronize an existing deck. The result shows both file names,
+sizes, validation outcomes, and the output folder. Download either file separately or both with the
+XML's figure assets in a ZIP. The standalone approved XML download remains available in Document review.
+Uploads and export history are scoped to the browser's local workspace cookie. The first browser to open the
+workspace owns Batch review and adopts documents that predate browser ownership.
 The settings dialog shows local model availability and saves a reviewer name for attribution.
 
 Select **Batch review** to open the original dashboard. It uses the Phase 1 folders by default and accepts

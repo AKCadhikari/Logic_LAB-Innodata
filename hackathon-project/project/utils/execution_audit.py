@@ -106,6 +106,21 @@ def mark(ids, **values):
                 item.update(values)
 
 
+def private_prompt(item, payload):
+    state = current()
+    if not item or not state or not state["private"]:
+        return
+    folder = Path(state["private"])
+    name = item["execution_id"] + "-prompt.json"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        with (folder / name).open("xb") as file:
+            file.write(canonical(payload))
+        item["private_prompt_reference"] = name
+    except OSError:
+        item["private_prompt_error"] = "Could not retain optional prompt evidence."
+
+
 def since(start):
     state = current()
     return state["executions"][start:] if state else []

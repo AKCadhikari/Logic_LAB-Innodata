@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections import deque
 from dataclasses import replace
 from concurrent.futures import Future, ProcessPoolExecutor
 from contextlib import contextmanager
@@ -68,6 +69,10 @@ class Workspace:
                 );
                 CREATE TABLE IF NOT EXISTS ocr_preferences (
                     owner TEXT PRIMARY KEY, engine TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ocr_probes (
+                    owner TEXT NOT NULL, engine TEXT NOT NULL, result TEXT NOT NULL,
+                    PRIMARY KEY(owner, engine)
                 );
             """)
             if "owner" not in {row["name"] for row in db.execute("PRAGMA table_info(documents)")}:
@@ -156,7 +161,8 @@ class Workspace:
                 stage_data = state.pop("stage_json")
                 config = json.loads(state.pop("settings"))
                 state["ocr_selection"] = {key: config.get(key) for key in (
-                    "ocr_backend", "ocr_automatic_primary", "glm_ocr_model", "paddle_ocr_lang", "paddle_ocr_unknown_lang")}
+                    "ocr_backend", "ocr_automatic_primary", "ocr_automatic_secondary", "ocr_automatic_tertiary",
+                    "glm_ocr_model", "paddle_vl_model", "paddle_ocr_lang", "paddle_ocr_unknown_lang")}
                 if stage_data:
                     state["processing"] = json.loads(stage_data)
                 public_jobs.append(state)
@@ -219,14 +225,24 @@ class Workspace:
                                           (layout_from, document_id)).fetchone() if layout_from is not None else None)
             db.execute("UPDATE jobs SET status='running', started=? WHERE id=?", (now(), job))
         settings = Settings(**json.loads(settings_json))
+        history = deque(maxlen=30)
+        page_seconds = {}
 
         def progress(done: int, total: int) -> None:
             with connect(root) as db:
                 db.execute("UPDATE jobs SET done=?, total=? WHERE id=?", (done, total, job))
 
         def processing(stage: dict) -> None:
+            if stage.get("stage") == "extracted" and stage.get("elapsed_seconds") is not None:
+                page_seconds[stage["page"]] = {"seconds": stage["elapsed_seconds"],
+                                               "ocr": stage.get("ocr_required", False)}
+            history.append({**stage, "at": now()})
+            recent = list(history)
+            snapshot = {**stage, "history": recent, "page_seconds": list(page_seconds.values()),
+                        "last_ocr_attempt": next((item for item in reversed(recent)
+                                                  if item["stage"] == "ocr_attempt"), None)}
             with connect(root) as db:
-                db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(stage), job))
+                db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(snapshot), job))
 
         result = {}
         error = None

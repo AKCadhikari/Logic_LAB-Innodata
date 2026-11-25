@@ -14,6 +14,7 @@ from layout import native, reconstruct, kinds, figures, ocr_geometry
 from layout.docling_adapter import DoclingLayout
 from ocr import engine as ocr
 from ocr.router import OCRRouter
+from ocr.recognition import ENGINE_MODES
 from quality.qa import page_confidence, doc_quality
 from utils.cache import Cache, file_key
 from utils.logs import AuditLog
@@ -146,9 +147,11 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             if fast and decision == "compare":
                 decision = "native"; d["reasons"].append("fast mode: compare skipped")
                 d["ocr"] = {"engine": None, "status": "skipped", "requires_review": True}
-            if decision != "native" and settings.ocr_enabled and settings.ocr_backend in {"automatic", "glm-ocr", "paddleocr"}:
+            if decision != "native" and settings.ocr_enabled and settings.ocr_backend in ENGINE_MODES:
+                model_names = {"glm-ocr": settings.glm_ocr_model, "paddleocr-vl": settings.paddle_vl_model}
                 result, info = router.recognise(page, page_language, dpi, d,
-                                               lambda engine: stage("ocr", page=i + 1, engine=engine))
+                                               lambda engine: stage("ocr", page=i + 1, engine=engine, model=model_names.get(engine)),
+                                               event=lambda attempt: stage("ocr_attempt", page=i + 1, **attempt))
                 d["ocr"] = info
                 if result and decision == "compare":
                     native_text = page.get_text()
@@ -247,8 +250,9 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
         raw.append(rec)
         d["selected_ocr_engine"] = settings.ocr_backend
         ocr_info = d.get("ocr", {})
-        for engine, key in (("glm-ocr", "glm_ocr"), ("paddleocr", "paddle_ocr")):
-            counts[key] += ocr_info.get("engine") == engine and ocr_info.get("status") == "accepted"
+        for engine, key in (("glm-ocr", "glm_ocr"), ("paddleocr", "paddle_ocr"), ("paddleocr-vl", "paddle_vl")):
+            if ocr_info.get("engine") == engine and ocr_info.get("status") == "accepted":
+                counts[key] = counts.get(key, 0) + 1
         counts["failed"] += bool(d.get("ocr_required") and
                                  (d.get("error") or ocr_info.get("status") == "review_required"))
         counts["review"] += bool(ocr_info.get("requires_review") or d.get("error"))
@@ -259,7 +263,8 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                                 "ocr": ocr_info, "seconds": round(time.time() - tp, 2), "unread_scan": unread_scan})
         if progress:
             progress(i + 1, n)
-        stage("extracted", page=i + 1)
+        stage("extracted", page=i + 1, elapsed_seconds=round(time.time() - tp, 3),
+              ocr_required=bool(d.get("ocr_required")))
     metadata = {key: value for key, value in (doc.metadata or {}).items() if value}
     if router:
         router.close()

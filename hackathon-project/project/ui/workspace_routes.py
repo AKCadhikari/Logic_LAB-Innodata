@@ -161,20 +161,45 @@ def ocr_settings():
     if request.method == "PATCH":
         body = request.get_json(silent=True)
         if not isinstance(body, dict) or body.get("engine") not in ENGINE_MODES:
-            return fail("Choose Automatic, GLM-OCR or PaddleOCR.", 400)
+            return fail("Choose a supported OCR engine or Automatic.", 400)
         ws.set_ocr_preference(owner, body["engine"])
-    data = {"engine": ws.ocr_preference(owner), "automatic_primary": ws.settings.ocr_automatic_primary}
+    data = {"engine": ws.ocr_preference(owner), "automatic_primary": ws.settings.ocr_automatic_primary,
+            "automatic_secondary": ws.settings.ocr_automatic_secondary,
+            "automatic_tertiary": ws.settings.ocr_automatic_tertiary}
     if request.method == "PATCH" or request.args.get("detail") != "1":
         return jsonify(data)
     with ws.db() as db:
         jobs = db.execute("""SELECT j.result, j.finished FROM jobs j JOIN documents d ON d.id=j.document_id
                              WHERE d.owner=? AND j.finished IS NOT NULL AND j.result IS NOT NULL
                              ORDER BY j.finished DESC LIMIT 50""", (owner,)).fetchall()
+        probes = {row["engine"]: json.loads(row["result"]) for row in db.execute(
+            "SELECT engine, result FROM ocr_probes WHERE owner=?", (owner,))}
     results = [{**json.loads(row["result"]), "finished": row["finished"]} for row in jobs]
     runs = observed_runs(results)
     logs = current_app.extensions.get("startup_logs", ROOT / "logs")
-    return jsonify(**data, engines=health(ws.settings, runs), measurements=runs, jobs_sampled=len(jobs),
+    return jsonify(**data, engines=health(ws.settings, runs, probes), measurements=runs, jobs_sampled=len(jobs),
                    benchmark=read_json(logs / "ocr-comparison.json"))
+
+
+@api.post("/ocr-test")
+def test_ocr_engine():
+    from ocr.probe import test_engine
+    from ocr.recognition import OCR_ENGINES
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or body.get("engine") not in OCR_ENGINES:
+        return fail("Choose one OCR engine to test.", 400)
+    owner, ws = browser_owner(create=True), workspace()
+    engine = body["engine"]
+    try:
+        result = ws.worker.submit(test_engine, ws.settings, engine).result()
+    except (OSError, RuntimeError, ValueError):
+        current_app.logger.exception("The local OCR engine test could not be completed.")
+        return fail("The OCR test worker stopped. See the local application log.", 503)
+    with ws.db() as db:
+        db.execute("INSERT INTO ocr_probes VALUES (?, ?, ?) ON CONFLICT(owner,engine) DO UPDATE SET result=excluded.result",
+                   (owner, engine, json.dumps(result)))
+    return jsonify(result)
 
 
 def requested_ocr(engine, language):
@@ -182,7 +207,7 @@ def requested_ocr(engine, language):
     from ocr.recognition import ENGINE_MODES
 
     if engine is not None and engine not in ENGINE_MODES:
-        raise ValueError("Choose Automatic, GLM-OCR or PaddleOCR.")
+        raise ValueError("Choose a supported OCR engine or Automatic.")
     if language is not None and (not isinstance(language, str) or language not in {"", *LANGUAGES}):
         raise ValueError("Choose a supported PaddleOCR language.")
     return engine, language
@@ -245,7 +270,7 @@ def view(ir: DocIR) -> dict:
                            "n_items": len(block.children) or len(block.cells)})
             if block.kind == "title" and title is None:
                 title = {"value": block.text, "page": page.n, "bbox": block.bbox if aligned else None,
-                         "confidence": None if block.ocr_engine == "glm-ocr" else block.conf}
+                         "confidence": None if block.ocr_engine in {"glm-ocr", "paddleocr-vl"} else block.conf}
         diag = {key: page.diag[key] for key in ("health", "decision", "reasons", "ocr", "confidence", "rotation",
                                               "layout", "native_chars", "has_native_text", "short_native_text",
                                               "appears_scanned", "has_images", "ocr_required", "review_reasons",

@@ -15,7 +15,8 @@
   <select id="ocr-engine">
    <option value="automatic">Automatic</option>
    <option value="glm-ocr">GLM-OCR</option>
-   <option value="paddleocr">PaddleOCR</option>
+   <option value="paddleocr-vl">PaddleOCR-VL (Ollama)</option>
+   <option value="paddleocr">PaddleOCR (Python)</option>
   </select>
   <label class="ocr-remember"><input id="ocr-remember" type="checkbox" checked> Remember engine</label>
   <div id="ocr-paddle-row">
@@ -40,6 +41,7 @@
    <h2 id="preview-heading">Document preview</h2>
    <div class="chip" id="runchip" role="status"></div>
   </header>
+  <div id="ocr-timeline" class="legend" aria-live="polite" hidden></div>
   <div class="tabs" id="vtabs" role="group" aria-label="Preview mode">
    <button class="tab on" data-t="pdf" aria-pressed="true">Source PDF</button>
    <button class="tab" data-t="text" aria-pressed="false">Extracted text</button>

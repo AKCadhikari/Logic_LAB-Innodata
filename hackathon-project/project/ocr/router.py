@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Callable
 
 from config.settings import Settings
-from ocr import glm, paddle
+from ocr import glm, paddle, paddle_vl
 from ocr.quality import validate_recognition
-from ocr.recognition import ENGINE_MODES, Recognition, RecognitionError
+from ocr.recognition import ENGINE_MODES, OCR_ENGINES, Recognition, RecognitionError
 from utils.textutil import language_profile, norm_cmp
 from utils import execution_audit as audit
 
@@ -20,25 +20,33 @@ class OCRRouter:
         self.settings = settings
         self.evidence = evidence
         self.paddle = paddle.PaddleOCR(settings)
-        self.glm_status = None
-        mode, primary = settings.ocr_backend, settings.ocr_automatic_primary
-        if mode not in ENGINE_MODES or (mode == "automatic" and primary not in ENGINE_MODES[1:]):
-            raise ValueError("Invalid OCR engine selection or automatic primary engine.")
-        self.engines = (primary, next(engine for engine in ENGINE_MODES[1:] if engine != primary)) if mode == "automatic" else (mode,)
+        self.model_status = {}
+        mode = settings.ocr_backend
+        order = (settings.ocr_automatic_primary, settings.ocr_automatic_secondary, settings.ocr_automatic_tertiary)
+        if mode not in ENGINE_MODES or (mode == "automatic" and (
+                any(engine not in OCR_ENGINES for engine in order[:2]) or (order[2] and order[2] not in OCR_ENGINES))):
+            raise ValueError("Invalid OCR engine selection or Automatic fallback configuration.")
+        self.engines = tuple(dict.fromkeys(filter(None, order))) if mode == "automatic" else (mode,)
+        self.ollama_engines = {"glm-ocr": glm, paddle_vl.ENGINE: paddle_vl}
+        self.models = {"glm-ocr": settings.glm_ocr_model, paddle_vl.ENGINE: settings.paddle_vl_model}
 
     def recognise(self, page, language: str, dpi: int, diag: dict,
-                  status: Callable[[str], None]) -> tuple[Recognition | None, dict]:
+                  status: Callable[[str], None], *, event: Callable[[dict], None] | None = None,
+                  probe: bool = False) -> tuple[Recognition | None, dict]:
         page_number = page.number + 1
         attempts = []
         observed = ""
         provisional = None
         for engine_index, engine in enumerate(self.engines):
-            status(engine)
             fallback_reason = None
             if engine_index:
                 previous = attempts[-1]
                 fallback_reason = (provisional[1]["review_reason"] if provisional else
                                    f"{previous['engine']} {previous['status']}: " + " ".join(previous["issues"]))
+            status(engine)
+            model = self.models.get(engine)
+            if event and fallback_reason:
+                event({"engine": engine, "model": model, "status": "switching", "fallback_reason": fallback_reason})
             repeats = 1 + min(2, max(0, self.settings.glm_ocr_retries)) if engine == "glm-ocr" else 1
             for _ in range(repeats):
                 started = time.monotonic()
@@ -50,16 +58,23 @@ class OCRRouter:
                 try:
                     with audit.details(selected_ocr_engine=self.settings.ocr_backend, ocr_engine=engine,
                                        fallback_reason=fallback_reason):
-                        if engine == "glm-ocr":
-                            if self.glm_status is None or not self.glm_status["ready"]:
-                                self.glm_status = glm.model_info(self.settings)
-                            if not self.glm_status["ready"]:
-                                raise RecognitionError(self.glm_status["reason"], unavailable=True)
+                        adapter = self.ollama_engines.get(engine)
+                        if adapter:
+                            if engine not in self.model_status:
+                                self.model_status[engine] = adapter.model_info(self.settings)
+                            state = self.model_status[engine]
+                            # The synthetic probe can confirm the server's explicit image rejection.
+                            if not state["ready"] and not (probe and engine == paddle_vl.ENGINE and state.get("installed")):
+                                raise RecognitionError(state["reason"], unavailable=True)
                             inference_attempted = True
-                            with audit.details(model_digest=self.glm_status.get("digest")):
-                                result = glm.recognise(page, dpi, self.settings)
+                            with audit.details(model_digest=state.get("digest")):
+                                result = adapter.recognise(page, dpi, self.settings)
                         else:
                             input_language = self.paddle_language(language, observed, diag)
+                            if event:
+                                model = paddle.models(self.settings, input_language)[1].name
+                                event({"engine": engine, "model": model, "status": "requesting",
+                                       "fallback_reason": fallback_reason})
                             result = self.paddle.recognise(page, input_language, dpi)
                     issues = validate_recognition(result, page_number, diag, self.settings)
                     observed = result.text()
@@ -73,7 +88,6 @@ class OCRRouter:
                     failure_status = error.status
                 except (OSError, ValueError, RuntimeError, TypeError, KeyError, IndexError):
                     issues = [f"{engine} returned an invalid result or stopped."]
-                model = self.settings.glm_ocr_model if engine == "glm-ocr" else None
                 if result is not None:
                     model = result.model or model
                 attempt = {"engine": engine, "model": model, "status": "accepted" if not issues else failure_status,
@@ -87,11 +101,14 @@ class OCRRouter:
                            detected_language=profile.get("language"))
                 if ids:
                     attempt["execution_ids"] = ids
+                    attempt["inference_ms"] = round(sum(item["duration_ms"] for item in audit.since(audit_start)), 2)
                 if result is not None and not result.execution_ids:
                     result.execution_ids = ids
-                if engine == "glm-ocr":
+                if engine in self.ollama_engines:
                     attempt["document_inference_attempted"] = inference_attempted
                 attempts.append(attempt)
+                if event:
+                    event(attempt)
                 if result is not None and self.settings.audit_private_responses:
                     try:
                         self._save(result, len(attempts))
@@ -104,7 +121,7 @@ class OCRRouter:
                             "model": model, "language": profile, "selected_execution_ids": result.execution_ids,
                             "selected_engine": self.settings.ocr_backend, "fallback_reason": fallback_reason}
                     moderate_language = profile["language"] != "und" and profile["confidence"] < .6
-                    if engine == "glm-ocr" and (profile["direction"] in {"mixed", "rtl"} or moderate_language):
+                    if engine in self.ollama_engines and (profile["direction"] in {"mixed", "rtl"} or moderate_language):
                         info.update(requires_review=True, review_reason="OCR language or direction requires independent verification.")
                     if result.confidence is not None and result.confidence < 80:
                         info.update(requires_review=True, review_reason="OCR confidence requires corroboration.")
@@ -119,9 +136,11 @@ class OCRRouter:
                                 or re.findall(r"\d+", a) != re.findall(r"\d+", b)):
                             provisional[1].update(fallback_similarity=info["fallback_similarity"], fallback_reason=fallback_reason,
                                                   review_reason="Local recognizers disagree on text, order, or numerical values.")
+                            if engine_index < len(self.engines) - 1:
+                                break
                             return provisional
-                    if info["requires_review"] and engine_index == 0 and len(self.engines) > 1:
-                        provisional = result, info
+                    if info["requires_review"] and engine_index < len(self.engines) - 1:
+                        provisional = provisional or (result, info)
                         break
                     return result, info
                 if failure_status == "unavailable":

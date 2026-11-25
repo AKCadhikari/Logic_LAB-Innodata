@@ -56,7 +56,7 @@ def test_reversed_automatic_primary_falls_back_when_paddle_unavailable(tmp_path,
     monkeypatch.setattr(paddle.PaddleOCR, "recognise", unavailable)
     monkeypatch.setattr(glm, "model_info", lambda _: {"ready": True})
     monkeypatch.setattr(glm, "recognise", lambda *args: glm_result("The system recorded pressure of 42 kPa."))
-    router = OCRRouter(Settings(ocr_automatic_primary="paddleocr"), tmp_path)
+    router = OCRRouter(Settings(ocr_automatic_primary="paddleocr", ocr_automatic_secondary="glm-ocr"), tmp_path)
     with pymupdf.open() as pdf:
         output, debug = router.recognise(pdf.new_page(), "en", 180, {}, lambda _: None)
     assert output.engine == "glm-ocr" and debug["selected_engine"] == "automatic"
@@ -69,7 +69,7 @@ def test_automatic_conflict_preserves_one_result_and_requires_review(tmp_path, m
     monkeypatch.setattr(paddle.PaddleOCR, "recognise", lambda *args: paddle_result(text, .70))
     monkeypatch.setattr(glm, "model_info", lambda _: {"ready": True})
     monkeypatch.setattr(glm, "recognise", lambda *args: glm_result(text.replace("42", "12")))
-    router = OCRRouter(Settings(ocr_automatic_primary="paddleocr"), tmp_path)
+    router = OCRRouter(Settings(ocr_automatic_primary="paddleocr", ocr_automatic_secondary="glm-ocr"), tmp_path)
     with pymupdf.open() as pdf:
         output, debug = router.recognise(pdf.new_page(), "en", 180, {}, lambda _: None)
     assert output.text() == text and debug["requires_review"]

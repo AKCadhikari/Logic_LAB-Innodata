@@ -129,14 +129,14 @@ def prose(text: str):
         yield text_block("p", "\n".join(paragraph), "body")
 
 
-def parse(page: int, data: dict) -> Recognition:
-    result = Recognition(page, "glm-ocr", raw=data)
+def parse(page: int, data: dict, *, engine: str = "glm-ocr") -> Recognition:
+    result = Recognition(page, engine, raw=data)
     text = data.get("response")
     if not isinstance(text, str):
-        result.issues.append("GLM-OCR did not return recognised text.")
+        result.issues.append("The model did not return recognised text.")
         return result
     if data.get("done") is not True or data.get("done_reason") not in {"stop", None}:
-        result.issues.append("GLM-OCR did not finish the page cleanly.")
+        result.issues.append("The model did not finish the page cleanly.")
     if fence := re.fullmatch(r"\s*```(?:markdown|text|html)?\s*\n(.*?)\n```\s*", text, re.I | re.S):
         text = fence[1]
     pattern = re.compile(f"(?P<table>{TABLE.pattern})|(?P<formula>{FORMULA.pattern})", re.I | re.S)
@@ -162,7 +162,7 @@ def parse(page: int, data: dict) -> Recognition:
 
     def mark(block: Block) -> None:
         block.source = "ocr"
-        block.ocr_engine = "glm-ocr"
+        block.ocr_engine = engine
         block.conf = 0  # Legacy numeric readers must not treat absent model confidence as 100%.
         for child in block.children:
             mark(child)

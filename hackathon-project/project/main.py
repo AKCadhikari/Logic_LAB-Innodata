@@ -33,7 +33,7 @@ def build_parser():
     ap.add_argument("--profile", choices=["brief", "example", "sample"], default=None,
                     help="XML profile for extraction and explicit XML-only exports")
     ap.add_argument("--no-ocr", action="store_true", help="disable OCR fallback (diagnostics only)")
-    ap.add_argument("--ocr-backend", choices=["automatic", "glm-ocr", "paddleocr", "tesseract"],
+    ap.add_argument("--ocr-backend", choices=["automatic", "glm-ocr", "paddleocr-vl", "paddleocr", "tesseract"],
                     help="select the OCR pipeline")
     ap.add_argument("--skip-pptx", action="store_true", help="only generate XML")
     ap.add_argument("--time-budget", type=int, default=None, help="seconds before the run switches to fast mode")

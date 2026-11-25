@@ -162,9 +162,16 @@ def probe_image():
 
 def configured_models(settings):
     models = []
-    if settings.ocr_enabled and settings.ocr_backend in {"automatic", "glm-ocr"}:
+    enabled = {settings.ocr_backend}
+    if settings.ocr_backend == "automatic":
+        enabled = {settings.ocr_automatic_primary, settings.ocr_automatic_secondary, settings.ocr_automatic_tertiary}
+    if settings.ocr_enabled and "glm-ocr" in enabled:
         models.append({"role": "ocr", "label": "GLM-OCR", "name": settings.glm_ocr_model,
                        "url": settings.glm_ocr_url, "capability": "vision"})
+    if settings.ocr_enabled and "paddleocr-vl" in enabled:
+        models.append({"role": "ocr", "label": "PaddleOCR-VL", "name": settings.paddle_vl_model,
+                       "url": settings.paddle_vl_url, "capability": "vision", "is_paddle_vl": True,
+                       "on_demand": settings.ocr_backend == "automatic" and settings.ocr_automatic_primary != "paddleocr-vl"})
     if settings.ollama_enabled:
         models.append({"role": "review", "label": "Qwen", "name": settings.ollama_model,
                        "url": settings.ollama_url, "capability": "completion"})
@@ -289,7 +296,7 @@ class StartupManager:
         if release and not already:
             payload["keep_alive"] = "0"
         if model["role"] == "ocr":
-            payload.update(prompt="Text Recognition:", images=[probe_image()])
+            payload.update(prompt="OCR:" if model.get("is_paddle_vl") else "Text Recognition:", images=[probe_image()])
         else:
             payload.update(prompt="Reply with only the digits 42.", think=False)
         response = ollama_json(url, "/api/generate", payload, s.ollama_model_timeout)
@@ -320,6 +327,10 @@ class StartupManager:
         self.validate()
         s = self.settings
         models = configured_models(s)
+        from ocr import paddle, paddle_vl
+        python_ocr = paddle.readiness(s, s.paddle_ocr_lang or s.paddle_ocr_unknown_lang or "en")
+        self.event("startup", "python_ocr_checked", installed=python_ocr["installed"],
+                   model=python_ocr.get("model"), weights_available=python_ocr["model_available"])
         exe = find_ollama(s)
         self.event("startup", "prepare", mode=s.ollama_startup_mode, executable=exe,
                    required_models=[model["name"] for model in models])
@@ -328,7 +339,7 @@ class StartupManager:
         services, tags = {}, {}
         self.publish(status="warming" if s.ollama_startup_enabled else "startup_disabled",
                      mode=s.ollama_startup_mode, launcher_managed=True, ollama_installed=bool(exe),
-                     services=[], models=models, error=None)
+                     services=[], models=models, python_ocr=python_ocr, error=None)
         if not s.ollama_startup_enabled or not models:
             self.publish(status="startup_disabled" if not s.ollama_startup_enabled else "no_models_required")
             return
@@ -347,6 +358,8 @@ class StartupManager:
             inventory = tags.get(model["url"])
             if inventory is not None:
                 info = ollama.model_info(model["name"], list(inventory.values()), capability=model["capability"])
+                if info["ready"] and model.get("is_paddle_vl"):
+                    info = paddle_vl.model_info(s)
                 model["installed"] = info["ready"] or bool(info["digest"])
                 if not info["ready"]:
                     model["error"] = info["reason"]
@@ -357,7 +370,7 @@ class StartupManager:
             self.event("startup_model", "installation_checked", model=model["name"],
                        installed=model["installed"], error=model.get("error"))
         self.publish(models=models)
-        selected = [model for model in models if "error" not in model
+        selected = [model for model in models if "error" not in model and not model.get("on_demand")
                     and not (s.ollama_startup_mode == "ocr-only" and model["role"] != "ocr")]
         for model in models:
             if "error" in model:

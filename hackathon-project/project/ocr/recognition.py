@@ -3,7 +3,8 @@ from dataclasses import dataclass, field
 
 from layout.model import Block, Line
 
-ENGINE_MODES = ("automatic", "glm-ocr", "paddleocr")
+OCR_ENGINES = ("glm-ocr", "paddleocr-vl", "paddleocr")
+ENGINE_MODES = ("automatic", *OCR_ENGINES)
 
 
 class RecognitionError(RuntimeError):

@@ -1,4 +1,4 @@
-"""Page-by-page PaddleOCR fallback with a bounded local CPU worker."""
+"""Page-by-page PaddleOCR with a bounded local CPU worker."""
 from __future__ import annotations
 
 import importlib.util
@@ -18,6 +18,7 @@ from utils import execution_audit as audit
 LATIN = {"en", "fr", "de", "nl", "it", "cs", "sk"}
 RECOGNIZERS = {"ja": "PP-OCRv5_mobile_rec", "zh": "PP-OCRv5_mobile_rec",
                "ko": "korean_PP-OCRv5_mobile_rec", "ar": "arabic_PP-OCRv3_mobile_rec"}
+LANGUAGES = LATIN | RECOGNIZERS.keys()
 
 
 def models(settings: Settings, language: str) -> tuple[Path, Path]:
@@ -31,15 +32,23 @@ def models(settings: Settings, language: str) -> tuple[Path, Path]:
 
 
 def readiness(settings: Settings, language: str = "en") -> dict:
+    installed = bool(importlib.util.find_spec("paddle") and importlib.util.find_spec("paddleocr"))
     try:
         detector, recogniser = models(settings, language)
     except RecognitionError as error:
-        return {"ready": False, "reason": str(error)}
-    if not importlib.util.find_spec("paddle") or not importlib.util.find_spec("paddleocr"):
-        return {"ready": False, "reason": "Install PaddlePaddle CPU and PaddleOCR in this environment."}
-    if not all((folder / "inference.yml").is_file() for folder in (detector, recogniser)):
-        return {"ready": False, "reason": "PaddleOCR detector or recognition weights are not provisioned."}
-    return {"ready": True, "reason": None, "model": recogniser.name}
+        return {"ready": False, "installed": installed, "model_available": False, "reason": str(error)}
+    provisioned = all((folder / "inference.yml").is_file() for folder in (detector, recogniser))
+    reason = ("Install PaddlePaddle CPU and PaddleOCR in this environment." if not installed else
+              "PaddleOCR detector or recognition weights are not provisioned." if not provisioned else None)
+    return {"ready": reason is None, "installed": installed, "model_available": provisioned,
+            "reason": reason, "model": recogniser.name, "language": settings.paddle_ocr_lang or language}
+
+
+def available_languages(settings: Settings) -> list[str]:
+    from dataclasses import replace
+
+    discovered = replace(settings, paddle_ocr_lang="")
+    return [language for language in sorted(LANGUAGES) if readiness(discovered, language)["model_available"]]
 
 
 def worker(connection, detector: Path, recogniser: Path) -> None:
@@ -119,6 +128,12 @@ class PaddleOCR:
             self.connection.send(image)
             payload = self._receive(deadline)
             audit.response(event, payload, executed=True)
+            if event:
+                import psutil
+                try:
+                    event["worker_rss_bytes"] = psutil.Process(self.process.pid).memory_info().rss
+                except psutil.Error:
+                    pass
             result = parse(number, payload["output"], effective_dpi, status["model"])
             if event:
                 result.execution_ids.append(event["execution_id"])

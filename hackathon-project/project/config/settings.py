@@ -14,7 +14,8 @@ class Settings:
     emit_bbox: bool = False                # debug: data-bbox on blocks
     # --- diagnostics / OCR -----------------------------------------------------
     ocr_enabled: bool = True
-    ocr_backend: str = "glm-ocr"           # glm-ocr with Paddle fallback, or explicit legacy tesseract
+    ocr_backend: str = "automatic"         # automatic | glm-ocr | paddleocr | tesseract
+    ocr_automatic_primary: str = "glm-ocr"
     glm_ocr_url: str = "http://localhost:11434"
     glm_ocr_model: str = "glm-ocr:q8_0"
     glm_ocr_timeout_s: int = 300
@@ -26,6 +27,8 @@ class Settings:
     paddle_det_model_dir: str = ""
     paddle_rec_model_dir: str = ""
     paddle_ocr_lang: str = ""              # override the language inferred from native text
+    paddle_ocr_unknown_lang: str = "en"   # default for image-only pages without language evidence
+    workspace_workers: int = 1
     ocr_min_chars: int = 2
     ocr_max_chars: int = 42000
     ocr_min_native_ratio: float = 0.30

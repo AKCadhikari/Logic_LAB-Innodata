@@ -83,7 +83,7 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
     doc_id = pdf.stem
     res = {"doc_id": doc_id, "file": pdf.name, "ok": False, "pages": 0, "error": "", "page_log": []}
     cache = Cache(work_dir / settings.cache_dir, settings.use_cache)
-    router = OCRRouter(settings, work_dir / "recognition" / doc_id)
+    router = OCRRouter(settings, work_dir / "recognition" / doc_id) if settings.ocr_backend != "tesseract" else None
     layout = DoclingLayout(settings)
     counts = {"required": 0, "glm_ocr": 0, "paddle_ocr": 0, "failed": 0, "review": 0}
     res["processing_counts"] = counts
@@ -146,7 +146,7 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             if fast and decision == "compare":
                 decision = "native"; d["reasons"].append("fast mode: compare skipped")
                 d["ocr"] = {"engine": None, "status": "skipped", "requires_review": True}
-            if decision != "native" and settings.ocr_enabled and settings.ocr_backend == "glm-ocr":
+            if decision != "native" and settings.ocr_enabled and settings.ocr_backend in {"automatic", "glm-ocr", "paddleocr"}:
                 result, info = router.recognise(page, page_language, dpi, d,
                                                lambda engine: stage("ocr", page=i + 1, engine=engine))
                 d["ocr"] = info
@@ -192,7 +192,8 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                 if page_language == "und":
                     page_language = ocr.pick_language(page, settings, installed)
                     audit.event("ocr", "page_language_by_trial", doc=doc_id, page=i + 1, lang=page_language)
-                olines, info, cached = _ocr_cached(page, cache, cache_identity, fkey, page_language, settings,
+                with model_audit.details(selected_ocr_engine="tesseract", ocr_engine="tesseract"):
+                    olines, info, cached = _ocr_cached(page, cache, cache_identity, fkey, page_language, settings,
                                                    installed, deskew, dpi)
                 oconf = sum(l.conf for l in olines) / len(olines) if olines else 0.0
                 otext = _text_of(olines)
@@ -244,6 +245,7 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                 except Exception:
                     pass
         raw.append(rec)
+        d["selected_ocr_engine"] = settings.ocr_backend
         ocr_info = d.get("ocr", {})
         for engine, key in (("glm-ocr", "glm_ocr"), ("paddleocr", "paddle_ocr")):
             counts[key] += ocr_info.get("engine") == engine and ocr_info.get("status") == "accepted"
@@ -259,7 +261,8 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             progress(i + 1, n)
         stage("extracted", page=i + 1)
     metadata = {key: value for key, value in (doc.metadata or {}).items() if value}
-    router.close()
+    if router:
+        router.close()
     # ---- Layout Reconstruction agent ------------------------------------------------------------------
     ctx = reconstruct.compute_context(raw, settings)
     ctx.lang = lang
@@ -317,6 +320,7 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
         doc.close()
     dir_ = DocIR(doc_id=doc_id, path=str(pdf), lang=lang, pages=pages,
                  meta={"settings": settings.schema_profile, "pdf_metadata": metadata, "source_sha256": fkey,
+                       "selected_ocr_engine": settings.ocr_backend,
                        "ocr_metadata_version": 2})
     stage("validation")
     return finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0)
@@ -438,7 +442,7 @@ def _job(args):
 
 
 def run_pdfs(pdfs: list[Path], settings: Settings, out_dir: Path, work_dir: Path, audit: AuditLog, t_start: float) -> list[dict]:
-    workers = settings.workers or (1 if settings.ocr_backend == "glm-ocr" or settings.docling_enabled
+    workers = settings.workers or (1 if settings.ocr_backend != "tesseract" or settings.docling_enabled
                                    else max(1, min((os.cpu_count() or 2) - 1, 6, len(pdfs) or 1)))
     deadline = t_start + 0.75 * settings.time_budget_s            # after this point OCR drops to fast mode
     audit.event("orchestrator", "batch_start", documents=len(pdfs), workers=workers, soft_deadline_s=round(0.75 * settings.time_budget_s))

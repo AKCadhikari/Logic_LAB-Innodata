@@ -151,6 +151,43 @@ def documents():
     return jsonify(workspace().documents(browser_owner(create=True)))
 
 
+@api.route("/ocr-settings", methods=["GET", "PATCH"])
+def ocr_settings():
+    from ocr.recognition import ENGINE_MODES
+    from ocr.summary import health, observed_runs
+    from startup import ROOT, read_json
+
+    ws, owner = workspace(), browser_owner(create=True)
+    if request.method == "PATCH":
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or body.get("engine") not in ENGINE_MODES:
+            return fail("Choose Automatic, GLM-OCR or PaddleOCR.", 400)
+        ws.set_ocr_preference(owner, body["engine"])
+    data = {"engine": ws.ocr_preference(owner), "automatic_primary": ws.settings.ocr_automatic_primary}
+    if request.method == "PATCH" or request.args.get("detail") != "1":
+        return jsonify(data)
+    with ws.db() as db:
+        jobs = db.execute("""SELECT j.result, j.finished FROM jobs j JOIN documents d ON d.id=j.document_id
+                             WHERE d.owner=? AND j.finished IS NOT NULL AND j.result IS NOT NULL
+                             ORDER BY j.finished DESC LIMIT 50""", (owner,)).fetchall()
+    results = [{**json.loads(row["result"]), "finished": row["finished"]} for row in jobs]
+    runs = observed_runs(results)
+    logs = current_app.extensions.get("startup_logs", ROOT / "logs")
+    return jsonify(**data, engines=health(ws.settings, runs), measurements=runs, jobs_sampled=len(jobs),
+                   benchmark=read_json(logs / "ocr-comparison.json"))
+
+
+def requested_ocr(engine, language):
+    from ocr.paddle import LANGUAGES
+    from ocr.recognition import ENGINE_MODES
+
+    if engine is not None and engine not in ENGINE_MODES:
+        raise ValueError("Choose Automatic, GLM-OCR or PaddleOCR.")
+    if language is not None and (not isinstance(language, str) or language not in {"", *LANGUAGES}):
+        raise ValueError("Choose a supported PaddleOCR language.")
+    return engine, language
+
+
 @api.route("/profile", methods=["GET", "PATCH"])
 def profile():
     ws = workspace()
@@ -165,6 +202,10 @@ def profile():
 
 @api.post("/documents")
 def create_document():
+    try:
+        engine, language = requested_ocr(request.form.get("ocr_engine"), request.form.get("ocr_language"))
+    except ValueError as error:
+        return fail(str(error), 400)
     uploaded, error = upload_file("pdf", ".pdf", b"%PDF-")
     if error:
         return fail(error, 400)
@@ -173,7 +214,7 @@ def create_document():
     if previous and not ws.owns(previous, browser_owner()):
         return fail("The previous document version does not exist.", 400)
     filename, stream = uploaded
-    document_id = ws.upload(filename, stream, previous, browser_owner(create=True))
+    document_id = ws.upload(filename, stream, previous, browser_owner(create=True), engine=engine, language=language)
     return jsonify(ws.get(document_id)), 202
 
 
@@ -207,7 +248,8 @@ def view(ir: DocIR) -> dict:
                          "confidence": None if block.ocr_engine == "glm-ocr" else block.conf}
         diag = {key: page.diag[key] for key in ("health", "decision", "reasons", "ocr", "confidence", "rotation",
                                               "layout", "native_chars", "has_native_text", "short_native_text",
-                                              "appears_scanned", "has_images", "ocr_required", "review_reasons")
+                                              "appears_scanned", "has_images", "ocr_required", "review_reasons",
+                                              "selected_ocr_engine")
                 if key in page.diag}
         pages.append({"n": page.n, "w": page.width, "h": page.height, "source": page.source,
                       "diag": diag, "blocks": blocks, "ocr_engine": page.ocr_engine,
@@ -236,7 +278,14 @@ def retry(document_id: str):
     ws = workspace()
     if ws.get(document_id) is None:
         return fail("Document not found.", 404)
-    if not ws.enqueue(document_id):
+    body = request.get_json(silent=True) if request.is_json else {}
+    if not isinstance(body, dict):
+        return fail("Send OCR options as an object.", 400)
+    try:
+        engine, language = requested_ocr(body.get("ocr_engine"), body.get("ocr_language"))
+    except ValueError as error:
+        return fail(str(error), 400)
+    if not ws.enqueue(document_id, engine=engine, language=language):
         return fail("A processing attempt is already active.", 409)
     return jsonify(ws.get(document_id)), 202
 

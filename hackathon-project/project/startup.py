@@ -162,7 +162,7 @@ def probe_image():
 
 def configured_models(settings):
     models = []
-    if settings.ocr_enabled and settings.ocr_backend == "glm-ocr":
+    if settings.ocr_enabled and settings.ocr_backend in {"automatic", "glm-ocr"}:
         models.append({"role": "ocr", "label": "GLM-OCR", "name": settings.glm_ocr_model,
                        "url": settings.glm_ocr_url, "capability": "vision"})
     if settings.ollama_enabled:

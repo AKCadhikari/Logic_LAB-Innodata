@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from dataclasses import replace
 from concurrent.futures import Future, ProcessPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 from agents.orchestrator import process_pdf, refresh_layout
 from config.settings import Settings
+from ocr.recognition import ENGINE_MODES
 from layout.model import Block, DocIR, ir_from_dict
 from utils.logs import AuditLog
 from xml_engine.serializer import to_xml
@@ -41,7 +43,7 @@ class Workspace:
         self.output = output if output is not None else root / "output"
         self.root.mkdir(parents=True, exist_ok=True)
         self.settings = settings
-        self.worker = ProcessPoolExecutor(max_workers=1)
+        self.worker = ProcessPoolExecutor(max_workers=max(1, settings.workspace_workers))
         with self.db() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS documents (
@@ -64,6 +66,9 @@ class Workspace:
                     id INTEGER PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id),
                     created TEXT NOT NULL, reviewer TEXT NOT NULL, approved INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ocr_preferences (
+                    owner TEXT PRIMARY KEY, engine TEXT NOT NULL
+                );
             """)
             if "owner" not in {row["name"] for row in db.execute("PRAGMA table_info(documents)")}:
                 db.execute("ALTER TABLE documents ADD COLUMN owner TEXT")
@@ -78,7 +83,20 @@ class Workspace:
     def source(self, document_id: str) -> Path:
         return self.root / document_id / "source.pdf"
 
-    def upload(self, filename: str, stream: BinaryIO, previous_id: str | None, owner: str) -> str:
+    def ocr_preference(self, owner: str) -> str:
+        with self.db() as db:
+            row = db.execute("SELECT engine FROM ocr_preferences WHERE owner=?", (owner,)).fetchone()
+        return row["engine"] if row else (self.settings.ocr_backend if self.settings.ocr_backend in ENGINE_MODES else "automatic")
+
+    def set_ocr_preference(self, owner: str, engine: str) -> None:
+        if engine not in ENGINE_MODES:
+            raise ValueError("Choose Automatic, GLM-OCR or PaddleOCR.")
+        with self.db() as db:
+            db.execute("INSERT INTO ocr_preferences VALUES (?, ?) ON CONFLICT(owner) DO UPDATE SET engine=excluded.engine",
+                       (owner, engine))
+
+    def upload(self, filename: str, stream: BinaryIO, previous_id: str | None, owner: str,
+               *, engine: str | None = None, language: str | None = None) -> str:
         document_id = uuid4().hex
         source = self.source(document_id)
         with self.db() as db:
@@ -93,7 +111,7 @@ class Workspace:
                 source.unlink(missing_ok=True)
                 source.parent.rmdir()
                 raise
-            job = self._create_job(db, document_id)
+            job = self._create_job(db, document_id, engine, language)
         self._submit(document_id, job)
         return document_id
 
@@ -124,7 +142,7 @@ class Workspace:
             if row is None:
                 return None
             jobs = db.execute("""
-                SELECT id, status, created, started, finished, done, total, error,
+                SELECT id, status, created, started, finished, done, total, error, settings,
                        CASE WHEN status='running' THEN result END AS stage_json
                 FROM jobs WHERE document_id=? ORDER BY id DESC
             """, (document_id,))
@@ -136,6 +154,9 @@ class Workspace:
             for job in jobs:
                 state = dict(job)
                 stage_data = state.pop("stage_json")
+                config = json.loads(state.pop("settings"))
+                state["ocr_selection"] = {key: config.get(key) for key in (
+                    "ocr_backend", "ocr_automatic_primary", "glm_ocr_model", "paddle_ocr_lang", "paddle_ocr_unknown_lang")}
                 if stage_data:
                     state["processing"] = json.loads(stage_data)
                 public_jobs.append(state)
@@ -143,7 +164,8 @@ class Workspace:
             document.pop("owner")
             return {**document, "jobs": public_jobs, "review": dict(review) if review else None}
 
-    def enqueue(self, document_id: str, *, layout_only: bool = False) -> bool:
+    def enqueue(self, document_id: str, *, layout_only: bool = False, engine: str | None = None,
+                language: str | None = None) -> bool:
         with self.db() as db:
             previous = None
             if layout_only:
@@ -151,7 +173,7 @@ class Workspace:
                                          ORDER BY id DESC LIMIT 1""", (document_id,)).fetchone()
                 if previous is None:
                     return False
-            job = self._create_job(db, document_id)
+            job = self._create_job(db, document_id, engine, language)
             if job is None:
                 return False
             if previous is not None:
@@ -160,12 +182,15 @@ class Workspace:
         self._submit(document_id, job, previous["id"] if previous is not None else None)
         return True
 
-    def _create_job(self, db: sqlite3.Connection, document_id: str) -> int | None:
+    def _create_job(self, db: sqlite3.Connection, document_id: str, engine: str | None = None,
+                    language: str | None = None) -> int | None:
+        settings = replace(self.settings, ocr_backend=engine or self.settings.ocr_backend,
+                           paddle_ocr_lang=language if language is not None else self.settings.paddle_ocr_lang)
         cursor = db.execute("""
             INSERT INTO jobs(document_id, status, created, settings)
             SELECT ?, 'queued', ?, ? WHERE NOT EXISTS(
                 SELECT 1 FROM jobs WHERE document_id=? AND status IN ('queued','running'))
-        """, (document_id, now(), json.dumps(self.settings.to_dict()), document_id))
+        """, (document_id, now(), json.dumps(settings.to_dict()), document_id))
         return cursor.lastrowid if cursor.rowcount else None
 
     def _submit(self, document_id: str, job: int, layout_from: int | None = None) -> None:

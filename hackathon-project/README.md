@@ -78,6 +78,26 @@ launcher. `-NoBrowser` suppresses the browser for smoke tests. Advanced commands
 
 Upload one PDF at a time. The local workspace stores each original and its processing attempts under `storage/`
 and shows job progress, native-text diagnostics, OCR attempts, layout status, and pages flagged for review.
+Choose **OCR engine** before upload or reprocessing. **GLM-OCR** and **PaddleOCR** are strict choices.
+**Automatic** starts with GLM-OCR by default and tries PaddleOCR after an unavailable engine, a timeout,
+rejected output, or an output requiring corroboration. A disagreement leaves one result flagged for review.
+Pages with a usable native layer continue through native extraction. Uncheck **Remember engine** for an override
+that applies only to the next submission. Each attempt retains its own engine and model settings.
+
+Use **PaddleOCR language** for an image-only page with a known language. When there is no language evidence,
+PaddleOCR uses the configured default (`DOCUSYNC_PADDLE_OCR_UNKNOWN_LANG`, initially `en`).
+`GLM_OCR_MODEL` sets the local model tag, and `DOCUSYNC_OCR_AUTOMATIC_PRIMARY=paddleocr` reverses automatic order.
+The workspace queues jobs by default and can run more concurrently through `DOCUSYNC_WORKSPACE_WORKERS`.
+The CLI accepts `--ocr-backend automatic|glm-ocr|paddleocr|tesseract`.
+
+**Settings → OCR health and comparison** separates installation, availability, observed residency, and previous
+successful inference. It shows actual recent timings and failures. Labelled accuracy appears after running a
+benchmark. Run this from the project directory to publish a local comparison in the dashboard.
+
+```powershell
+.\.venv\Scripts\python.exe -B project/ocr_selector_check.py --out storage/new-ocr-comparison --dashboard-file logs/ocr-comparison.json
+```
+
 Review a page in Source PDF, Text, Zoning or Reading Order, correct the title or language,
 then approve and export XML. Locate an extracted title in the PDF when the source region is available. Use Changes
 to compare two versions and apply matching text updates to an uploaded PowerPoint deck.

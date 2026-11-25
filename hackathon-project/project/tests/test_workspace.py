@@ -55,6 +55,34 @@ def wait_for_attempt(client, url):
     pytest.fail("The processing attempt did not finish.")
 
 
+def test_ocr_preference_and_independent_job_snapshots(workspace):
+    client, _ = workspace
+    profile = "/api/ocr-settings"
+    assert client.patch(profile, json={"engine": "paddleocr"}).json["engine"] == "paddleocr"
+    assert client.get(profile).json["engine"] == "paddleocr"
+    try:
+        def submit(engine, language=""):
+            return client.post("/api/documents", data={"pdf": (io.BytesIO(pdf_with_text(
+                "The audited pressure remained within tolerance.")), "job.pdf"),
+                "ocr_engine": engine, "ocr_language": language})
+
+        first = submit("glm-ocr")
+        second = submit("paddleocr", "fr")
+        assert first.status_code == second.status_code == 202
+        assert submit("unrecognised").status_code == 400
+        assert client.get(profile).json["engine"] == "paddleocr"
+        first_url = "/api/documents/" + first.json["id"]
+        second_url = "/api/documents/" + second.json["id"]
+        assert wait_for_attempt(client, first_url)["jobs"][0]["ocr_selection"]["ocr_backend"] == "glm-ocr"
+        stored = wait_for_attempt(client, second_url)["jobs"][0]["ocr_selection"]
+        assert stored["ocr_backend"] == "paddleocr" and stored["paddle_ocr_lang"] == "fr"
+        assert client.post(first_url + "/retry", json={"ocr_engine": "automatic"}).status_code == 202
+        history = wait_for_attempt(client, first_url)["jobs"]
+        assert [job["ocr_selection"]["ocr_backend"] for job in history] == ["automatic", "glm-ocr"]
+    finally:
+        client.patch(profile, json={"engine": "automatic"})
+
+
 def test_upload_review_export_compare_and_sync(workspace):
     client, root = workspace
     assert client.get("/api/documents").status_code == 200

@@ -10,6 +10,20 @@
 </header>
 <aside class="library" aria-labelledby="library-heading">
  <h2 id="library-heading">Documents</h2>
+ <div id="ocr-controls">
+  <label for="ocr-engine">OCR engine</label>
+  <select id="ocr-engine">
+   <option value="automatic">Automatic</option>
+   <option value="glm-ocr">GLM-OCR</option>
+   <option value="paddleocr">PaddleOCR</option>
+  </select>
+  <label class="ocr-remember"><input id="ocr-remember" type="checkbox" checked> Remember engine</label>
+  <div id="ocr-paddle-row">
+   <label for="ocr-language">PaddleOCR language</label>
+   <select id="ocr-language"><option value="">Detect / configured default</option></select>
+  </div>
+  <small id="ocr-choice-status" aria-live="polite"></small>
+ </div>
  <button class="btn pri upload" id="upload"><span aria-hidden="true">+</span> Upload PDF</button>
  <input id="pdf-file" type="file" accept=".pdf,application/pdf" hidden>
  <label for="docsel">Current document</label>
@@ -65,6 +79,10 @@
 <dialog id="settings-dialog" aria-labelledby="settings-heading">
  <div class="dialog-heading"><h2 id="settings-heading">Workspace settings</h2><form method="dialog"><button class="btn">Close</button></form></div>
  <p id="settings-info"></p>
+ <section id="ocr-dashboard" aria-labelledby="ocr-dashboard-heading">
+  <h3 id="ocr-dashboard-heading">OCR health and comparison</h3>
+  <div id="ocr-dashboard-results" aria-live="polite"></div>
+ </section>
  <section id="startup-status" aria-labelledby="startup-heading">
   <div class="dialog-heading"><h3 id="startup-heading">AI execution audit</h3>
    <button type="button" class="btn" id="startup-retry">Retry model startup</button></div>
@@ -146,6 +164,6 @@ $("#rot").onclick=()=>{S.rot=(S.rot+90)%360;W.batch?viewer():workspaceViewer()};
 $("#dlxml").onclick=()=>{if(S.id)location.href=W.batch?`/api/doc/${encodeURIComponent(S.id)}/xml?download=1`:`${docUrl()}/xml?download=1`};
 $("#reproc").onclick=async()=>{if(!S.id)return;const b=$("#reproc");b.disabled=true;try{
  if(W.batch){await J(`/api/reprocess/${encodeURIComponent(S.id)}`,{method:"POST"});await open(S.id)}
- else{await workspaceFetch(docUrl()+"/retry",{method:"POST"});await selectWorkspace(S.id)}
+ else{await workspaceFetch(docUrl()+"/retry",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(ocrJobOptions())});await selectWorkspace(S.id)}
  }catch(e){showError(e)}finally{if(W.batch)b.disabled=false}};
 </script><script src="/static/workspace.js"></script></body></html>

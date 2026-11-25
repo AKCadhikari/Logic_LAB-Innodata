@@ -88,6 +88,11 @@ a { color: var(--accent); }
 .library h2 { margin-bottom: 16px; }
 .library label { display: block; margin: 23px 0 6px; color: var(--mute); font-size: 12px; }
 .library .upload { width: 100%; text-align: left; }
+#ocr-controls { display: grid; gap: 6px; margin-bottom: 12px; }
+#ocr-controls label { margin: 0; }
+#ocr-controls .ocr-remember { display: flex; align-items: center; gap: 5px; }
+#ocr-choice-status { color: var(--mute); }
+#ocr-dashboard table { width: 100%; font-size: 12px; text-align: left; }
 .upload span { display: inline-block; margin-right: 7px; font-size: 18px; line-height: 1; vertical-align: -1px; }
 .library select { width: 100%; text-overflow: ellipsis; }
 .library-nav { display: grid; gap: 4px; margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--line); }
@@ -271,6 +276,7 @@ dialog::backdrop { background: #132e27a6; }
     }
     .library h2, .library label { margin: 0; }
     .library .upload { justify-self: end; width: auto; }
+    #ocr-controls { grid-column: 1 / -1; }
     .library-nav { display: flex; flex-wrap: wrap; grid-column: 1 / -1; margin: 0; padding: 0; border: 0; }
     .pane, .side { height: max(520px, calc(100dvh - 200px)); }
 }

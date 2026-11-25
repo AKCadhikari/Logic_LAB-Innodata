@@ -72,7 +72,8 @@ def check():
         fallback_pdf = out / "fallback-probe.pdf"
         fall_nonce = str(1000000 + uuid4().int % 9000000)
         fixture(fallback_pdf, fall_nonce)
-        fallback_settings = replace(settings, glm_ocr_model=f"audit-absent:{fall_nonce}")
+        fallback_settings = replace(settings, ocr_backend="automatic", ocr_automatic_primary="glm-ocr",
+                                    glm_ocr_model=f"audit-absent:{fall_nonce}")
         with audit.scope(fallback_pdf.stem, file_key(fallback_pdf)) as fallback, pymupdf.open(fallback_pdf) as pdf:
             router = OCRRouter(fallback_settings, out / "fallback-recognition")
             try:

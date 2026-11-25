@@ -11,6 +11,7 @@ from rapidfuzz import fuzz
 
 from config.settings import Settings
 from utils import ollama
+from utils import execution_audit as execution
 from utils.logs import AuditLog
 
 NUMBER = re.compile(r"(?<!\w)[+−-]?(?:\d+(?:[.,]\d+)*|\.\d+)(?:[eE][+−-]?\d+)?(?:\s?[%‰])?(?!\w)")
@@ -72,12 +73,14 @@ def related_pair(changes: list[dict]) -> tuple[dict, dict] | None:
 def annotate(changes: list[dict], settings: Settings, audit: AuditLog) -> dict:
     model = settings.ollama_model
     inference_attempted = False
+    record = {}
 
     def report(status: str, count: int = 0, reason: str | None = None) -> dict:
         if status not in {"disabled", "skipped"}:
             audit.event("comparison", "assistance_" + status, model=model, reviewed=count, reason=reason)
         return {"status": status, "model": model, "reviewed": count, "reason": reason,
-                "document_inference_attempted": inference_attempted}
+                "document_inference_attempted": inference_attempted,
+                "execution_id": record.get("execution_id"), "execution": record or None}
 
     candidates = []
     for change in changes:
@@ -127,17 +130,29 @@ def annotate(changes: list[dict], settings: Settings, audit: AuditLog) -> dict:
     try:
         inference_attempted = True
         audit.event("comparison", "document_inference_requested", model=model)
-        data = request_json(settings, "/api/chat", payload)
-        if data.get("done") is not True or data.get("done_reason") not in {"stop", None}:
-            raise ValueError("Qwen did not complete the response.")
-        analysis = schema.model_validate_json(data["message"]["content"])
+        with execution.execution("semantic_document_comparison", "ollama", model,
+                                 model_digest=model_status.get("digest"), input_type="comparison_json",
+                                 input_sha256=execution.digest(payload), input_reference="deterministic_comparison",
+                                 prompt_template="comparison-review/v1") as record:
+            data = request_json(settings, "/api/chat", payload)
+            if isinstance(data.get("model"), str) and ollama.tagged_model(data["model"]) != ollama.tagged_model(model):
+                raise ValueError("Ollama returned a different review model.")
+            if data.get("done") is not True or data.get("done_reason") not in {"stop", None}:
+                raise ValueError("Qwen did not complete the response.")
+            analysis = schema.model_validate_json(data["message"]["content"])
     except ollama.OllamaError as error:
         return report(error.status if error.status in {"timeout", "unavailable"} else "failed", reason=str(error))
     except (ValidationError, KeyError, ValueError, TypeError, OSError):
+        if record:
+            record["validation"] = "rejected"
         return report("failed", reason="Qwen returned an incomplete or invalid assessment.")
     for key, (change, other) in selected.items():
         item = getattr(analysis, key)
         change["assistance"] = {"relation": item.relation, "classification": item.classification,
                                 "review_focus": item.review_focus, "explanation": EXPLANATIONS[item.review_focus],
                                 "candidate": other["new_location"] if other is not None else None}
+    if record and record["executed"]:
+        record.update(validation="passed", classification_sha256=execution.digest(analysis.model_dump()),
+                      classification=analysis.model_dump(), downstream=[{"consumer": "comparison_review", "reference": "review.assistance",
+                                                        "classifications": len(candidates)}])
     return report("completed", len(candidates))

@@ -20,6 +20,7 @@ from config.settings import Settings
 from layout.model import DocIR, ir_from_dict
 from powerpoint.package import RunEdit, open_deck, write_deck
 from utils.logs import AuditLog
+from utils import execution_audit as model_audit
 from xml_engine.serializer import to_xml
 
 FURNITURE = {"slide-number", "footer", "rule", "date"}
@@ -35,10 +36,13 @@ class Unit:
     source: str
     reliable: bool
     engine: str = ""
+    block_id: str | None = None
+    execution_ids: tuple = ()
 
     def reference(self) -> dict:
         return {"page": self.page, "xml_node": self.node, "text": self.text,
                 "extraction": self.source, "ocr_engine": self.engine or None,
+                "block_id": self.block_id, "execution_ids": list(self.execution_ids),
                 "extraction_confidence": None if self.engine == "glm-ocr" else self.confidence}
 
 
@@ -94,7 +98,8 @@ def build_evidence(ir: DocIR, settings: Settings) -> list[Unit]:
                             and page.diag.get("health") == "healthy"
                             and not page.diag.get("error") and confidence >= 80)
                 evidence.append(Unit(text, ws_lower(text), page.n, locations[key], confidence,
-                                     block.source, reliable, block.ocr_engine))
+                                     block.source, reliable, block.ocr_engine, block.source_reference.get("block_id"),
+                                     tuple(block.source_reference.get("execution_ids", []))))
     return evidence
 
 
@@ -239,7 +244,8 @@ def confirm_ocr(ir: DocIR, match: Match, replacements: list[dict], settings: Set
         try:
             with pymupdf.open(ir.path) as pdf:
                 check_settings = replace(settings, ocr_psm=11)
-                lines, _ = ocr_page(pdf[unit.page - 1], ir.lang, min(275, max(240, settings.ocr_dpi + 40)),
+                with model_audit.details(purpose="verify_pptx_source_text"):
+                    lines, _ = ocr_page(pdf[unit.page - 1], ir.lang, min(275, max(240, settings.ocr_dpi + 40)),
                                     check_settings, available_langs(check_settings), orient=False, deskew=False)
                 cache[unit.page] = " ".join(word_tokens(" ".join(line.text for line in lines if line.conf >= 75)))
         except (OSError, RuntimeError, ValueError, TimeoutExpired):
@@ -292,6 +298,14 @@ def source_pages(slide, total: int) -> set[int]:
 
 
 def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Settings) -> dict:
+    with model_audit.scope(ir.doc_id, ir.meta.get("source_sha256"),
+                           trace_id=ir.meta.get("execution_trace_id")) as trace:
+        report = _repair_presentation(ir, source, target, settings)
+        report["verification_executions"] = trace["executions"]
+    return report
+
+
+def _repair_presentation(ir, source, target, settings):
     from powerpoint.numbering import numbering
 
     evidence = build_evidence(ir, settings)
@@ -360,6 +374,10 @@ def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Setting
                     record["change_type"] = record["proposals"][0]["type"]
                 if conflicting:
                     record["alternatives"] = conflicting
+                if verified_ocr:
+                    ids = [row["execution_id"] for row in model_audit.since(0)
+                           if row.get("page") == best.unit.page and row["validation"] == "passed"]
+                    record["source"]["execution_ids"].extend(ids)
                 records.append(record)
     for item in numbering(deck, edits):
         if item.get("old") != item.get("new"):
@@ -398,4 +416,5 @@ def amend_deck(pdf: Path, pptx: Path, target: Path, work: Path, settings: Settin
               "types": dict(Counter(r["change_type"] for r in report["applied"])),
               "valid": True, "seconds": round(time.monotonic() - started, 2)}
     audit.event("powerpoint", "deck_done", **result)
-    return {**result, "records": report["records"], "slide_numbering": report["slide_numbering"]}
+    return {**result, "records": report["records"], "slide_numbering": report["slide_numbering"],
+            "verification_executions": report["verification_executions"]}

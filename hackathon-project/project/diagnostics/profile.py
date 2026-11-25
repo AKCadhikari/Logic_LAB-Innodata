@@ -34,7 +34,7 @@ def decorate_document(ir) -> dict:
             block.lang = block.language["language"]
             if block.lang != "und" and block.language["confidence"] >= 0.55:
                 languages.add(block.lang)
-            block.source_reference = {"page": page.n, "bbox": block.bbox, "extraction_method": block.source,
+            block.source_reference = {**block.source_reference, "page": page.n, "bbox": block.bbox, "extraction_method": block.source,
                                       "recognizer": block.ocr_engine or (page.ocr_engine if block.source == "ocr" else None),
                                       "alignment": "unverified" if block.source == "ocr" and (
                                           page.diag.get("rotation") or page.diag.get("ocr", {}).get("rotate")

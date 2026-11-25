@@ -41,6 +41,7 @@ def test_native_pages_bypass_both_engines(tmp_path, settings, audit, monkeypatch
 
 def test_glm_page_flows_through_ir_and_xml(tmp_path, settings, audit, monkeypatch):
     settings.docling_enabled = False
+    settings.audit_private_responses = True
     monkeypatch.setattr(glm, "model_info", lambda settings: {"ready": True})
     def recognise(page, dpi, settings):
         raw = {"done": True, "model": "glm-ocr:q8_0",
@@ -99,6 +100,7 @@ def test_failed_page_remains_in_xml_and_is_marked_for_review(tmp_path, settings,
 
 
 def test_evidence_write_failure_does_not_trigger_fallback(tmp_path, settings, monkeypatch):
+    settings.audit_private_responses = True
     monkeypatch.setattr(glm, "model_info", lambda settings: {"ready": True})
     monkeypatch.setattr(glm, "recognise", lambda *args: glm.parse(1, {"done": True, "response": "Valid OCR text"}))
     monkeypatch.setattr(paddle.PaddleOCR, "recognise", lambda *args: pytest.fail("GLM-OCR produced valid text."))

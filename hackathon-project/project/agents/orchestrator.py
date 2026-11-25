@@ -10,7 +10,7 @@ from diagnostics.page_diagnostics import analyze_page
 from diagnostics.profile import decorate_document, quality_gate
 from ingestion.discover import describe
 from layout.model import PageIR, DocIR, Line, Block, Span, ir_from_dict
-from layout import native, reconstruct, kinds, figures
+from layout import native, reconstruct, kinds, figures, ocr_geometry
 from layout.docling_adapter import DoclingLayout
 from ocr import engine as ocr
 from ocr.router import OCRRouter
@@ -20,6 +20,8 @@ from utils.logs import AuditLog
 from utils.naming import xml_name
 from utils.textutil import detect_lang, language_profile, norm_cmp, norm_ws
 from reporting.exports import write_report
+from reporting import execution as execution_reports
+from utils import execution_audit as model_audit
 from xml_engine.serializer import to_xml
 from xml_engine.validate import validate_xml, verify_unicode
 
@@ -61,7 +63,20 @@ def _text_of(lines) -> str:
 
 def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, audit: AuditLog,
                 deadline: float | None = None, progress: Callable[[int, int], None] | None = None,
-                processing: Callable[[dict], None] | None = None) -> dict:
+                processing: Callable[[dict], None] | None = None, *, document_id=None) -> dict:
+    private = work_dir / "private-model-responses" if settings.audit_private_responses else None
+    with model_audit.scope(document_id or pdf.stem, file_key(pdf), private):
+        try:
+            result = _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing)
+        except Exception:
+            save_execution_reports(work_dir, pdf.stem, {})
+            raise
+        if "execution_evidence" not in result:
+            save_execution_reports(work_dir, pdf.stem, result)
+        return result
+
+
+def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing):
     import pymupdf
     from rapidfuzz import fuzz
     t0 = time.time()
@@ -77,7 +92,7 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
         if processing:
             processing({"stage": name, "counts": dict(counts), **values})
 
-    fkey = file_key(pdf)
+    fkey = model_audit.current()["document_sha256"]
     try:
         doc = pymupdf.open(str(pdf))
     except Exception as e:
@@ -167,6 +182,7 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
                         if rec["lines"] and not d["rotation"]:
                             rec["lines"] = native.recover_running_text(page, rec["lines"], settings.header_band)
                 else:
+                    info.pop("selected_execution_ids", None)
                     rec["lines"] = native.extract_lines(page)
                     if info["requires_review"]:
                         d["reasons"].append("OCR requires manual review. The source page and any native text were retained.")
@@ -197,6 +213,7 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
                     rec["lines"] = nlines
                     audit.event("diagnostics", "compare", doc=doc_id, page=i + 1, similarity=round(sim, 3), ocr_conf=round(oconf, 1), chosen="ocr" if use_ocr else "native")
                 if use_ocr:
+                    d["ocr"]["selected_execution_ids"] = [] if cached else info.get("selected_execution_ids", [])
                     rec["lines"], rec["source"] = olines, "ocr"
                     if d["health"] != "absent":     # digital page with broken text: keep real figures
                         try: rec["figs"] = native.extract_figures(page, settings, [])
@@ -242,12 +259,12 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
             progress(i + 1, n)
         stage("extracted", page=i + 1)
     metadata = {key: value for key, value in (doc.metadata or {}).items() if value}
-    doc.close()
     router.close()
     # ---- Layout Reconstruction agent ------------------------------------------------------------------
     ctx = reconstruct.compute_context(raw, settings)
     ctx.lang = lang
     pages: list[PageIR] = []
+    geometry_packs = ocr.available_langs(settings) if any(item["blocks"] for item in raw) else set()
     try:
         for rp in raw:
             stage("layout", page=rp["n"])
@@ -274,8 +291,11 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
             layout_status, regions = layout.enrich(pdf, pg)
             pg.diag["layout"] = {"engine": "Docling" if layout_status == "applied" else "reconstruction",
                                  "status": layout_status, "regions": len(regions)}
+            if geometry := ocr_geometry.position_page(doc[pg.n - 1], pg, settings, geometry_packs):
+                pg.diag["layout"]["coordinate_alignment"] = geometry
+                audit.event("layout", "ocr_coordinate_alignment", page=pg.n, **geometry)
             pg.layout_engine = pg.diag["layout"]["engine"]
-            if regions:
+            if regions and settings.audit_private_responses:
                 report = work_dir / "recognition" / doc_id / f"page-{pg.n:04d}-docling.json"
                 report.parent.mkdir(parents=True, exist_ok=True)
                 report.write_text(json.dumps(regions, ensure_ascii=False), encoding="utf-8")
@@ -283,6 +303,9 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
                 if block.source == "ocr" and not block.ocr_engine:
                     block.ocr_engine = pg.ocr_engine
                     block.recognition_confidence = block.conf
+                if block.source == "ocr" and block.ocr_engine == pg.ocr_engine and ocr_info.get("selected_execution_ids"):
+                    for item in execution_reports.blocks([block]):
+                        item.source_reference.setdefault("execution_ids", ocr_info["selected_execution_ids"])
             pg.diag["confidence"] = page_confidence(pg)
             page_result = res["page_log"][pg.n - 1]
             page_result.update(layout=pg.diag["layout"], review_required=pg.requires_review,
@@ -291,31 +314,76 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
         counts["review"] = sum(page.requires_review for page in pages)
     finally:
         layout.close()
+        doc.close()
     dir_ = DocIR(doc_id=doc_id, path=str(pdf), lang=lang, pages=pages,
                  meta={"settings": settings.schema_profile, "pdf_metadata": metadata, "source_sha256": fkey,
                        "ocr_metadata_version": 2})
+    stage("validation")
+    return finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0)
+
+
+def refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, progress, processing):
+    previous = result.get("execution_evidence", {})
+    private = work_dir / "private-model-responses" if settings.audit_private_responses else None
+    with model_audit.scope(previous.get("document_id", saved_ir.doc_id),
+                           saved_ir.meta.get("source_sha256"), private) as trace:
+        trace["executions"].extend({**row, "historical": True} for row in previous.get("executions", []))
+        return _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, progress, processing)
+
+
+def _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, progress, processing):
+    """Reconcile only the saved OCR attempt for the same source file."""
+    import pymupdf
+
+    start = time.time()
+    if saved_ir.meta.get("source_sha256") != file_key(pdf):
+        raise ValueError("The source PDF changed. Run a new extraction.")
+    packs = ocr.available_langs(settings)
+    if not packs:
+        raise RuntimeError("Tesseract is unavailable for layout refresh.")
+    result["layout_refresh"] = True
+    with pymupdf.open(pdf) as source:
+        if len(source) != len(saved_ir.pages):
+            raise ValueError("The PDF and the saved extraction have different page counts.")
+        for page in saved_ir.pages:
+            processing({"stage": "layout", "page": page.n})
+            if geometry := ocr_geometry.position_page(source[page.n - 1], page, settings, packs):
+                page.diag.setdefault("layout", {})["coordinate_alignment"] = geometry
+                result["page_log"][page.n - 1]["layout"] = page.diag["layout"]
+                audit.event("layout", "ocr_coordinate_alignment", page=page.n, **geometry)
+            progress(page.n, len(saved_ir.pages))
+    processing({"stage": "validation"})
+    return finish_extraction(pdf, saved_ir, settings, out_dir, work_dir, audit, result, start)
+
+
+def finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0):
+    import pymupdf
+
+    doc_id, pages = dir_.doc_id, dir_.pages
     kinds.assign_kinds(dir_)
     profile = decorate_document(dir_)
+    dir_.meta["execution_trace_id"] = model_audit.current()["trace_id"]
+    execution_reports.anchor_ir(dir_, model_audit.current()["trace_id"])
     gate = quality_gate(dir_)
-    counts["review"] = len(gate["review_pages"])
+    res["processing_counts"]["review"] = len(gate["review_pages"])
     for page in pages:
         res["page_log"][page.n - 1].update(review_required=page.n in gate["review_pages"], language=page.language)
     res.update(document_profile=profile, multilingual_validation=gate)
     profile_dir = work_dir / "profiles" / doc_id
     profile_dir.mkdir(parents=True, exist_ok=True)
     write_report(profile_dir / "document_profile.json", profile)
-    stage("validation")
     dir_ = ir_from_dict(dir_.to_dict())
     # ---- XML Generation + QA agents -----------------------------------------------------------------------
     assets = {}
     locations = {}
     data = to_xml(dir_, settings, locations=locations, assets=assets if settings.schema_profile == "sample" else None)
-    val = validate_xml(data, n, settings)
+    val = validate_xml(data, len(pages), settings)
     if not val["well_formed"] or val["issues"]:
         audit.event("xml", "invalid", doc=doc_id, issues=val["issues"])
-        res.update(validation=val, error="Generated XML failed validation.")
+        res.update(ok=False, validation=val, error="Generated XML failed validation.")
         gate.update(status="processing_failed", xml={"status": "invalid", "issues": val["issues"]})
         write_report(profile_dir / "multilingual_validation_report.json", gate)
+        save_execution_reports(work_dir, doc_id, res, dir_)
         return res
     gate["xml"] = verify_unicode(data, dir_, locations)
     if gate["xml"]["unconfirmed_nodes"] and gate["status"] == "structural_validation_passed":
@@ -328,6 +396,7 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
                 asset_path.parent.mkdir(parents=True, exist_ok=True)
                 source_pdf[page - 1].get_pixmap(dpi=180, clip=pymupdf.Rect(box), alpha=False).save(asset_path)
     _write_xml(out_dir, pdf, data)
+    save_execution_reports(work_dir, doc_id, res, dir_, data, locations)
     ir_dir = work_dir / "ir"; ir_dir.mkdir(parents=True, exist_ok=True)
     (ir_dir / f"{doc_id}.json").write_text(json.dumps(dir_.to_dict(), ensure_ascii=False), encoding="utf-8")
     q = doc_quality(dir_, val)
@@ -335,6 +404,15 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
                ocr_pages=sum(1 for p in pages if p.source == "ocr"), source_counts={s: sum(1 for p in pages if p.source == s) for s in ("native", "ocr")})
     audit.event("xml", "written", doc=doc_id, seconds=res["seconds"], issues=val["issues"], ocr_pages=res["ocr_pages"])
     return res
+
+
+def save_execution_reports(work_dir, doc_id, result, ir=None, data=None, locations=None):
+    state = model_audit.current()
+    result["execution_evidence"] = {key: value for key, value in state.items() if key != "private"}
+    folder = work_dir / "execution-audit" / doc_id
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, report in execution_reports.reports(ir, result["execution_evidence"], data, locations).items():
+        write_report(folder / name, report)
 
 
 def _write_xml(out_dir: Path, pdf: Path, data: bytes):

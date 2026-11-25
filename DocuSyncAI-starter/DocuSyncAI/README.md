@@ -2,9 +2,19 @@
 
 A configurable document-processing pipeline for the Innodata AI Catalyst 2026 Employee Track.
 
+## Launch the DocuSync AI workspace
+
+Double-click [Start_DocuSync_AI.bat](Start_DocuSync_AI.bat) in this folder. It opens the browser workspace from
+the repository's `hackathon-project` folder. The shared launcher starts or reuses Ollama, checks and warms
+the configured models, and opens DocuSync AI when the workspace is ready. The **AI startup** panel shows
+installation, residency, inference checks, and model errors.
+
+The workspace uses `hackathon-project/.venv`, the optional `hackathon-project/.env`, and
+`hackathon-project/logs/startup.log`. See the [workspace setup, shutdown, and troubleshooting instructions](../../hackathon-project/README.md).
+
 ## Current status
 
-Phase 1 starter baseline only:
+The command-line entry point below runs the Phase 1 starter baseline:
 - Reads every `*.pdf` in an input folder.
 - Extracts native text blocks page by page using PyMuPDF.
 - Writes well-formed XML with one `<page n="...">` element per PDF page and paragraph blocks.

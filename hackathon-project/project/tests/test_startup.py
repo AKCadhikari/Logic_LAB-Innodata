@@ -137,16 +137,19 @@ def test_service_will_not_replace_port_or_launch_missing_executable(tmp_path, mo
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows launcher integration")
-def test_windows_click_twice_shutdown_and_restart(tmp_path):
+@pytest.mark.parametrize("entry", ["workspace", "starter"])
+def test_windows_click_twice_shutdown_and_restart(tmp_path, entry):
     port = free_port()
     storage, logs = tmp_path / "workspace", tmp_path / "logs"
     batch = ["cmd.exe", "/d", "/c", "Start_DocuSync_AI.bat"]
     ps = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "start_doc_sync.ps1"]
+    launcher_dir = (startup.ROOT if entry == "workspace" else
+                    startup.ROOT.parent / "DocuSyncAI-starter" / "DocuSyncAI")
     args = ["-NoBrowser", "-Port", str(port), "-Storage", str(storage), "-Logs", str(logs)]
     env = {**os.environ, "OLLAMA_STARTUP_ENABLED": "false"}
 
     def launch(command, extra=()):
-        result = subprocess.run([*command, *args, *extra], cwd=startup.ROOT, env=env,
+        result = subprocess.run([*command, *args, *extra], cwd=launcher_dir, env=env,
                                 capture_output=True, text=True, timeout=35)
         assert result.returncode == 0, result.stdout + result.stderr
 
@@ -158,13 +161,13 @@ def test_windows_click_twice_shutdown_and_restart(tmp_path):
         before = startup.read_json(logs / "owned-processes.json")["backend"]
         launch(batch)
         assert startup.read_json(logs / "owned-processes.json")["backend"] == before
-        launch(ps, ("-Action", "Restart"))
+        launch(ps if entry == "workspace" else batch, ("-Action", "Restart"))
         after = startup.read_json(logs / "owned-processes.json")["backend"]
         assert after != before
         assert startup.read_json(logs / "startup-status.json")["frontend_ready"]
     finally:
         if startup.port_open("127.0.0.1", port):
-            launch(ps, ("-Action", "Stop"))
+            launch(ps if entry == "workspace" else batch, ("-Action", "Stop"))
     assert not startup.port_open("127.0.0.1", port)
 
 

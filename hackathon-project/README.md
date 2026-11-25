@@ -99,6 +99,29 @@ Qwen3 review is enabled by default. Set `DOCUSYNC_OLLAMA_ENABLED=false` to disab
 
 ## Tests and benchmark
 
+### AI execution audit
+
+Open **AI startup** with a processed document selected to see which model requests were recorded and which
+responses reached a downstream consumer. Model availability and startup warm-ups are reported separately.
+The audit distinguishes native PyMuPDF extraction, Ollama inference, local PaddleOCR/Tesseract recognition,
+Docling layout, and deterministic processing of the IR, XML, and presentation.
+
+Download the three JSON reports from the audit panel. They are also included in dual exports. The execution
+report records observed requests, responses, timing and validation. The usage report counts real executions,
+and the processing trace links available source block IDs to the saved XML and verified PPTX edits. Document
+text and prompts are omitted from the audit reports. Set `DOCUSYNC_AUDIT_PRIVATE_RESPONSES=true` to keep raw
+responses in the local run folder for debugging. These files are excluded from the audit downloads and ZIP.
+Older attempts may show source methods without execution evidence. A fresh extraction records the model calls.
+
+To run live checks with fresh, synthetic inputs against the configured models:
+
+```powershell
+.\.venv\Scripts\python.exe -B project/execution_check.py --out storage/new-execution-check
+```
+
+The execution check distinguishes live model probes from the full pipeline run. Mock HTTP tests use the
+`MOCKED_TEST` label and are excluded from real usage totals.
+
 ```powershell
 .\.venv\Scripts\python.exe -B -m pytest -p no:cacheprovider project/tests -q
 .\.venv\Scripts\python.exe -B project\tests\benchmark.py --corpus "<path>\Hackathon-Internal-Track\Data" --out storage\windows-benchmark.json

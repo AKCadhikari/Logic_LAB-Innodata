@@ -72,6 +72,14 @@ def test_upload_review_export_compare_and_sync(workspace):
     assert client.get(old + "/pdf").data == old_data
     assert (root / doc["id"] / "source.pdf").exists()
     assert doc["pages"][0]["source"] == "native"
+    execution = client.get(new + "/execution-audit")
+    assert execution.status_code == 200
+    assert execution.json["model_usage_report.json"]["requests"] == 0
+    trace = execution.json["processing_trace.json"]
+    assert trace["pages"][0]["method"] == "NATIVE_EXTRACTION_USED"
+    assert trace["xml_sha256"] and any(block["xml_corresponds_to_ir"] for block in trace["blocks"])
+    download = client.get(new + "/execution-audit?report=ai_execution_report.json")
+    assert download.status_code == 200 and "attachment" in download.headers["Content-Disposition"]
     assert doc["processing_counts"] == {"required": 0, "glm_ocr": 0, "paddle_ocr": 0, "failed": 0, "review": 0}
     assert doc["title"]["bbox"] and doc["title"]["page"] == 1
     assert str(root) not in client.get(new).text

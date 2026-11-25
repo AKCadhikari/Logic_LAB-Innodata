@@ -6,6 +6,7 @@ from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from utils import execution_audit as audit
 
 
 class OllamaError(RuntimeError):
@@ -44,9 +45,14 @@ def request_json(url: str, path: str, payload: dict | None, timeout: int, *, det
                       headers={"Content-Type": "application/json"})
     opener = build_opener(ProxyHandler({}), NoRedirect())
     limit = 1024 * 1024
+    event = audit.active.get() if payload is not None else None
 
     def fetch():
+        if event is not None:
+            event.update(request_status="attempted", endpoint=f"http://{endpoint.netloc}{path}")
         with opener.open(request, timeout=timeout) as response:
+            if event is not None:
+                event.update(request_status="sent", http_status=response.status)
             return response.read(limit + 1)
 
     try:
@@ -56,6 +62,8 @@ def request_json(url: str, path: str, payload: dict | None, timeout: int, *, det
             with _inference:
                 raw = fetch()
     except HTTPError as error:
+        if event is not None:
+            event.update(request_status="sent", http_status=error.code, response_status="http_error")
         hints = {404: " Check that the configured model is installed.", 500: " Check the Ollama server log."}
         status = "unavailable" if error.code in {404, 503} else "error"
         reason = ""
@@ -73,18 +81,29 @@ def request_json(url: str, path: str, payload: dict | None, timeout: int, *, det
                               else "Ollama connection timed out.", "timeout") from error
         raise OllamaError("Ollama is unreachable. Start the local Ollama server.", "unavailable") from error
     try:
+        if event is not None:
+            event.update(response_status="received", response_sha256=audit.digest(raw))
         if len(raw) > limit:
             raise ValueError
         data = json.loads(raw)
         if not isinstance(data, dict) or data.get("error"):
             raise ValueError
     except ValueError as error:
+        if event is not None:
+            event["response_status"] = "invalid"
         raise OllamaError("Ollama returned an invalid or oversized response.") from error
+    if event is not None:
+        message = data.get("message")
+        returned_text = data.get("response") or (message.get("content") if isinstance(message, dict) else None)
+        audit.response(event, data, raw=raw, executed=bool(
+            data.get("model") and (data.get("eval_count", 0) or data.get("prompt_eval_count", 0) or returned_text)))
+        event.update(returned_model=data.get("model"), model_done=data.get("done"),
+                     performance={key: data[key] for key in audit.METRICS if key in data})
     return data
 
 
 def model_info(model: str, models: list, *, capability: str | None = None) -> dict:
-    target = model if ":" in model.rsplit("/", 1)[-1] else model + ":latest"
+    target = tagged_model(model)
     match = next((item for item in models if isinstance(item, dict) and item.get("name") == target
                   and not item.get("remote_host") and not item.get("remote_model")
                   and not target.casefold().endswith((":cloud", "-cloud"))), None)
@@ -95,6 +114,10 @@ def model_info(model: str, models: list, *, capability: str | None = None) -> di
         reason = f"Ollama model {model} does not support {capability}."
     return {"ready": reason is None, "model": model, "digest": match.get("digest") if match else None,
             "reason": reason}
+
+
+def tagged_model(name: str) -> str:
+    return name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
 
 
 def installed_models(data: dict) -> list:

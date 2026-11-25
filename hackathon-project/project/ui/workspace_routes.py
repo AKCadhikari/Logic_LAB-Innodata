@@ -241,6 +241,14 @@ def retry(document_id: str):
     return jsonify(ws.get(document_id)), 202
 
 
+@api.post("/documents/<document_id>/layout")
+def refresh_document_layout(document_id: str):
+    ws = workspace()
+    if not ws.enqueue(document_id, layout_only=True):
+        return fail("Layout refresh requires a completed extraction and an idle document.", 409)
+    return jsonify(ws.get(document_id)), 202
+
+
 @api.get("/documents/<document_id>/pdf")
 def pdf(document_id: str):
     ws = workspace()
@@ -310,7 +318,9 @@ def version_changes(document_id: str, previous_id: str, current=None, previous=N
             block = ir.pages[target["page"] - 1].blocks[target["idx"]]
             change["source"] = {"page": target["page"], "xml_node": locations.get(id(block)),
                                 "text": change["new_content"], "extraction": block.source,
-                                "ocr_engine": block.ocr_engine or None}
+                                "ocr_engine": block.ocr_engine or None,
+                                "block_id": block.source_reference.get("block_id"),
+                                "execution_ids": block.source_reference.get("execution_ids", [])}
     return changes
 
 
@@ -319,21 +329,66 @@ def compare(document_id: str):
     changes = version_changes(document_id, request.args.get("previous_id", ""))
     if changes is None:
         return fail("Choose two different processed documents.", 409)
+    if request.args.get("include_analysis") != "1":
+        return jsonify(changes)
     changes, analysis = assess_changes(document_id, changes)
-    return jsonify(changes=changes, analysis=analysis) if request.args.get("include_analysis") == "1" else jsonify(changes)
+    return jsonify(changes=changes, analysis=analysis)
+
+
+@api.get("/documents/<document_id>/execution-audit")
+def document_execution_audit(document_id: str):
+    from reporting.execution import reports
+    from xml_engine.serializer import to_xml
+
+    ws = workspace()
+    snapshot = ws.extracted(document_id, reviewed=False)
+    if snapshot is None:
+        return fail("Finish extraction before opening the execution audit.", 409)
+    ir, settings, result = snapshot
+    job = next(item for item in ws.get(document_id)["jobs"] if item["status"] == "completed")
+    folder = ws.source(document_id).parent
+    evidence = result.get("execution_evidence") or {}
+    comparisons = []
+    for file in sorted((folder / "comparison-audit").glob("*.json")):
+        record = json.loads(file.read_text(encoding="utf-8"))
+        if record.get("trace_id") == evidence.get("trace_id") or (
+                not evidence and record.get("document_sha256") == ir.meta.get("source_sha256")):
+            comparisons.append(record)
+    stored_xml = folder / str(job["id"]) / "output" / "source.xml"
+    locations = {}
+    to_xml(ir, settings, locations)
+    data = reports(ir, {**evidence, "executions": [*evidence.get("executions", []), *comparisons]},
+                   stored_xml.read_bytes() if stored_xml.is_file() else None, locations)
+    if name := request.args.get("report"):
+        if name not in data:
+            return fail("Unknown audit report.", 404)
+        return send_file(io.BytesIO(json.dumps(data[name], ensure_ascii=False, indent=2).encode("utf-8")),
+                         mimetype="application/json", as_attachment=True, download_name=name)
+    return jsonify(data)
 
 
 def assess_changes(document_id: str, changes: list[dict]) -> tuple[list[dict], dict]:
     ws = workspace()
     audit = ws.source(document_id).parent / "comparison.jsonl"
-    return ws.worker.submit(run_assessment, changes, ws.settings, audit).result()
+    ir, _, extraction = ws.extracted(document_id)
+    return ws.worker.submit(run_assessment, changes, ws.settings, audit, document_id, ir.meta.get("source_sha256"),
+                            extraction.get("execution_evidence", {}).get("trace_id")).result()
 
 
-def run_assessment(changes, settings, audit_path):
+def run_assessment(changes, settings, audit_path, document_id=None, source_hash=None, trace_id=None):
     from comparison.ollama import annotate
     from utils.logs import AuditLog
+    from utils.execution_audit import scope
+    from reporting.exports import write_report
 
-    return changes, annotate(changes, settings, AuditLog(audit_path))
+    with scope(document_id, source_hash,
+               audit_path.parent / "private-model-responses" if settings.audit_private_responses else None, trace_id):
+        analysis = annotate(changes, settings, AuditLog(audit_path))
+        if record := analysis.get("execution"):
+            folder = audit_path.parent / "comparison-audit"
+            folder.mkdir(parents=True, exist_ok=True)
+            write_report(folder / (record["execution_id"] + ".json"), record)
+        return changes, analysis
 
 
 def export_root(document_id: str) -> Path:

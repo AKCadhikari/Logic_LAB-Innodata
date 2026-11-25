@@ -17,6 +17,7 @@ from quality.conformance import tree
 from lxml import etree
 from xml_engine.serializer import to_xml
 from xml_engine.validate import validate_xml, verify_unicode
+from reporting.execution import reports as execution_reports
 
 
 def output_stem(filename: str) -> str:
@@ -91,6 +92,8 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
               "status": "failed", "xml_profile": settings.schema_profile}
     assets = {}
     corrections = []
+    audited_edits = []
+    verification_executions = []
     quality = extraction.get("multilingual_validation", {})
     staged = xml_path.with_suffix(".tmp")
     try:
@@ -144,11 +147,14 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
             validation["pptx"].update(valid=True, slides=slide_count)
             validation["pptx"]["slide_numbering"] = presentation.get("slide_numbering", [])
             quality = {**quality, "presentation": presentation_language_report(deck_path)}
-            result.update({key: value for key, value in presentation.items() if key not in {"status", "records"}})
+            result.update({key: value for key, value in presentation.items()
+                           if key not in {"status", "records", "verification_executions"}})
             records = presentation.get("records")
             if records is None:
                 records = [*({**item, "action": "applied"} for item in presentation["applied"]),
                            *({**item, "action": "review"} for item in presentation["review"])]
+            audited_edits = [item for item in records if item.get("action") == "applied"]
+            verification_executions = presentation.get("verification_executions", [])
             corrections = [correction_record(report["document_id"], item) for item in records]
             result["presentation_status"] = presentation["status"]
             result["status"] = "completed"
@@ -166,14 +172,16 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         "ocr_report.json": {"summary": extraction.get("processing_counts"), "pages": extraction.get("page_log", [])},
         "validation_report.json": validation,
         "correction_report.json": {"document_id": report["document_id"], "corrections": corrections},
-        "ai_execution_report.json": {
-            "ocr": [{"page": page["page"], "attempts": page.get("ocr", {}).get("attempts", [])}
-                    for page in extraction.get("page_log", [])],
-            "semantic_comparison": result.get("analysis"),
-        },
         "document_profile.json": extraction.get("document_profile", {}),
         "multilingual_validation_report.json": quality,
     }
+    evidence = extraction.get("execution_evidence", {})
+    evidence = {**evidence, "executions": [*evidence.get("executions", []), *verification_executions]}
+    reports.update(execution_reports(ir, evidence,
+                                     xml_path.read_bytes() if outputs["xml"] else None,
+                                     locations if outputs["xml"] else None,
+                                     edits=audited_edits, analysis=result.get("analysis"),
+                                     pptx=deck_path if outputs["pptx"] else None))
     if result["status"] == "completed":
         archive = folder / f"{stem}.zip"
         temp_zip = archive.with_suffix(".tmp")

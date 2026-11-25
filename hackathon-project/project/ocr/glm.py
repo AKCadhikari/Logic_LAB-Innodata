@@ -11,6 +11,7 @@ from config.settings import Settings
 from layout.model import Block, Cell, Span
 from ocr.recognition import Recognition, RecognitionError
 from utils import ollama
+from utils import execution_audit as audit
 
 
 def request_json(settings: Settings, path: str, payload: dict | None = None) -> dict:
@@ -181,8 +182,15 @@ def recognise_image(image: bytes, page: int, settings: Settings, mode: Recogniti
                "options": {"temperature": 0, "num_gpu": 0,
                            "num_ctx": max(8192, settings.glm_ocr_tokens + 4096),
                            "num_predict": settings.glm_ocr_tokens}}
-    data = request_json(settings, "/api/generate", payload)
-    result = parse(page, data)
+    with audit.execution("page_ocr", "ollama", settings.glm_ocr_model, page=page, input_type="rendered_png",
+                         input_sha256=audit.digest(image), input_reference=f"pdf/page/{page}/render",
+                         prompt_template=f"glm-ocr/{mode}/v1") as event:
+        data = request_json(settings, "/api/generate", payload)
+        result = parse(page, data)
+        if isinstance(data.get("model"), str) and ollama.tagged_model(data["model"]) != ollama.tagged_model(settings.glm_ocr_model):
+            result.issues.append("Ollama returned a different model identity.")
+        if event:
+            result.execution_ids.append(event["execution_id"])
     if mode == "table" and not any(block.tag == "table" for block in result.blocks):
         result.issues.append("GLM-OCR did not return a recognised table.")
     if mode == "formula" and not any(block.kind == "equation" for block in result.blocks):

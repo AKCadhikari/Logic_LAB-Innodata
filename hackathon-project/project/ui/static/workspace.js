@@ -169,13 +169,38 @@ function workspaceViewer() {
             '" ' + color + '><title>' + esc(label) + '</title></rect>';
     };
     if (S.vtab === "zoning" || S.vtab === "order") {
-        overlay = page.blocks.filter(block => block.bbox).map(block => {
+        const positioned = page.blocks.filter(block => block.bbox);
+        const legend = $("#legend");
+        legend.hidden = false;
+        legend.textContent = positioned.length ?
+            positioned.length + " of " + page.blocks.length + " blocks located on the page" :
+            "No verified layout coordinates are available for this page.";
+        if (page.source === "ocr" && (positioned.length < page.blocks.length || !page.diag.layout?.coordinate_alignment)
+            && !["queued", "running"].includes(doc.jobs[0].status)) {
+            const refresh = document.createElement("button");
+            refresh.className = "btn";
+            refresh.textContent = "Refresh layout";
+            refresh.onclick = async () => {
+                refresh.disabled = true;
+                try {
+                    await workspaceFetch(docUrl() + "/layout", {method: "POST"});
+                    await selectWorkspace(doc.id, false);
+                } catch (error) {
+                    showError(error);
+                    refresh.disabled = false;
+                }
+            };
+            legend.append(" ", refresh);
+        }
+        overlay = positioned.map(block => {
             const [x, y] = block.bbox;
             const color = col(block.tag);
             return S.vtab === "zoning" ? rectangle(block.bbox, 'fill="' + color + '" fill-opacity=".17" stroke="' +
-                color + '"', block.kind || block.tag) :
-                '<circle cx="' + x + '" cy="' + (y + 8) + '" r="10" fill="' + color + '"/><text x="' + x +
-                '" y="' + (y + 12) + '" text-anchor="middle" fill="white">' + (block.reading_order || block.i + 1) + '</text>';
+                color + '"', block.kind || block.tag) : '<g><title>' + esc((block.reading_order || block.i + 1) +
+                " · " + (block.text || block.kind || block.tag).slice(0, 120)) + '</title>' +
+                '<circle cx="' + Math.max(13, x - 12) + '" cy="' + (y + 8) + '" r="10" fill="' + color +
+                '"/><text x="' + Math.max(13, x - 12) + '" y="' + (y + 12) +
+                '" text-anchor="middle" font-size="11" fill="white">' + (block.reading_order || block.i + 1) + '</text></g>';
         }).join("");
     }
     if (W.highlight && S.vtab === "pdf" && !S.rot) {
@@ -463,14 +488,45 @@ $("#batch").onclick = async () => {
 };
 let startupRefresh;
 
+async function loadDocumentAudit(startup) {
+    const panel = $("#document-ai-audit"), id = S.id;
+    if (W.batch || !id || !S.data?.pages) {
+        panel.textContent = "Select a processed document to see its inference history.";
+        return;
+    }
+    const endpoint = docUrl() + "/execution-audit";
+    try {
+        const data = await workspaceFetch(endpoint);
+        if (id !== S.id) return;
+        const usage = data["model_usage_report.json"], history = data["ai_execution_report.json"].executions;
+        const counts = [
+            usage.requests + " requests", usage.responses + " responses", usage.failures + " failures or rejections",
+            usage.fallback_executions + " fallback executions", usage.used_responses + " responses used downstream",
+            usage.ocr_pages + " OCR pages", usage.native_pages + " native pages"
+        ];
+        const inventory = (startup?.models || []).map(model => {
+            const status = [];
+            if (model.installed === true) status.push("INSTALLED");
+            if (model.installed === true && startup.services?.some(service => service.url === model.url && service.healthy)) status.push("AVAILABLE");
+            if (model.loaded === true) status.push("LOADED");
+            if (status.includes("AVAILABLE") && !usage.executed_models[model.name]) status.push("AVAILABLE_NOT_EXECUTED");
+            return '<div>' + esc(model.name + ' · ' + (status.join(" · ") || "Unverified")) + '</div>';
+        }).join("");
+        const downloads = Object.keys(data).map(name => '<a class="workspace-link" href="' + endpoint +
+            '?report=' + encodeURIComponent(name) + '">' + esc(name) + '</a>').join(" · ");
+        panel.innerHTML = '<h4>Selected document</h4><p>' + esc(counts.join(" · ")) + '</p>' + inventory + '<p>' + downloads + '</p>' +
+            (history.length ? history.map(record => '<div class="card"><strong>' + esc(record.model) + '</strong>' +
+                '<div>' + esc(record.task + (record.page ? " · Page " + record.page : "") +
+                " · " + record.duration_ms + " ms") + '</div><div>' + esc(record.statuses.join(" · ")) +
+                '</div><small>' + esc(record.execution_id) + '</small></div>').join("") :
+                '<p>No verified model executions are recorded for this attempt. Check the page trace for its extraction methods.</p>');
+    } catch (error) {
+        if (id === S.id) panel.textContent = error.message;
+    }
+}
+
 async function loadStartupStatus() {
     const details = $("#startup-details"), retry = $("#startup-retry"), indicator = $("#startup-button");
-    const documentAttempts = (S.data?.pages || []).flatMap(page => page.diag?.ocr?.attempts || []);
-    const glmCalls = documentAttempts.filter(attempt => attempt.document_inference_attempted === true).length;
-    const qwen = W.changes?.analysis?.document_inference_attempted;
-    $("#document-ai-audit").textContent = S.data?.pages ?
-        "Selected document · GLM-OCR requests recorded " + glmCalls +
-        (qwen ? " · Qwen document review requested" : "") : "Select a processed document to check its inference activity.";
     clearTimeout(startupRefresh);
     try {
         const report = await workspaceFetch("/api/startup");
@@ -504,6 +560,7 @@ async function loadStartupStatus() {
             }).join("");
         retry.disabled = checking;
         if ($("#settings-dialog").open || checking) startupRefresh = setTimeout(loadStartupStatus, checking ? 1200 : 15000);
+        return report;
     } catch (error) {
         details.textContent = error.message;
         retry.disabled = false;
@@ -525,7 +582,7 @@ $("#startup-retry").onclick = async () => {
 
 $("#settings").onclick = () => {
     $("#settings-dialog").showModal();
-    loadStartupStatus();
+    loadStartupStatus().then(loadDocumentAudit);
     $("#settings-info").textContent = "Checking local processing settings…";
     $("#profile-status").textContent = "";
     const name = $("#profile-name"), save = $("#profile-form button");

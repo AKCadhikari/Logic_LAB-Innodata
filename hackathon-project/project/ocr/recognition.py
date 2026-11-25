@@ -20,6 +20,7 @@ class Recognition:
     raw: dict = field(default_factory=dict)
     issues: list[str] = field(default_factory=list)
     confidence: float | None = None
+    execution_ids: list[str] = field(default_factory=list)
 
     def text(self) -> str:
         def content(block: Block) -> str:

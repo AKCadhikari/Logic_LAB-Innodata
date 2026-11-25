@@ -12,6 +12,7 @@ from ocr import engine as tess, glm, paddle
 from ocr.quality import validate_recognition
 from ocr.recognition import Recognition, RecognitionError
 from utils.textutil import ISO_TO_TESS, REQUIRED_LANGUAGES, language_profile, norm_cmp
+from utils import execution_audit as audit
 
 
 class OCRRouter:
@@ -36,6 +37,7 @@ class OCRRouter:
                 result = None
                 failure_status = "rejected"
                 inference_attempted = False
+                audit_start = audit.cursor()
                 try:
                     if engine == "glm-ocr":
                         if self.glm_status is None:
@@ -43,13 +45,19 @@ class OCRRouter:
                         if not self.glm_status["ready"]:
                             raise RecognitionError(self.glm_status["reason"], unavailable=True)
                         inference_attempted = True
-                        result = glm.recognise(page, dpi, self.settings)
+                        with audit.details(model_digest=self.glm_status.get("digest")):
+                            result = glm.recognise(page, dpi, self.settings)
                     elif engine == "paddleocr":
                         if language == "und" and observed.get("glm-ocr"):
                             language = language_profile(observed["glm-ocr"])["language"]
-                        result = self.paddle.recognise(page, language, dpi)
+                        previous = attempts[-1]["status"]
+                        reason = ("GLM-OCR requires independent corroboration" if provisional
+                                  else f"GLM-OCR {previous}")
+                        with audit.details(fallback_reason=reason):
+                            result = self.paddle.recognise(page, language, dpi)
                     else:
-                        result = self._tesseract(page, language, dpi, diag, observed.get("glm-ocr", ""))
+                        with audit.details(fallback_reason=f"PaddleOCR {attempts[-1]['status']}"):
+                            result = self._tesseract(page, language, dpi, diag, observed.get("glm-ocr", ""))
                     issues = validate_recognition(result, page_number, diag, self.settings)
                     observed[engine] = result.text()
                     expected = diag.get("native_language", {})
@@ -67,10 +75,18 @@ class OCRRouter:
                     model = result.raw.get("model") or model
                 attempt = {"engine": engine, "model": model, "status": "accepted" if not issues else failure_status,
                            "issues": issues, "seconds": round(time.monotonic() - started, 2)}
+                ids = audit.ids_since(audit_start)
+                validation_ids = result.execution_ids if engine == "tesseract" and result else ids
+                audit.mark(validation_ids, validation="rejected" if issues else "passed",
+                           validation_issue_count=len(issues))
+                if ids:
+                    attempt["execution_ids"] = ids
+                if result is not None and not result.execution_ids and engine != "tesseract":
+                    result.execution_ids = ids
                 if engine == "glm-ocr":
                     attempt["document_inference_attempted"] = inference_attempted
                 attempts.append(attempt)
-                if result is not None:
+                if result is not None and self.settings.audit_private_responses:
                     try:
                         self._save(result, len(attempts))
                     except OSError:
@@ -79,7 +95,7 @@ class OCRRouter:
                     profile = language_profile(result.text(), language)
                     info = {"engine": engine, "status": "accepted", "attempts": attempts,
                             "confidence": result.confidence, "requires_review": False,
-                            "model": model, "language": profile}
+                            "model": model, "language": profile, "selected_execution_ids": result.execution_ids}
                     if engine == "tesseract":
                         info.update({key: result.raw.get(key) for key in ("rotate", "skew", "langs")})
                     moderate_language = profile["language"] != "und" and profile["confidence"] < .6
@@ -118,14 +134,15 @@ class OCRRouter:
             if language == "und" and profile["script"] == "arab":
                 language = "ar"  # Independent Arabic-script trial. The result still requires review.
         if language == "und" and "osd" in self.tess_packs and diagnostics.get("image_coverage", 0) >= 0.4:
-            _, script, confidence = tess.detect_orientation(tess.render_gray(page, min(dpi, 155)), self.settings)
+            with audit.details(page=page.number + 1):
+                _, script, confidence = tess.detect_orientation(tess.render_gray(page, min(dpi, 155)), self.settings)
             language = {"Arabic": "ar", "Japanese": "ja", "Hangul": "ko"}.get(script, "und") if confidence >= 2 else "und"
         if language not in REQUIRED_LANGUAGES or ISO_TO_TESS[language] not in self.tess_packs:
             raise RecognitionError("No independently tested Tesseract pack matches this page.", unavailable=True)
         lines, raw = tess.ocr_page(page, language, dpi, self.settings, self.tess_packs)
         confidence = sum(line.conf for line in lines) / len(lines) if lines else None
         return Recognition(page.number + 1, "tesseract", lines=lines, raw={**raw, "model": ISO_TO_TESS[language]},
-                           confidence=confidence)
+                           confidence=confidence, execution_ids=raw.get("selected_execution_ids", []))
 
     def _save(self, result: Recognition, attempt: int) -> None:
         self.evidence.mkdir(parents=True, exist_ok=True)

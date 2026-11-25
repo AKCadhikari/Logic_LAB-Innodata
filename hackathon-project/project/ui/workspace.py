@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import BinaryIO
 from uuid import uuid4
 
-from agents.orchestrator import process_pdf
+from agents.orchestrator import process_pdf, refresh_layout
 from config.settings import Settings
 from layout.model import Block, DocIR, ir_from_dict
 from utils.logs import AuditLog
@@ -143,13 +143,21 @@ class Workspace:
             document.pop("owner")
             return {**document, "jobs": public_jobs, "review": dict(review) if review else None}
 
-    def enqueue(self, document_id: str) -> bool:
+    def enqueue(self, document_id: str, *, layout_only: bool = False) -> bool:
         with self.db() as db:
+            previous = None
+            if layout_only:
+                previous = db.execute("""SELECT id, settings FROM jobs WHERE document_id=? AND status='completed'
+                                         ORDER BY id DESC LIMIT 1""", (document_id,)).fetchone()
+                if previous is None:
+                    return False
             job = self._create_job(db, document_id)
             if job is None:
                 return False
+            if previous is not None:
+                db.execute("UPDATE jobs SET settings=? WHERE id=?", (previous["settings"], job))
             db.execute("UPDATE documents SET approved=0 WHERE id=?", (document_id,))
-        self._submit(document_id, job)
+        self._submit(document_id, job, previous["id"] if previous is not None else None)
         return True
 
     def _create_job(self, db: sqlite3.Connection, document_id: str) -> int | None:
@@ -160,9 +168,9 @@ class Workspace:
         """, (document_id, now(), json.dumps(self.settings.to_dict()), document_id))
         return cursor.lastrowid if cursor.rowcount else None
 
-    def _submit(self, document_id: str, job: int) -> None:
+    def _submit(self, document_id: str, job: int, layout_from: int | None = None) -> None:
         try:
-            future = self.worker.submit(self._process, self.root, document_id, job)
+            future = self.worker.submit(self._process, self.root, document_id, job, layout_from)
         except RuntimeError:
             self._worker_failed(job)
         else:
@@ -178,10 +186,12 @@ class Workspace:
                        (now(), "The processing worker stopped. Restart the workspace and retry.", job))
 
     @staticmethod
-    def _process(root: Path, document_id: str, job: int) -> None:
+    def _process(root: Path, document_id: str, job: int, layout_from: int | None = None) -> None:
         run = root / document_id / str(job)
         with connect(root) as db:
             settings_json = db.execute("SELECT settings FROM jobs WHERE id=?", (job,)).fetchone()[0]
+            previous_result = (db.execute("SELECT result FROM jobs WHERE id=? AND document_id=? AND status='completed'",
+                                          (layout_from, document_id)).fetchone() if layout_from is not None else None)
             db.execute("UPDATE jobs SET status='running', started=? WHERE id=?", (now(), job))
         settings = Settings(**json.loads(settings_json))
 
@@ -196,8 +206,18 @@ class Workspace:
         result = {}
         error = None
         try:
-            result = process_pdf(run.parent / "source.pdf", settings, run / "output", run,
-                                 AuditLog(run / "audit.jsonl"), progress=progress, processing=processing)
+            audit = AuditLog(run / "audit.jsonl")
+            if layout_from is not None:
+                old_ir = run.parent / str(layout_from) / "ir" / "source.json"
+                if previous_result is None:
+                    raise ValueError("The saved OCR attempt is unavailable.")
+                ir = ir_from_dict(json.loads(old_ir.read_text(encoding="utf-8")))
+                audit.event("layout", "refresh_started", previous_attempt=layout_from)
+                result = refresh_layout(run.parent / "source.pdf", ir, settings, run / "output", run, audit,
+                                        json.loads(previous_result[0]), progress, processing)
+            else:
+                result = process_pdf(run.parent / "source.pdf", settings, run / "output", run, audit,
+                                     progress=progress, processing=processing, document_id=document_id)
             if result.get("validation", {}).get("issues"):
                 error = "The extracted document failed XML validation."
             elif not result["ok"]:
@@ -206,8 +226,11 @@ class Workspace:
                          else "The PDF could not be processed. Check that the original opens.")
             elif any(page["health"] == "error" for page in result["page_log"]):
                 error = "One or more PDF pages could not be read."
+        except (ValueError, RuntimeError) as failure:
+            logging.getLogger(__name__).exception("Processing failed for document %s, job %s", document_id, job)
+            error = str(failure) if layout_from is not None else "Processing failed. Check the local runtime and retry."
         except Exception:
-            logging.getLogger(__name__).error("Processing failed for document %s, job %s", document_id, job)
+            logging.getLogger(__name__).exception("Processing failed for document %s, job %s", document_id, job)
             error = "Processing failed. Check the local runtime and retry."
         with connect(root) as db:
             db.execute("UPDATE jobs SET status=?, finished=?, error=?, result=? WHERE id=?",

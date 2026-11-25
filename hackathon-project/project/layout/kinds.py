@@ -1,9 +1,8 @@
-"""Semantic `kind` attribute (bonus marks in the brief) + per-block language tagging."""
+"""Assign semantic kinds using document structure and typography."""
 from __future__ import annotations
 import re
 from statistics import median
 from layout.model import DocIR, Block
-from utils.textutil import detect_lang, script_counts
 
 R = lambda p: re.compile(p, re.I)
 ABSTRACT = R(r"^\W*(abstract|resumen|résumé|resume|zusammenfassung|samenvatting|riassunto|abstrakt|souhrn|súhrn|ملخص|الملخص|要旨|概要|초록|요약)\b")
@@ -13,6 +12,7 @@ KEYW = R(r"^\W*(key\s?words?|index terms|schlüsselwörter|schlagwörter|mots[- 
 RIGHTS = R(r"(©|\(c\)|copyright|all rights reserved|licen[cs]e|creative commons|cc[- ]by)")
 PUBMETA = R(r"(issn|isbn|doi\b|doi\.org|\bvol(ume)?\.?\s*\d|\bissue\b|journal of|received:|accepted:|published:|proceedings)")
 AFFIL = R(r"(universit|institut|department|faculty|college|school of|laborator|hospital|academy|centre|center|@|université|universität|hochschule|جامعة|كلية|大学|研究所|대학)")
+NUMBERED_HEADING = re.compile(r"^(\d+(?:\.\d+){0,4})\s+[A-Z][^\n.:!?]{2,90}$")
 
 
 def _pick_title(doc: DocIR):
@@ -46,7 +46,9 @@ def assign_kinds(doc: DocIR) -> None:
                     similar_size = abs(nb.size - chosen.size) < 0.1 * chosen.size
                     short_centered = (centers_close and 0.78 * chosen.size <= nb.size
                                       and 1 <= len(nb.text.split()) <= 7 and not nb.text.endswith((".", ":")))
-                    if nb.tag == "p" and (similar_size or short_centered) and 0 <= nb.bbox[1] - chosen.bbox[3] < 1.5 * chosen.size:
+                    if (nb.tag == "p" and nb.writing_mode == chosen.writing_mode and (similar_size or short_centered)
+                            and 0 <= nb.bbox[1] - chosen.bbox[3] < 1.5 * chosen.size):
+                        chosen.original_text = "\n".join((chosen.original_text or chosen.text, nb.original_text or nb.text))
                         chosen.text = (chosen.text + " " + nb.text).strip(); chosen.bbox = (min(chosen.bbox[0], nb.bbox[0]), chosen.bbox[1], max(chosen.bbox[2], nb.bbox[2]), nb.bbox[3])
                         chosen.spans = []; page.blocks.remove(nb); break
                 break
@@ -59,6 +61,9 @@ def assign_kinds(doc: DocIR) -> None:
                 b.kind = "figure_caption" if False else b.kind
                 continue
             txt = b.text or " ".join(c.text for c in b.children)
+            number = NUMBERED_HEADING.fullmatch(txt.strip()) if b.tag == "p" and b.source == "ocr" else None
+            if number and len(txt.split()) <= 12 and b.kind != "equation":
+                b.tag = f"h{2 + number[1].count('.')}"
             if b.tag == "p" and len(txt.split()) <= 3 and (REFS.match(txt) or ACK.match(txt)) and len(txt) < 32:
                 b.tag = "h2"
             elif section == "references" and not (REFS.match(txt) or ACK.match(txt)):
@@ -72,7 +77,7 @@ def assign_kinds(doc: DocIR) -> None:
             if b.tag.startswith("h"):
                 if b is chosen:
                     title_done = True; section = "front"; continue
-                if chosen is None and pi == 0 and not title_done:
+                if chosen is None and pi == 0 and not title_done and not number and not ABSTRACT.match(txt):
                     b.tag, b.kind, title_done = "h1", "title", True
                     section = "front"; continue
                 b.kind = "section_heading"
@@ -102,20 +107,3 @@ def assign_kinds(doc: DocIR) -> None:
                 it.kind = k
             if b.tag in ("ul", "ol"):
                 b.kind = items[0].kind if items else "body"
-    # per-block language (cross-script differences, or long Latin blocks differing from the doc language)
-    for page in doc.pages:
-        for b in page.blocks:
-            items = b.children if b.tag in ("ul", "ol") else [b]
-            for it in items:
-                t = it.text or ""
-                if len(t) < 30 or it.tag in ("table", "figure"):
-                    continue
-                sc = script_counts(t); tot = sum(sc.values()) or 1
-                lg = detect_lang(t)
-                if lg == "und" or lg == doc.lang:
-                    continue
-                cross = (lg in ("ar", "ja", "ko")) != (doc.lang in ("ar", "ja", "ko")) or (lg in ("ar", "ja", "ko") and doc.lang in ("ar", "ja", "ko") and lg != doc.lang)
-                if cross and tot >= 20:
-                    it.lang = lg
-                elif not cross and len(t) >= 150 and lg != doc.lang and doc.lang not in ("ar", "ja", "ko"):
-                    it.lang = lg

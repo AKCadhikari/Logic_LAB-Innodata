@@ -14,13 +14,13 @@ app or run `ollama serve` if the server is stopped.
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r project\requirements.txt
 ollama list
-ollama pull glm-ocr:q8_0
 .\.venv\Scripts\python.exe -B project\ui\server.py
 ```
 
 Open `http://127.0.0.1:8765`. The local `/api/health` endpoint shows the configured models and
-their readiness checks. GLM-OCR receives a page image through Ollama's vision API with the `Text Recognition:`
-prompt. The adapter preserves the raw reply and parses text, tables, and formulas. Page numbers come
+their readiness checks. GLM-OCR receives a page image through `/api/generate` with the `Text Recognition:`
+prompt. The adapter preserves the raw reply and parses text, tables, and formulas. The image service
+also accepts table and formula crops with their respective recognition prompts. Page numbers come
 from the app. Recognition confidence and region coordinates are nullable because the Ollama response
 provides text without those fields. [Ollama model](https://ollama.com/library/glm-ocr) ·
 [GLM-OCR Ollama guide](https://github.com/zai-org/GLM-OCR/blob/main/examples/ollama-deploy/README.md)
@@ -79,17 +79,38 @@ XML validation is required for downstream processing. Use `--profile sample` for
 hierarchy. The UI and CLI default to the written brief profile. See the
 [official sample validation](../../docs/OFFICIAL_SAMPLE_VALIDATION.md) for known differences.
 
-Comparison and PowerPoint changes keep PDF page and XML references. Uncertain edits go to review.
+Version comparison and PowerPoint sync keep PDF page and XML references. The workspace sends up to four
+prioritized changes per request to Qwen via `/api/chat` at temperature zero. It checks the JSON against
+a Pydantic schema and uses the returned classifications to display advisory review explanations.
+Numerical values displayed alongside the suggestions come from the deterministic comparison. The
+existing source and slide matching rules govern which edits can be applied.
 Tesseract can independently corroborate source text during deck repair. Install Tesseract with your source
 language packs and set `TESSERACT_CMD` if required. The explicit legacy extraction backend is available
 through `--ocr-backend tesseract`.
 
-Settings accept a JSON file through `--config` or a `DOCUSYNC_` environment variable. Runtime controls
-include `GLM_OCR_TIMEOUT_S`, `GLM_OCR_RETRIES`, `GLM_OCR_MAX_EDGE`, `PADDLE_OCR_TIMEOUT_S`,
-`DOCLING_TIMEOUT_S`, and the OCR thresholds in `project/config/settings.py`. The CPU profile processes
-one document at a time by default. The workspace supports retrying a completed or failed job.
+These PowerShell environment variables override the JSON configuration and the older per-service settings.
+
+```powershell
+$env:OLLAMA_BASE_URL = 'http://localhost:11434'
+$env:GLM_OCR_MODEL = 'glm-ocr:q8_0'
+$env:QWEN_MODEL = 'qwen3:4b'
+$env:OLLAMA_TIMEOUT = '300'
+$env:OLLAMA_KEEP_ALIVE = '0'
+```
+
+These are the defaults. A keep-alive of `0` requests immediate unloading after inference. Omit the shared
+override to use different durations through `DOCUSYNC_GLM_OCR_KEEP_ALIVE` and
+`DOCUSYNC_OLLAMA_KEEP_ALIVE`. Set `DOCUSYNC_OLLAMA_ENABLED=false` to disable Qwen review.
+Runtime controls also include `DOCUSYNC_GLM_OCR_RETRIES`, `DOCUSYNC_GLM_OCR_MAX_EDGE`,
+`DOCUSYNC_PADDLE_OCR_TIMEOUT_S`, and `DOCUSYNC_DOCLING_TIMEOUT_S`, along with the OCR thresholds in
+`project/config/settings.py`. The CPU profile processes one document at a time by default.
+The workspace supports retrying a completed or failed job.
 
 ```powershell
 .\.venv\Scripts\python.exe -B -m pytest -p no:cacheprovider project/tests -q
 .\.venv\Scripts\python.exe -B project\sample_check.py --help
 ```
+
+To compare the installed GLM-OCR variants, run the [official sample command](../../docs/OFFICIAL_SAMPLE_VALIDATION.md#reproduce)
+with `GLM_OCR_MODEL=glm-ocr:q8_0` and then with `GLM_OCR_MODEL=glm-ocr:latest`, using a fresh output
+directory each time. Compare per-page attempts and OCR times in `summary.json` alongside XML and deck scores.

@@ -41,11 +41,13 @@ def sample_blocks(blocks: list[Block]):
 
 
 def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None) -> bytes:
-    from xml_engine.serializer import _emit, _inline
+    from xml_engine.serializer import _emit, _inline, direction_attributes
 
-    root = etree.Element("document", lang=lang_attr(doc.lang, "name"), reading_order_layout_source="corrected")
+    root = etree.Element("document", lang=lang_attr(doc.lang, "name"), reading_order_layout_source="corrected",
+                         **direction_attributes(doc.language))
     header = etree.SubElement(root, "header")
-    title = next((block.text for page in doc.pages for block in page.blocks if block.kind == "title"), "")
+    title = next((block.text for page in doc.pages for block in page.blocks if block.kind == "title"),
+                 doc.meta.get("pdf_metadata", {}).get("title", ""))
     if title:
         etree.SubElement(header, "title").text = xml_safe(title)
     body = etree.SubElement(root, "body")
@@ -55,7 +57,7 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
     front = True
     top_number = 0
     last_reference = None
-    name = Path(doc.path).stem or doc.doc_id
+    name = doc.meta.get("asset_stem") or Path(doc.path).stem or doc.doc_id
 
     def section(depth, kind, level):
         while sections and sections[-1][0] >= depth:
@@ -78,7 +80,7 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
         return {key: f"{value:.2f}" for key, value in zip(("x0", "y0", "x1", "y1"), box)} if box else {}
 
     def text_attributes(block, page, prefix, kind):
-        attributes = {"page": str(page.n), "id": identifier(prefix)}
+        attributes = {"page": str(page.n), "id": identifier(prefix), **direction_attributes(block.language)}
         if kind:
             attributes["kind"] = kind
         if block.lang and block.lang != doc.lang:
@@ -86,7 +88,10 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
         if block.bbox:
             attributes.update(geometry(block.bbox))
             x0, _, x1, _ = block.bbox
-            attributes["align"] = "center" if abs(x0 + x1 - page.width) < page.width * 0.025 else "left"
+            if abs(x0 + x1 - page.width) < page.width * 0.025:
+                attributes["align"] = "center"
+            else:
+                attributes["align"] = "right" if block.language.get("base_direction") == "rtl" else "left"
         if block.size > 0:
             attributes["font_size"] = f"{block.size:.1f}"
         return attributes
@@ -108,7 +113,11 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
     for page in doc.pages:
         if page.n > 1:
             front = False
-        etree.SubElement(parent(), "page", num=str(page.n), height=f"{page.height:.2f}", width=f"{page.width:.2f}")
+        page_language = page.language.get("language")
+        attributes = direction_attributes(page.language)
+        if page_language not in {None, "und", doc.lang}:
+            attributes["lang"] = lang_attr(page_language, "name")
+        etree.SubElement(parent(), "page", num=str(page.n), height=f"{page.height:.2f}", width=f"{page.width:.2f}", **attributes)
         for block in sample_blocks(page.blocks):
             text, kind, tag = block.text, block.kind, block.tag
             heading = tag in {"h2", "h3", "h4", "h5", "h6"}
@@ -145,13 +154,18 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                 figure = etree.SubElement(target, "figure_wrap", kind=figure_kind)
                 image_id = identifier(f"P{page.n}_{'FORMULA' if formula else 'IMG'}")
                 source = f"output_images/{name}/{name}_{image_id}.png"
-                attributes = {"src": source, "id": image_id, "page": str(page.n),
-                              "kind": figure_kind, **geometry(block.bbox)}
+                attributes = {"id": image_id, "page": str(page.n), "kind": figure_kind, **geometry(block.bbox)}
+                if block.bbox:
+                    attributes["src"] = source
                 if formula:
                     attributes["type"] = "formula"
+                if block.text or block.alt:
+                    label = f"({block.marker}) " if formula and block.marker else ""
+                    description = "Equation from source PDF" if block.source == "pdf_crop" else block.text or block.alt
+                    attributes["alt"] = xml_safe(label + description)
                 etree.SubElement(figure, "img", **attributes)
                 if assets is not None and block.bbox:
-                    assets[source] = (page.n, block.bbox)
+                    assets[source] = (page.n, tuple(float(value) for value in geometry(block.bbox).values()))
                 if block.caption:
                     caption = etree.SubElement(figure, "figcaption", **text_attributes(block, page, "FC", "figure_caption"))
                     text_node(caption, block.caption, [])
@@ -201,13 +215,18 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                 nodes[id(block)] = listing
             elif tag == "table":
                 _emit(target, block, {}, doc.lang, settings, nodes)
+                nodes[id(block)].set("page", str(page.n))
             else:
                 prefixes = {"p": "P", "page_header": "PH", "page_footer": "PF", "reference": "R"}
                 attrs = text_attributes(block, page, prefixes.get(tag, "H" if tag[0] == "h" else tag.upper()), kind)
                 if tag in {"h2", "h3", "h4", "h5", "h6"}:
                     attrs["level"] = tag[1]
                 element = etree.SubElement(target, tag, **attrs)
-                text_node(element, text, block.spans)
+                if kind == "pseudocode":
+                    element.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                    element.text = xml_safe(text)
+                else:
+                    text_node(element, text, block.spans)
                 nodes[id(block)] = element
     if locations is not None:
         tree = root.getroottree()

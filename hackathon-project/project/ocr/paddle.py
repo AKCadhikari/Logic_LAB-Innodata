@@ -13,8 +13,9 @@ from layout.model import Line
 from ocr.engine import render_gray
 from ocr.recognition import Recognition, RecognitionError
 from utils.textutil import is_rtl
+from utils import execution_audit as audit
 
-LATIN = {"en", "fr", "de", "nl", "it", "cs", "sk", "und", ""}
+LATIN = {"en", "fr", "de", "nl", "it", "cs", "sk"}
 RECOGNIZERS = {"ja": "PP-OCRv5_mobile_rec", "zh": "PP-OCRv5_mobile_rec",
                "ko": "korean_PP-OCRv5_mobile_rec", "ar": "arabic_PP-OCRv3_mobile_rec"}
 
@@ -108,14 +109,25 @@ class PaddleOCR:
             self.weights = weights
             self._receive(deadline)
         effective_dpi = min(dpi, max(1, int(1800 * 72 / max(page.rect.width, page.rect.height))))
-        self.connection.send(render_gray(page, effective_dpi))
-        payload = self._receive(deadline)
-        return parse(page.number + 1, payload["output"], effective_dpi, status["model"])
+        image = render_gray(page, effective_dpi)
+        number = page.number + 1
+        with audit.execution("page_ocr", "paddleocr", status["model"], page=number, language=language,
+                             input_type="rendered_grayscale_pixels", input_sha256=audit.digest(image.tobytes()),
+                             input_reference=f"pdf/page/{number}/render", image_shape=list(image.shape)) as event:
+            if event:
+                event["request_status"] = "sent"
+            self.connection.send(image)
+            payload = self._receive(deadline)
+            audit.response(event, payload, executed=True)
+            result = parse(number, payload["output"], effective_dpi, status["model"])
+            if event:
+                result.execution_ids.append(event["execution_id"])
+        return result
 
     def _receive(self, deadline: float) -> dict:
         if not self.connection.poll(max(0, deadline - time.monotonic())):
             self.close()
-            raise RecognitionError("PaddleOCR timed out.")
+            raise RecognitionError("PaddleOCR timed out.", status="timeout")
         try:
             payload = self.connection.recv()
         except EOFError as error:

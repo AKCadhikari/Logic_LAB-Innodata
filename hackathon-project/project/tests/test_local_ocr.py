@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from base64 import b64decode
+
 import pymupdf
 import pytest
 from lxml import etree
@@ -39,6 +41,7 @@ def test_native_pages_bypass_both_engines(tmp_path, settings, audit, monkeypatch
 
 def test_glm_page_flows_through_ir_and_xml(tmp_path, settings, audit, monkeypatch):
     settings.docling_enabled = False
+    settings.audit_private_responses = True
     monkeypatch.setattr(glm, "model_info", lambda settings: {"ready": True})
     def recognise(page, dpi, settings):
         raw = {"done": True, "model": "glm-ocr:q8_0",
@@ -53,7 +56,8 @@ def test_glm_page_flows_through_ir_and_xml(tmp_path, settings, audit, monkeypatc
     stages = []
     result = process_pdf(source, settings, tmp_path / "out", tmp_path / "run", audit, processing=stages.append)
     assert result["ok"] and result["page_log"][0]["ocr"]["engine"] == "glm-ocr"
-    assert [step["stage"] for step in stages] == ["diagnostics", "ocr", "layout", "validation"]
+    assert [step["stage"] for step in stages] == ["diagnostics", "ocr", "extracted", "layout", "validation"]
+    assert stages[2]["counts"] == {"required": 1, "glm_ocr": 1, "paddle_ocr": 0, "failed": 0, "review": 0}
     xml = etree.parse(str(tmp_path / "out" / "scan.xml"))
     assert xml.findtext(".//table/tbody/tr/td") == "μ"
     assert xml.findtext(".//p[@kind='equation']") == "E = mc^2"
@@ -66,7 +70,7 @@ def test_paddle_runs_after_failed_glm_only(tmp_path, settings, monkeypatch, fail
     monkeypatch.setattr(glm, "model_info", lambda settings: {"ready": True})
     def recognise(page, dpi, settings):
         if failure == "timeout":
-            raise RecognitionError("GLM-OCR timed out.")
+            raise RecognitionError("GLM-OCR timed out.", status="timeout")
         content = "" if failure == "empty" else "<table><tr><td>Incomplete</td></tr>"
         return glm.parse(1, {"done": True, "response": content})
     monkeypatch.setattr(glm, "recognise", recognise)
@@ -76,7 +80,8 @@ def test_paddle_runs_after_failed_glm_only(tmp_path, settings, monkeypatch, fail
     with pymupdf.open() as pdf:
         result, info = OCRRouter(settings, tmp_path).recognise(pdf.new_page(), "en", 180, {}, calls.append)
     assert calls == ["glm-ocr", "paddleocr"] and info["engine"] == "paddleocr"
-    assert info["attempts"][0]["status"] == "rejected"
+    assert info["attempts"][0]["status"] == ("timeout" if failure == "timeout" else "rejected")
+    assert info["attempts"][0]["model"] == settings.glm_ocr_model
     assert result.lines[0].bbox == (5, 6, 40, 11.5)
 
 
@@ -94,6 +99,19 @@ def test_failed_page_remains_in_xml_and_is_marked_for_review(tmp_path, settings,
     assert xml.find("page").get("n") == "1"
 
 
+def test_evidence_write_failure_does_not_trigger_fallback(tmp_path, settings, monkeypatch):
+    settings.audit_private_responses = True
+    monkeypatch.setattr(glm, "model_info", lambda settings: {"ready": True})
+    monkeypatch.setattr(glm, "recognise", lambda *args: glm.parse(1, {"done": True, "response": "Valid OCR text"}))
+    monkeypatch.setattr(paddle.PaddleOCR, "recognise", lambda *args: pytest.fail("GLM-OCR produced valid text."))
+    evidence = tmp_path / "blocked"
+    evidence.touch()
+    with pymupdf.open() as pdf:
+        result, info = OCRRouter(settings, evidence).recognise(pdf.new_page(), "en", 180, {}, lambda _: None)
+    assert result.text() == "Valid OCR text" and info["engine"] == "glm-ocr"
+    assert info["attempts"][0]["evidence_error"]
+
+
 def test_docling_enrichment_keeps_ocr_text_and_uses_matched_geometry():
     page = PageIR(1, 612, 792, [Block("p", "Same extracted title", source="ocr")], source="ocr")
     region = {"kind": "title", "text": "Same extracted title", "bbox": (40, 42, 100, 65)}
@@ -109,3 +127,22 @@ def test_ir_rejects_disordered_pages_and_invalid_geometry():
         ir_from_dict(doc)
     with pytest.raises(ValidationError, match="Bounding box"):
         Block("p", "invalid", bbox=(30, 20, 10, 40))
+
+
+@pytest.mark.parametrize(("mode", "content", "tag"), [
+    ("text", "Sample PDF text", "p"),
+    ("table", "<table><tr><td>Value</td><td>42</td></tr></table>", "table"),
+    ("formula", "$$E = mc^2$$", "p"),
+])
+def test_glm_uses_native_image_endpoint_and_configured_model(settings, monkeypatch, mode, content, tag):
+    def respond(config, path, payload):
+        assert config is settings and path == "/api/generate"
+        assert payload["model"] == "glm-ocr:latest"
+        assert payload["keep_alive"] == settings.glm_ocr_keep_alive and not payload["stream"]
+        assert payload["prompt"] == f"{mode.capitalize()} Recognition:"
+        assert b64decode(payload["images"][0]) == b"test-image"
+        return {"response": content, "done": True}
+    settings.glm_ocr_model = "glm-ocr:latest"
+    monkeypatch.setattr(glm, "request_json", respond)
+    result = glm.recognise_image(b"test-image", 3, settings, mode)
+    assert result.page == 3 and result.blocks[0].tag == tag and not result.issues

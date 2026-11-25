@@ -5,11 +5,8 @@ from pathlib import Path
 
 
 def file_key(path: Path) -> str:
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        h.update(f.read(1 << 20))
-    h.update(str(path.stat().st_size).encode())
-    return h.hexdigest()[:16]
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 class Cache:
@@ -32,7 +29,15 @@ class Cache:
         if not self.enabled:
             return
         try:
+            from tempfile import NamedTemporaryFile
+
             p = self._p(*parts); p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
-        except Exception:
+            with NamedTemporaryFile(mode="w", dir=p.parent, delete=False, encoding="utf-8") as stream:
+                temp = Path(stream.name)
+                json.dump(value, stream, ensure_ascii=False)
+            try:
+                temp.replace(p)
+            finally:
+                temp.unlink(missing_ok=True)
+        except (OSError, ValueError, TypeError):
             pass

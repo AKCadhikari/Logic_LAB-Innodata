@@ -20,6 +20,7 @@ from config.settings import Settings
 from layout.model import DocIR, ir_from_dict
 from powerpoint.package import RunEdit, open_deck, write_deck
 from utils.logs import AuditLog
+from utils import execution_audit as model_audit
 from xml_engine.serializer import to_xml
 
 FURNITURE = {"slide-number", "footer", "rule", "date"}
@@ -35,10 +36,13 @@ class Unit:
     source: str
     reliable: bool
     engine: str = ""
+    block_id: str | None = None
+    execution_ids: tuple = ()
 
     def reference(self) -> dict:
         return {"page": self.page, "xml_node": self.node, "text": self.text,
                 "extraction": self.source, "ocr_engine": self.engine or None,
+                "block_id": self.block_id, "execution_ids": list(self.execution_ids),
                 "extraction_confidence": None if self.engine == "glm-ocr" else self.confidence}
 
 
@@ -54,10 +58,13 @@ class Match:
 
 
 def load_ir(pdf: Path, work: Path, settings: Settings, audit: AuditLog) -> DocIR:
+    from utils.cache import file_key
+
     path = work / "ir" / f"{pdf.stem}.json"
     if path.exists():
         ir = ir_from_dict(json.loads(path.read_text(encoding="utf-8")))
-        if Path(ir.path).resolve() == pdf.resolve():
+        if (Path(ir.path).resolve() == pdf.resolve() and ir.meta.get("ocr_metadata_version") == 2
+                and ir.meta.get("source_sha256") == file_key(pdf)):
             return ir
     from agents.orchestrator import process_pdf
 
@@ -76,7 +83,7 @@ def build_evidence(ir: DocIR, settings: Settings) -> list[Unit]:
         if page.requires_review:
             continue
         for block in page.blocks:
-            if block.tag in ("header", "footer") or block.kind == "equation":
+            if block.tag in ("header", "footer") or block.kind in {"equation", "pseudocode"}:
                 continue
             entries = [(id(block), block.text, block.conf)]
             if block.tag in ("ul", "ol"):
@@ -87,10 +94,12 @@ def build_evidence(ir: DocIR, settings: Settings) -> list[Unit]:
                 text = " ".join(content.split())
                 if len(text) < 6 or key not in locations:
                     continue
-                reliable = (block.source == "native" and page.diag.get("health") == "healthy"
+                reliable = (block.source == "native" and block.validation_status != "manual_review_required"
+                            and page.diag.get("health") == "healthy"
                             and not page.diag.get("error") and confidence >= 80)
                 evidence.append(Unit(text, ws_lower(text), page.n, locations[key], confidence,
-                                     block.source, reliable, block.ocr_engine))
+                                     block.source, reliable, block.ocr_engine, block.source_reference.get("block_id"),
+                                     tuple(block.source_reference.get("execution_ids", []))))
     return evidence
 
 
@@ -235,7 +244,8 @@ def confirm_ocr(ir: DocIR, match: Match, replacements: list[dict], settings: Set
         try:
             with pymupdf.open(ir.path) as pdf:
                 check_settings = replace(settings, ocr_psm=11)
-                lines, _ = ocr_page(pdf[unit.page - 1], ir.lang, min(275, max(240, settings.ocr_dpi + 40)),
+                with model_audit.details(purpose="verify_pptx_source_text"):
+                    lines, _ = ocr_page(pdf[unit.page - 1], ir.lang, min(275, max(240, settings.ocr_dpi + 40)),
                                     check_settings, available_langs(check_settings), orient=False, deskew=False)
                 cache[unit.page] = " ".join(word_tokens(" ".join(line.text for line in lines if line.conf >= 75)))
         except (OSError, RuntimeError, ValueError, TimeoutExpired):
@@ -288,6 +298,16 @@ def source_pages(slide, total: int) -> set[int]:
 
 
 def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Settings) -> dict:
+    with model_audit.scope(ir.doc_id, ir.meta.get("source_sha256"),
+                           trace_id=ir.meta.get("execution_trace_id")) as trace:
+        report = _repair_presentation(ir, source, target, settings)
+        report["verification_executions"] = trace["executions"]
+    return report
+
+
+def _repair_presentation(ir, source, target, settings):
+    from powerpoint.numbering import numbering
+
     evidence = build_evidence(ir, settings)
     normalized = [unit.norm for unit in evidence]
     vocab = Counter(token.lower() for unit in evidence for token in TOK.findall(unit.text) if token.isalnum())
@@ -295,7 +315,6 @@ def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Setting
     records = []
     edits = defaultdict(list)
     checked_pages = {}
-
     for number, slide in enumerate(deck.slides, 1):
         hints = source_pages(slide, len(ir.pages)) if settings.amend_use_notes else set()
         hinted = [unit for unit in evidence if unit.page in hints]
@@ -355,11 +374,23 @@ def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Setting
                     record["change_type"] = record["proposals"][0]["type"]
                 if conflicting:
                     record["alternatives"] = conflicting
+                if verified_ocr:
+                    ids = [row["execution_id"] for row in model_audit.since(0)
+                           if row.get("page") == best.unit.page and row["validation"] == "passed"]
+                    record["source"]["execution_ids"].extend(ids)
                 records.append(record)
+    for item in numbering(deck, edits):
+        if item.get("old") != item.get("new"):
+            location = {"slide": item["slide"], "shape_id": item["shape_id"], "shape": item["shape"]}
+            records.append({**item, "action": "applied", "change_type": "slide_number", "confidence": 1,
+                            "document": ir.doc_id, "original_location": location, "new_location": location,
+                            "old_content": item["old"], "new_content": item["new"],
+                            "reason": "Updated the cached number in the existing slide-number field or shape.",
+                            "source": {"part": item["part"], "expected_number": item["expected"]}})
     write_deck(source, target, edits, len(deck.slides))
     return {"slides": len(deck.slides), "applied": [r for r in records if r["action"] == "applied"],
             "review": [r for r in records if r["action"] == "review"], "records": records,
-            "status": "updated" if edits else "unchanged"}
+            "slide_numbering": numbering(open_deck(target)), "status": "updated" if edits else "unchanged"}
 
 
 def change_record(ir: DocIR, slide: int, shape, paragraph: int, old: str, new: str, confidence: float,
@@ -385,4 +416,5 @@ def amend_deck(pdf: Path, pptx: Path, target: Path, work: Path, settings: Settin
               "types": dict(Counter(r["change_type"] for r in report["applied"])),
               "valid": True, "seconds": round(time.monotonic() - started, 2)}
     audit.event("powerpoint", "deck_done", **result)
-    return result
+    return {**result, "records": report["records"], "slide_numbering": report["slide_numbering"],
+            "verification_executions": report["verification_executions"]}

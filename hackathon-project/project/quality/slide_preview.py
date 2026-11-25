@@ -8,6 +8,9 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import pymupdf
+from pptx import Presentation
+
+from powerpoint.numbering import numbering
 
 
 def renderer() -> str | None:
@@ -18,7 +21,30 @@ def renderer() -> str | None:
     return str(installed) if installed.is_file() else None
 
 
+def rendered_numbering(deck_path: Path, rendered) -> list[dict]:
+    deck = Presentation(deck_path)
+    results = []
+    for entry in numbering(deck):
+        entry = dict(entry)
+        index = entry["slide"] - 1
+        status = "UNCERTAIN"
+        if "shape_id" in entry and index < len(rendered):
+            slide = deck.slides[index]
+            shape = next(item for item in slide.shapes if item.shape_id == entry["shape_id"])
+            page = rendered[index]
+            sx, sy = page.rect.width / deck.slide_width, page.rect.height / deck.slide_height
+            box = pymupdf.Rect(shape.left * sx - 1, shape.top * sy - 1,
+                               (shape.left + shape.width) * sx + 1, (shape.top + shape.height) * sy + 1)
+            text = page.get_textbox(box).strip()
+            entry["rendered_text"] = text
+            status = "CORRECT" if text == entry["expected"] else "INCORRECT" if text else "UNCERTAIN"
+        entry["render_status"] = status
+        results.append(entry)
+    return results
+
+
 def compare_slides(decks: dict[str, Path], out: Path, executable: str) -> dict:
+    out = out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     rendered = {}
     with ExitStack() as stack:
@@ -34,6 +60,7 @@ def compare_slides(decks: dict[str, Path], out: Path, executable: str) -> dict:
                 raise ValueError(f"LibreOffice could not render {label}: {result.stderr or result.stdout}")
             rendered[label] = stack.enter_context(pymupdf.open(pdf))
         rows, comparisons = [], []
+        number_checks = rendered_numbering(decks["actual"], rendered["actual"]) if "actual" in rendered else []
         for index in range(max(len(doc) for doc in rendered.values())):
             cells, pixmaps = [], {}
             for label, document in rendered.items():
@@ -51,7 +78,7 @@ def compare_slides(decks: dict[str, Path], out: Path, executable: str) -> dict:
                          and expected.samples == actual.samples)
             comparisons.append({"slide": index + 1, "expected_matches_actual": match,
                                 "available": list(pixmaps)})
-            rows.append(f'<tr><th scope="row">{index + 1}<br>{"Match" if match else "Different"}</th>'
+            rows.append(f'<tr id="slide-{index + 1:03d}"><th scope="row">{index + 1}<br>{"Match" if match else "Different"}</th>'
                         + "".join(cells) + "</tr>")
     headings = "".join(f'<th scope="col">{html.escape(label.title())}</th>' for label in decks)
     page = ('<!doctype html><meta charset="utf-8"><title>Slide comparison</title>'
@@ -64,4 +91,4 @@ def compare_slides(decks: dict[str, Path], out: Path, executable: str) -> dict:
             f'<tbody>{"".join(rows)}</tbody></table>')
     (out / "index.html").write_text(page, encoding="utf-8")
     return {"renderer": "LibreOffice", "matched_slides": sum(row["expected_matches_actual"] for row in comparisons),
-            "slides": comparisons, "report": "visual/index.html"}
+            "slides": comparisons, "slide_numbering": number_checks, "report": "visual/index.html"}

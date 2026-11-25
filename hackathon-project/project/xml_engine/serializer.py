@@ -67,6 +67,7 @@ def _attrs(b: Block, cfg, doc_lang: str, settings) -> dict:
     a = {}
     if b.lang and b.lang != doc_lang:
         a["lang"] = lang_attr(b.lang, settings.lang_format)
+    a.update(direction_attributes(b.language))
     if b.cls and not b.cls.startswith("__") and b.cls != "caption":
         a["class"] = b.cls
     if settings.emit_kind and b.kind and b.kind not in ("table", "figure", "list", "ul", "ol"):
@@ -74,6 +75,11 @@ def _attrs(b: Block, cfg, doc_lang: str, settings) -> dict:
     if settings.emit_bbox and b.bbox:
         a["data-bbox"] = ",".join(f"{v:.1f}" for v in b.bbox)
     return a
+
+
+def direction_attributes(language: dict) -> dict:
+    base = language.get("base_direction")
+    return {"dir": base} if base in {"rtl", "ltr"} else {}
 
 
 def _emit(parent, b: Block, cfg, doc_lang, settings, nodes):
@@ -85,7 +91,7 @@ def _emit(parent, b: Block, cfg, doc_lang, settings, nodes):
             if nodes is not None:
                 nodes[id(li)] = e
     elif t == "table":
-        el = etree.SubElement(parent, "table", **({"data-bbox": ",".join(f"{v:.1f}" for v in b.bbox)} if settings.emit_bbox and b.bbox else {}))
+        el = etree.SubElement(parent, "table", **_attrs(b, cfg, doc_lang, settings))
         if b.caption:
             caption = etree.SubElement(el, "caption")
             caption.text = xml_safe(b.caption)
@@ -99,8 +105,11 @@ def _emit(parent, b: Block, cfg, doc_lang, settings, nodes):
         tbody = etree.SubElement(el, "tbody")
         for r in sorted(rows):
             tr = etree.SubElement(thead if (thead is not None and r in head_rows) else tbody, "tr")
-            for c in sorted(rows[r], key=lambda c: c.col):
-                at = {}
+            rtl_grid = b.source == "native" and b.language.get("base_direction") == "rtl"
+            for c in sorted(rows[r], key=lambda c: c.col, reverse=rtl_grid):
+                at = direction_attributes(c.language)
+                if c.language.get("language") not in {None, "und", doc_lang}:
+                    at["lang"] = lang_attr(c.language["language"], settings.lang_format)
                 if c.rowspan > 1: at["rowspan"] = str(c.rowspan)
                 if c.colspan > 1: at["colspan"] = str(c.colspan)
                 cell = etree.SubElement(tr, "th" if c.header else "td", **at)
@@ -108,7 +117,7 @@ def _emit(parent, b: Block, cfg, doc_lang, settings, nodes):
                 if nodes is not None:
                     nodes[id(c)] = cell
     elif t == "figure":
-        el = etree.SubElement(parent, "figure", **({"class": b.cls} if b.cls in ("stamp", "handwritten") else {}))
+        el = etree.SubElement(parent, "figure", **_attrs(b, cfg, doc_lang, settings))
         etree.SubElement(el, "img", alt=xml_safe(b.alt or "Figure"))
         if b.caption:
             fc = etree.SubElement(el, "figcaption")
@@ -130,10 +139,12 @@ def to_xml(doc: DocIR, settings, locations: dict | None = None, assets: dict | N
         from xml_engine.sample import sample_xml
         return sample_xml(doc, settings, locations, assets)
     cfg = PROFILES.get(settings.schema_profile, PROFILES["brief"])
-    root = etree.Element("document", lang=lang_attr(doc.lang, settings.lang_format))
+    root = etree.Element("document", lang=lang_attr(doc.lang, settings.lang_format), **direction_attributes(doc.language))
     nodes = {} if locations is not None else None
     for p in doc.pages:
-        at = {cfg["page_attr"]: str(p.n)}
+        at = {cfg["page_attr"]: str(p.n), **direction_attributes(p.language)}
+        if p.language.get("language") not in {None, "und", doc.lang}:
+            at["lang"] = lang_attr(p.language["language"], settings.lang_format)
         if cfg["page_dims"]:
             at.update(height=f"{p.height:.2f}", width=f"{p.width:.2f}")
         pe = etree.SubElement(root, "page", **at)

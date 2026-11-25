@@ -5,6 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 from powerpoint.amend import editable_paragraph, is_furniture, iter_shapes, para_text, record_text_edit, text_paragraphs
 from powerpoint.package import open_deck, write_deck
+from powerpoint.numbering import numbering
 
 
 def synchronize(source: Path, output: Path, changes: list[dict]) -> dict:
@@ -43,6 +44,11 @@ def synchronize(source: Path, output: Path, changes: list[dict]) -> dict:
                         "paragraph": index, "old": original, "new": updated,
                         "source": change.get("source"), "confidence": change.get("confidence"),
                         "reason": "Exact paragraph match for a verified document-version change."})
+    for item in numbering(deck, edits):
+        if item.get("old") != item.get("new"):
+            applied.append({**item, "change_type": "slide_number", "confidence": 1,
+                            "source": {"part": item["part"], "expected_number": item["expected"]},
+                            "reason": "Updated the cached number in the existing slide-number field or shape."})
     write_deck(source, output, edits, len(deck.slides))
     review = []
     for change in changes:
@@ -57,4 +63,5 @@ def synchronize(source: Path, output: Path, changes: list[dict]) -> dict:
                 reason = "More than one deck paragraph matches." if locations else "No exact deck paragraph match."
             review.append({**change, "reason": reason})
     return {"slides": len(deck.slides), "applied": applied, "review": review,
+            "slide_numbering": numbering(open_deck(output)),
             "status": "updated" if edits else "unchanged"}

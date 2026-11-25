@@ -16,6 +16,7 @@ from rapidfuzz import fuzz
 from config.settings import Settings
 from layout.model import BBox, Block, PageIR
 from utils.textutil import norm_cmp
+from utils import execution_audit as audit
 
 
 def artifacts(settings: Settings) -> Path:
@@ -65,17 +66,23 @@ class DoclingLayout:
             self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             encoding="utf-8", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             Thread(target=self._read, args=(self.process.stdout,), daemon=True).start()
-        self.process.stdin.write(json.dumps({"pdf": str(pdf.resolve()), "page": number}) + "\n")
-        self.process.stdin.flush()
-        try:
-            line = self.responses.get(timeout=timeout)
-        except Empty as error:
-            raise TimeoutError("Local Docling timed out.") from error
-        if not line:
-            raise RuntimeError("The Docling worker stopped.")
-        result = json.loads(line)
-        if "error" in result:
-            raise RuntimeError(f"Local Docling failed ({result['error']}).")
+        with audit.execution("page_layout", "docling", "Docling PDF layout pipeline", page=number,
+                             input_type="pdf_page", input_reference=f"pdf/page/{number}",
+                             input_sha256=(audit.current() or {}).get("document_sha256")) as event:
+            if event:
+                event["request_status"] = "sent"
+            self.process.stdin.write(json.dumps({"pdf": str(pdf.resolve()), "page": number}) + "\n")
+            self.process.stdin.flush()
+            try:
+                line = self.responses.get(timeout=timeout)
+            except Empty as error:
+                raise TimeoutError("Local Docling timed out.") from error
+            if not line:
+                raise RuntimeError("The Docling worker stopped.")
+            result = json.loads(line)
+            audit.response(event, result, executed="regions" in result)
+            if "error" in result:
+                raise RuntimeError(f"Local Docling failed ({result['error']}).")
         return result["regions"]
 
     def _read(self, stdout) -> None:
@@ -100,13 +107,20 @@ class DoclingLayout:
     def enrich(self, pdf: Path, page: PageIR) -> tuple[str, list[dict]]:
         if not self.state["ready"]:
             return self.state["status"], []
+        start = audit.cursor()
         try:
             regions = self.regions(pdf, page.n, page.diag.get("rotation", 0))
         except (OSError, ValueError, RuntimeError) as error:
             self.close()
             self.state = {"ready": False, "status": str(error)}
             return self.state["status"], []
+        before = [(id(block), block.tag, block.kind, block.bbox) for block in page.blocks]
         applied = apply_regions(page, regions)
+        changed = before != [(id(block), block.tag, block.kind, block.bbox) for block in page.blocks]
+        ids = audit.ids_since(start)
+        audit.mark(ids, validation="passed", downstream=(
+            [{"consumer": "pydantic_layout", "reference": f"pdf/page/{page.n}", "matched_regions": applied}]
+            if changed else []))
         return ("applied" if applied else "no safe matches"), regions
 
 

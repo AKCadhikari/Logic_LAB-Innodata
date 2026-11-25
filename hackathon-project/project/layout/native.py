@@ -2,7 +2,7 @@
 from __future__ import annotations
 import bisect
 from layout.model import Line, Span, Cell, Block
-from utils.textutil import xml_safe, is_rtl, fix_ligatures
+from utils.textutil import xml_safe, is_rtl
 
 
 def _is_bold(font: str, flags: int) -> bool:
@@ -56,7 +56,7 @@ def extract_lines(page) -> list[Line]:
             maxsize = main["size"] if main else 10
             baseline = main["origin"][1] if main else ln["bbox"][3]
             for s in ln["spans"]:
-                t = fix_ligatures(xml_safe(s["text"].replace("\x00", "")).replace("\u00ad", ""))
+                t = xml_safe(s["text"])
                 if not t:
                     continue
                 n = len(t.strip()) or 0
@@ -85,7 +85,9 @@ def extract_lines(page) -> list[Line]:
                 continue
             wsz = sum(a * b for a, b in sizes) / max(sum(b for _, b in sizes), 1)
             out.append(Line(text=text.rstrip(), bbox=tuple(ln["bbox"]), size=wsz, bold=tot > 0 and bold_chars / tot > 0.6,
-                            italic=tot > 0 and ital_chars / tot > 0.6, spans=spans, source="native", rtl=is_rtl(text)))
+                            italic=tot > 0 and ital_chars / tot > 0.6, spans=spans, source="native", rtl=is_rtl(text),
+                            original_text="".join(span["text"] for span in ln["spans"]),
+                            writing_mode="vertical" if ln.get("wmode") == 1 else "horizontal"))
     return out
 
 
@@ -109,6 +111,9 @@ def recover_running_text(page, recognized: list[Line], band: float) -> list[Line
         near = [(i, other) for i, other in enumerate(native) if i not in used
                 and min(y1, other.bbox[3]) > max(y0, other.bbox[1])
                 and min(x1, other.bbox[2]) > max(x0, other.bbox[0])]
+        if line.rtl:
+            merged.append(line)
+            continue
         combined = " ".join(other.text for _, other in sorted(near, key=lambda pair: pair[1].bbox[0]))
         if combined and fuzz.ratio(norm_cmp(combined), norm_cmp(line.text)) >= 88:
             merged.extend(other for _, other in near)
@@ -153,8 +158,10 @@ def extract_tables(page, settings) -> list[Block]:
         for c in cells:
             c0, c1 = idx(xs, c[0]), idx(xs, c[2])
             r0, r1 = idx(ys, c[1]), idx(ys, c[3])
-            txt = " ".join(page.get_text("text", clip=(c[0] + 0.5, c[1] + 0.5, c[2] - 0.5, c[3] - 0.5)).split())
-            grid_cells.append(Cell(text=xml_safe(txt), row=r0, col=c0, rowspan=max(1, r1 - r0), colspan=max(1, c1 - c0)))
+            raw = page.get_text("text", clip=(c[0], c[1], c[2], c[3]))
+            txt = " ".join(raw.split())
+            grid_cells.append(Cell(text=xml_safe(txt), row=r0, col=c0, rowspan=max(1, r1 - r0),
+                                   colspan=max(1, c1 - c0), original_text=raw, bbox=tuple(c)))
         nonempty = sum(1 for c in grid_cells if c.text) / len(grid_cells)
         nrows = max(c.row + c.rowspan for c in grid_cells)
         if nonempty < 0.3 or nrows < 2:
@@ -170,6 +177,7 @@ def extract_tables(page, settings) -> list[Block]:
 def extract_figures(page, settings, table_boxes, lines=None) -> list[Block]:
     from hashlib import sha256
     import pymupdf
+    from layout.reconstruct import CAPTION_RE, TABLE_WORDS
     W, H = page.rect.width, page.rect.height
     figs: list[Block] = []
     mn = settings.figure_min_pt
@@ -180,6 +188,15 @@ def extract_figures(page, settings, table_boxes, lines=None) -> list[Block]:
     except Exception:
         infos = []
     page_rect = page.rect
+    captions = [line for line in lines or [] if CAPTION_RE.match(line.text) and not TABLE_WORDS.match(line.text)]
+
+    def compact_figure(rect):
+        return min(rect.width, rect.height) >= 16 and any(
+            rect.x0 < line.bbox[2] and rect.x1 > line.bbox[0]
+            and (0 <= line.bbox[1] - rect.y1 <= max(24, 2 * line.size)
+                 or 0 <= rect.y0 - line.bbox[3] <= max(24, 2 * line.size))
+            for line in captions)
+
     def text_overlap(r):
         if not lines:
             return 0.0, 0
@@ -196,14 +213,16 @@ def extract_figures(page, settings, table_boxes, lines=None) -> list[Block]:
         ov, nl = text_overlap(r)
         if nl >= 3 and ov > 0.10:                                # image under real text = scanned text strip, not a figure
             continue
-        if r.width < mn or r.height < mn or r.get_area() > 0.92 * W * H or inside_table(r):
+        if ((min(r.width, r.height) < mn and not compact_figure(r)) or r.get_area() > 0.92 * W * H
+                or inside_table(r)):
             continue
         figs.append(Block(tag="figure", bbox=tuple(r), kind="figure", cls="raster",
                           fingerprint=i.get("digest", b"").hex()))
     try:
         for r in page.cluster_drawings():
             r = pymupdf.Rect(r)
-            if r.width < mn * 1.5 or r.height < mn * 1.5 or r.get_area() > 0.85 * W * H or inside_table(r):
+            if ((min(r.width, r.height) < mn * 1.5 and not compact_figure(r)) or r.get_area() > 0.85 * W * H
+                    or inside_table(r)):
                 continue
             if any(pymupdf.Rect(f.bbox).intersect(r).get_area() > 0.5 * r.get_area() for f in figs):
                 continue

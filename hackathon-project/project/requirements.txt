@@ -5,8 +5,10 @@ numpy>=1.26              # tested 2.5
 opencv-contrib-python==4.10.0.84  # same cv2 wheel required by PaddleOCR
 python-pptx>=1.0         # tested 1.0.2
 rapidfuzz>=3.0           # tested 3.14
+regex>=2024.11.6        # Unicode Script properties and grapheme segmentation
 flask>=3.0               # dashboard only; tested 3.1
 pytest>=8.0              # tests only
-psutil>=5.9              # benchmark process-tree memory sampling
+psutil>=5.9              # launcher process ownership and memory checks
+Pillow>=10.1             # synthetic image for GLM-OCR startup inference
 pydantic>=2.10,<3        # shared extraction and document validation
 # External, not pip-installable: Tesseract OCR 5.x with language packs ara jpn kor ces slk deu nld ita fra eng osd

@@ -9,6 +9,7 @@ venv/
 docsync_run/
 .pytest_cache/
 /storage/
+/logs/
 phase-1/output/*
 phase-2/output/*
 !phase-1/output/.gitkeep

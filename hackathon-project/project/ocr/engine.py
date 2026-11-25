@@ -6,8 +6,8 @@ import numpy as np
 import cv2
 from layout.model import Line
 from utils.textutil import ISO_TO_TESS, join_words, is_rtl
+from utils import execution_audit as audit
 
-_SCRIPT_TO_LANG = {"Latin": "eng", "Arabic": "ara", "Japanese": "jpn", "Hangul": "kor", "Han": "jpn", "Cyrillic": "eng"}
 LATIN_ALL = "eng+deu+fra+ita+nld+ces+slk"
 
 
@@ -69,11 +69,20 @@ def detect_orientation(img: np.ndarray, settings) -> tuple[int, str, float]:
     """Tesseract OSD -> (rotate_degrees, script, confidence). Falls back to (0, '', 0)."""
     try:
         ok, buf = cv2.imencode(".png", img)
-        r = _run([find_tesseract(settings), "stdin", "stdout", "--psm", "0"], buf.tobytes(), 60, settings)
-        txt = r.stdout.decode("utf-8", "ignore")
-        rot = int(re.search(r"Rotate:\s*(\d+)", txt).group(1))
-        conf = float(re.search(r"Orientation confidence:\s*([\d.]+)", txt).group(1))
-        script = (re.search(r"Script:\s*(\w+)", txt) or [None, ""])[1]
+        image = buf.tobytes()
+        cmd = [find_tesseract(settings), "stdin", "stdout", "--psm", "0"]
+        with audit.execution("orientation_detection", "tesseract", "osd", input_type="rendered_png",
+                             input_sha256=audit.digest(image), input_reference="pdf/page/render") as event:
+            if event:
+                event["request_status"] = "sent"
+            r = _run(cmd, image, 60, settings)
+            audit.response(event, None, raw=r.stdout, executed=r.returncode == 0)
+            txt = r.stdout.decode("utf-8", "ignore")
+            rot = int(re.search(r"Rotate:\s*(\d+)", txt).group(1))
+            conf = float(re.search(r"Orientation confidence:\s*([\d.]+)", txt).group(1))
+            script = (re.search(r"Script:\s*(\w+)", txt) or [None, ""])[1]
+            if event:
+                event["validation"] = "passed"
         return rot, script, conf
     except Exception:
         return 0, "", 0.0
@@ -100,11 +109,14 @@ def preprocess(gray: np.ndarray, settings, orient: bool = True, deskew: bool = T
     info = {"rotate": 0, "skew": 0.0}
     img = gray
     if orient:
+        orientation_start = audit.cursor()
         rot, script, conf = detect_orientation(img, settings)
         info["osd_script"] = script
         if rot in (90, 180, 270) and conf >= 1.5:
             img = np.ascontiguousarray(np.rot90(img, k={90: 3, 180: 2, 270: 1}[rot]))   # OSD "Rotate" = clockwise fix
             info["rotate"] = rot
+            audit.mark(audit.ids_since(orientation_start),
+                       downstream=[{"consumer": "ocr_preprocessing", "reference": "rotation", "degrees": rot}])
     sk = estimate_skew(img) if deskew else 0.0
     if 0.3 <= abs(sk) <= 15:
         h, w = img.shape
@@ -118,7 +130,15 @@ def preprocess(gray: np.ndarray, settings, orient: bool = True, deskew: bool = T
 def ocr_image(img: np.ndarray, langs: str, dpi: int, settings, psm: int | None = None) -> list[Line]:
     ok, buf = cv2.imencode(".png", img)
     cmd = [find_tesseract(settings), "stdin", "stdout", "-l", langs, "--psm", str(psm or settings.ocr_psm), "-c", "preserve_interword_spaces=0", "tsv"]
-    r = _run(cmd, buf.tobytes(), settings.ocr_timeout_s, settings)
+    image = buf.tobytes()
+    with audit.execution("ocr", "tesseract", langs, input_type="rendered_png",
+                         input_sha256=audit.digest(image), input_reference="pdf/page/render") as event:
+        if event:
+            event["request_status"] = "sent"
+        r = _run(cmd, image, settings.ocr_timeout_s, settings)
+        audit.response(event, None, raw=r.stdout, executed=r.returncode == 0)
+        if event:
+            event.update(return_code=r.returncode, validation="passed" if r.returncode == 0 and r.stdout else "rejected")
     if r.returncode != 0 and not r.stdout:
         raise RuntimeError(r.stderr.decode("utf-8", "ignore")[:300])
     rows = csv.reader(io.StringIO(r.stdout.decode("utf-8", "ignore")), delimiter="\t", quoting=csv.QUOTE_NONE)
@@ -140,9 +160,7 @@ def ocr_image(img: np.ndarray, langs: str, dpi: int, settings, psm: int | None =
     lines: list[Line] = []
     par_ids: dict[tuple, int] = {}
     for key in sorted(groups):
-        ws = sorted(groups[key], key=lambda w: w[0])
-        if is_rtl(" ".join(w[5] for w in ws)):
-            ws = ws[::-1]                      # RTL line: logical order is right-to-left
+        ws = groups[key]  # Keep recognizer order. Coordinates describe layout.
         text = join_words([w[5] for w in ws])
         x0 = min(w[0] for w in ws); y0 = min(w[1] for w in ws)
         x1 = max(w[0] + w[2] for w in ws); y1 = max(w[1] + w[3] for w in ws)
@@ -151,22 +169,34 @@ def ocr_image(img: np.ndarray, langs: str, dpi: int, settings, psm: int | None =
         gid = par_ids.setdefault(key[:2], len(par_ids))
         lines.append(Line(text=text, bbox=(x0 * k, y0 * k, x1 * k, y1 * k), size=size, conf=float(np.mean([w[4] for w in ws])),
                           source="ocr", rtl=is_rtl(text), grp=gid))
+    if event:
+        event["validation"] = "passed" if lines and r.returncode == 0 else "rejected"
     return lines
 
 
-_SCRIPT_PACK = {"Arabic": "ara+eng", "Japanese": "jpn+eng", "Hangul": "kor+eng", "Han": "jpn+eng"}
+_SCRIPT_PACK = {"Arabic": "ara+eng", "Japanese": "jpn+eng", "Hangul": "kor+eng", "Latin": LATIN_ALL,
+                "Hebrew": "heb+eng", "Devanagari": "hin+eng", "Sinhala": "sin+eng", "Tamil": "tam+eng"}
 
 
 def ocr_page(page, lang_code: str, dpi: int, settings, installed: set[str] | None = None, orient: bool = True, deskew: bool = True) -> tuple[list[Line], dict]:
     """OCR one page. If the document language is unknown the OSD script picks the language pack."""
+    start = audit.cursor()
+    with audit.details(page=page.number + 1, language=lang_code):
+        lines, info = _ocr_page(page, lang_code, dpi, settings, installed, orient, deskew)
+    if lines:
+        info["selected_execution_ids"] = [row["execution_id"] for row in audit.since(start)
+                                          if row["task"] == "ocr" and row["validation"] == "passed"]
+    return lines, info
+
+
+def _ocr_page(page, lang_code, dpi, settings, installed, orient, deskew):
     gray = render_gray(page, dpi)
     img, info = preprocess(gray, settings, orient=orient, deskew=deskew)
     info["dpi"] = dpi
+    if lang_code not in ISO_TO_TESS or (installed is not None and ISO_TO_TESS[lang_code] not in installed):
+        info["reason"] = "No language identified with an installed Tesseract pack."
+        return [], info
     langs = tess_langs(lang_code, installed)
-    if info.get("osd_script") in _SCRIPT_PACK:
-        langs = _SCRIPT_PACK[info["osd_script"]]
-        if installed:
-            langs = "+".join(l for l in langs.split("+") if l in installed) or "eng"
     info["langs"] = langs
     if info.get("rotate"):
         info["note"] = "page rotated by OCR preprocessing; bbox are in rotated space"
@@ -182,27 +212,15 @@ def pick_language(page, settings, installed: set[str] | None, dpi: int = 130) ->
     from utils.textutil import detect_lang
     gray = render_gray(page, dpi)
     img, info = preprocess(gray, settings, orient=True, deskew=False)
-    routed = _SCRIPT_PACK.get(info.get("osd_script", ""), None)
-    cands = []
-    other = ["ara+eng", LATIN_ALL] if routed else ["ara+eng", LATIN_ALL, "jpn+eng", "kor+eng"]
-    for pk in ([routed] if routed else []) + other:
-        pk = "+".join(l for l in pk.split("+") if not installed or l in installed)
-        if pk and pk not in cands:
-            cands.append(pk)
-    best, best_score, best_text = None, -1.0, ""
-    for pk in cands:
-        try:
-            lines = ocr_image(img, pk, dpi, settings)
-        except Exception:
-            continue
-        words = sum(len(l.text.split()) for l in lines)
-        conf = sum(l.conf for l in lines) / len(lines) if lines else 0.0
-        score = conf * min(1.0, words / 25.0)
-        if score > best_score:
-            best, best_score, best_text = pk, score, " ".join(l.text for l in lines)
-    if not best:
+    routed = _SCRIPT_PACK.get(info.get("osd_script", ""))
+    if not routed:
         return "und"
-    lg = detect_lang(best_text)
-    if lg != "und":
-        return lg
-    return {"ara+eng": "ar", "jpn+eng": "ja", "kor+eng": "ko"}.get(best, "en")
+    packs = [pack for pack in routed.split("+") if installed is None or pack in installed]
+    if not packs or (routed != LATIN_ALL and packs[0] != routed.split("+")[0]):
+        return "und"
+    try:
+        lines = ocr_image(img, "+".join(packs), dpi, settings)
+    except (OSError, RuntimeError, ValueError):
+        return "und"
+    detected = detect_lang(" ".join(line.text for line in lines))
+    return detected if ISO_TO_TESS.get(detected) in packs else "und"

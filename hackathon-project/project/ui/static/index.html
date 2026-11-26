@@ -287,7 +287,6 @@ $("#docsel").onchange=e=>W.batch?open(e.target.value).catch(showError):selectWor
 $("#vtabs").onclick=e=>{const t=e.target.dataset.t;if(!t)return;setView(t)};
 $("#stabs").onclick=e=>{const t=e.target.dataset.t;if(!t)return;S.stab=t;document.querySelectorAll("#stabs .tab").forEach(b=>setActive(b,b.dataset.t===t));if(W.batch)side();else reviewPanel().catch(showError)};
 $("#rot").onclick=()=>{S.rot=(S.rot+90)%360;W.batch?viewer():workspaceViewer()};
-$("#dlxml").onclick=()=>{if(S.id)location.href=W.batch?`/api/doc/${encodeURIComponent(S.id)}/xml?download=1`:`${docUrl()}/xml?download=1`};
 $("#reproc").onclick=async()=>{if(!S.id)return;const b=$("#reproc");b.disabled=true;try{
  if(W.batch){await J(`/api/reprocess/${encodeURIComponent(S.id)}`,{method:"POST"});await open(S.id)}
  else{await workspaceFetch(docUrl()+"/retry",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(ocrJobOptions())});await selectWorkspace(S.id)}

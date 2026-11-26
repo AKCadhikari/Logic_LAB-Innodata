@@ -238,6 +238,34 @@ function setActive(button, active) {
     button.setAttribute("aria-pressed", String(active));
 }
 
+function hasSavedPdfXml(exportInfo) {
+    const xml = exportInfo?.outputs?.xml;
+    return ["xml_only", "completed"].includes(exportInfo?.status) && xml?.valid && !xml.draft;
+}
+
+$("#dlxml").onclick = async () => {
+    if (!S.id) return;
+    if (W.batch) {
+        location.href = "/api/doc/" + encodeURIComponent(S.id) + "/xml?download=1";
+        return;
+    }
+    const data = S.data, base = docUrl();
+    if (data.approved) {
+        location.href = base + "/xml?download=1";
+        return;
+    }
+    try {
+        const reports = await workspaceFetch(base + "/presentations");
+        if (S.data !== data || W.batch) return;
+        const report = reports.find(item => item.mode === "pdf_processing" &&
+            item.job_id === data.jobs[0].id && hasSavedPdfXml(item));
+        if (!report) throw new Error("The saved XML is unavailable. Check the phase output folder or submit a review to export again.");
+        location.href = base + "/presentations/" + encodeURIComponent(report.id) + "/xml?format=auto";
+    } catch (error) {
+        showError(error);
+    }
+};
+
 function setView(tab) {
     S.vtab = tab;
     document.querySelectorAll("#vtabs .tab").forEach(button =>
@@ -309,9 +337,10 @@ async function selectWorkspace(id, reset = true) {
     $("#runchip").dataset.jobStatus = job.status;
     $("#reproc").disabled = active;
     $("#reproc").textContent = job.status === "failed" ? "Retry" : "Reprocess";
-    $("#dlxml").disabled = !data.approved;
+    const canDownloadXml = data.approved || (job.status === "completed" && hasSavedPdfXml(data.submission_export));
+    $("#dlxml").disabled = !canDownloadXml;
     $("#dlpptx").disabled = active || !data.approved || !!data.content_validation?.blocking_pages?.length;
-    $("#dlxml").title = data.approved ? "Downloads a ZIP when the XML has images" : "Approve metadata review before exporting";
+    $("#dlxml").title = canDownloadXml ? "Downloads a ZIP when the XML has images" : "Approve metadata review before exporting";
     workspaceViewer();
     await reviewPanel();
     if (active && !W.batch && W.selection === selection) {

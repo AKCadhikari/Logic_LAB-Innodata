@@ -74,6 +74,14 @@ def check_document(page, args):
     expect(page.locator("#sbody")).to_contain_text("DocLayout-YOLO | Completed")
     expect(page.locator("#sbody")).to_contain_text("detections")
     expect(page.locator("#sbody")).to_contain_text("inference")
+    saved = result["submission_export"]
+    download_xml = page.get_by_role("button", name="Export XML", exact=True)
+    if saved["status"] == "xml_only":
+        with page.expect_download() as downloaded:
+            download_xml.click()
+        assert Path(downloaded.value.suggested_filename).suffix in {".xml", ".zip"}
+    elif saved["status"] == "manual_review_required":
+        expect(download_xml).to_be_disabled()
     page.get_by_role("button", name="Zoning", exact=True).click()
     box = page.locator("#viewer svg .layout-box").first
     expect(box).to_be_visible()

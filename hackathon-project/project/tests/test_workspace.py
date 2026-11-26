@@ -55,6 +55,59 @@ def wait_for_attempt(client, url):
     pytest.fail("The processing attempt did not finish.")
 
 
+def test_export_xml_defaults_to_zip_when_there_is_a_picture(workspace):
+    client, _ = workspace
+    with pymupdf.open() as art:
+        sample = art.new_page(width=180, height=120)
+        sample.draw_circle((90, 60), 47, fill=(0.15, 0.30, 0.75))
+        picture = sample.get_pixmap().tobytes("png")
+    with pymupdf.open(stream=pdf_with_text("The source document contains a diagram.")) as source:
+        source[0].insert_image(pymupdf.Rect(72, 200, 252, 320), stream=picture)
+        url = upload(client, source.tobytes(), "picture report.pdf")
+    assert wait_for_attempt(client, url)["jobs"][0]["status"] == "completed"
+    assert client.patch(url + "/metadata", json={
+        "title": "Picture report", "lang": "en", "approved": True
+    }).status_code == 200
+    for profile in ("sample", "brief"):
+        result = client.get(url + f"/xml?download=1&profile={profile}")
+        assert result.mimetype == "application/zip"
+        with ZipFile(io.BytesIO(result.data)) as archive:
+            data = archive.read("picture report.xml")
+            src, = etree.fromstring(data).xpath("//img/@src")
+            assert src.startswith("output_images/picture report/")
+            assert archive.read(src).startswith(b"\x89PNG\r\n\x1a\n")
+            assert archive.testzip() is None
+        assert client.get(url + f"/xml?download=1&profile={profile}&format=xml").data == data
+
+
+def test_ocr_preference_and_independent_job_snapshots(workspace):
+    client, _ = workspace
+    profile = "/api/ocr-settings"
+    assert client.patch(profile, json={"engine": "paddleocr"}).json["engine"] == "paddleocr"
+    assert client.get(profile).json["engine"] == "paddleocr"
+    try:
+        def submit(engine, language=""):
+            return client.post("/api/documents", data={"pdf": (io.BytesIO(pdf_with_text(
+                "The audited pressure remained within tolerance.")), "job.pdf"),
+                "ocr_engine": engine, "ocr_language": language})
+
+        first = submit("glm-ocr")
+        second = submit("paddleocr", "fr")
+        assert first.status_code == second.status_code == 202
+        assert submit("unrecognised").status_code == 400
+        assert client.get(profile).json["engine"] == "paddleocr"
+        first_url = "/api/documents/" + first.json["id"]
+        second_url = "/api/documents/" + second.json["id"]
+        assert wait_for_attempt(client, first_url)["jobs"][0]["ocr_selection"]["ocr_backend"] == "glm-ocr"
+        stored = wait_for_attempt(client, second_url)["jobs"][0]["ocr_selection"]
+        assert stored["ocr_backend"] == "paddleocr" and stored["paddle_ocr_lang"] == "fr"
+        assert client.post(first_url + "/retry", json={"ocr_engine": "automatic"}).status_code == 202
+        history = wait_for_attempt(client, first_url)["jobs"]
+        assert [job["ocr_selection"]["ocr_backend"] for job in history] == ["automatic", "glm-ocr"]
+    finally:
+        client.patch(profile, json={"engine": "automatic"})
+
+
 def test_upload_review_export_compare_and_sync(workspace):
     client, root = workspace
     assert client.get("/api/documents").status_code == 200
@@ -94,9 +147,16 @@ def test_upload_review_export_compare_and_sync(workspace):
     response = client.get(new + "/xml?download=1")
     assert response.status_code == 200
     document_xml = etree.fromstring(response.data)
-    assert document_xml.get("lang") == "de"
-    assert document_xml.findtext("page/h1") == "Reviewed title"
-    assert document_xml.find("page").get("n") == "1"
+    assert document_xml.get("lang") == "german"
+    assert document_xml.findtext("header/title") == "Reviewed title"
+    assert document_xml.find("header/page").get("num") == "1"
+    legacy = etree.fromstring(client.get(new + "/xml?profile=brief").data)
+    assert legacy.get("lang") == "de" and legacy.findtext("page/h1") == "Reviewed title"
+    packed = client.get(new + "/xml?download=1&format=zip")
+    assert packed.status_code == 200
+    with ZipFile(io.BytesIO(packed.data)) as archive:
+        assert archive.testzip() is None
+        assert archive.read(archive.namelist()[0]) == response.data
 
     delta = client.get(new + "/compare", query_string={"previous_id": old_doc["id"], "include_analysis": 1})
     assert delta.status_code == 200

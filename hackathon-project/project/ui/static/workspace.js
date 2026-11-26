@@ -2,19 +2,170 @@ const W = {batch: false, documents: [], page: 1, zoom: 100, highlight: null,
            selection: 0, timer: null, previous: "", changes: null};
 const docUrl = () => "/api/documents/" + encodeURIComponent(S.id);
 const statusText = message => $("#runchip").textContent = message;
-const engineName = engine => ({"glm-ocr": "GLM-OCR", paddleocr: "PaddleOCR", tesseract: "Tesseract"}[engine] || "");
+const engineName = engine => ({"glm-ocr": "GLM-OCR", "paddleocr-vl": "PaddleOCR-VL (Ollama)",
+    paddleocr: "PaddleOCR (Python)", tesseract: "Tesseract"}[engine] || "");
+const ocrModeName = mode => engineName(mode) || (mode === "automatic" ? "Automatic" : "");
+const ocrJobOptions = () => ({ocr_engine: $("#ocr-engine").value, ocr_language: $("#ocr-language").value});
+let ocrHealth;
+let ocrPreferenceChanged = false;
+let ocrPreferenceWrite = Promise.resolve();
+let ocrProbeInProgress = false;
+
+function showOcrChoice() {
+    const mode = $("#ocr-engine").value, models = ocrHealth?.engines;
+    $("#ocr-paddle-row").hidden = mode !== "automatic" && mode !== "paddleocr";
+    const description = mode === "automatic" ? "Primary " + ocrModeName(ocrHealth?.automatic_primary || "glm-ocr") :
+        (models?.[mode]?.model || ocrModeName(mode));
+    if (mode === "automatic" && models) {
+        const primary = ocrHealth.automatic_primary;
+        const secondary = ocrHealth.automatic_secondary;
+        const alternatives = [...new Set([secondary, ocrHealth.automatic_tertiary])]
+            .filter(engine => engine && engine !== primary);
+        $("#ocr-choice-status").textContent = description + " · " + (models[primary]?.status === "unavailable" ?
+            "Primary unavailable · " : "") + "Fallback " + alternatives.map(engine => engineName(engine) +
+                (models[engine]?.status === "unavailable" ? " unavailable" : "")).join(", ");
+        return;
+    }
+    const state = models?.[mode]?.status;
+    $("#ocr-choice-status").textContent = description + (state === "unavailable" ? " · " + models[mode].reason :
+        state === "verified_execution" ? " · Previous inference verified" :
+        state === "available_unverified" ? " · Available, inference unverified" : "");
+}
+
+async function loadOcrSettings() {
+    try {
+        const data = await workspaceFetch("/api/ocr-settings?detail=1");
+        ocrHealth = data;
+        if (!ocrPreferenceChanged) $("#ocr-engine").value = data.engine;
+        for (const option of $("#ocr-engine").options) {
+            const model = data.engines[option.value];
+            option.textContent = ocrModeName(option.value) + (model?.model ? " · " + model.model : "") +
+                (model?.status === "unavailable" ?
+                " · Unavailable" : "");
+        }
+        const language = $("#ocr-language"), current = language.value;
+        const labels = new Intl.DisplayNames(["en"], {type: "language"});
+        language.replaceChildren(new Option("Detect / configured default", ""));
+        for (const code of data.engines.paddleocr.languages) language.add(new Option(labels.of(code), code));
+        if ([...language.options].some(option => option.value === current)) language.value = current;
+        showOcrChoice();
+        const statuses = {unavailable: "Unavailable", available_unverified: "Available · inference unverified",
+                          verified_execution: "Previous inference verified"};
+        const flags = value => value == null ? "Unobserved" : value ? "Yes" : "No";
+        const cards = Object.entries(data.engines).map(([key, model]) => {
+            const run = data.measurements[key];
+            const when = date => date ? new Date(date).toLocaleString() : "None recorded";
+            const languageMetrics = run ? Object.entries(run.languages).map(([code, values]) =>
+                '<li>' + esc(labels.of(code) || code) + ' · ' + values.executions + ' runs · ' +
+                (values.duration_ms / 1000).toFixed(2) + ' s · ' + values.failures + ' failed</li>').join("") : "";
+            return '<div class="card"><strong>' + esc(engineName(key) + ' · ' + statuses[model.status]) + '</strong>' +
+                '<div>' + esc(model.model || "") + (model.configured_language ? ' · Default ' + esc(model.configured_language) : '') + '</div>' +
+                (Object.keys(model.runtime_versions || {}).length ?
+                    '<div>' + esc(Object.entries(model.runtime_versions).map(([name, version]) => name + ' ' + version).join(" · ")) +
+                    '</div>' : '') +
+                '<div>Installed ' + flags(model.installed) + ' · Model available ' + flags(model.available) +
+                ' · Loaded ' + flags(model.loaded) + '</div>' +
+                (key !== "paddleocr" ? '<div>Ollama installed ' + flags(model.runtime_installed) +
+                ' · Server online ' + flags(model.server_online) + '</div>' : '') +
+                '<div>Last successful inference ' + esc(when(model.last_success?.completed_at)) + '</div>' +
+                '<div>Last error ' + esc(model.last_error?.message || "None recorded") + '</div>' +
+                (model.reason ? '<div class="notice">' + esc(model.reason) + '</div>' : '') +
+                '<button type="button" class="btn" data-ocr-probe="' + esc(key) + '"' +
+                (ocrProbeInProgress ? ' disabled' : '') + '>Test ' + esc(engineName(key)) + '</button>' +
+                (model.probe ? '<div>Image test ' + (model.probe.verified ? "passed" : "failed") + ' · ' +
+                    esc(model.probe.attempts.at(-1)?.seconds ?? "—") + ' s</div>' : '') +
+                (run?.requests ? '<div>' + run.requests + ' requests · ' + (run.duration_ms / 1000).toFixed(2) +
+                    ' s total · ' + (100 * run.failures / run.requests).toFixed(1) + '% failed</div>' : '') +
+                (languageMetrics ? '<ul>' + languageMetrics + '</ul>' : '') +
+                (run?.worker_rss_bytes ? '<div>Peak observed Paddle worker memory ' +
+                Math.round(run.worker_rss_bytes / 1048576) + ' MiB</div>' : '') +
+                (model.residency?.size_vram != null ? '<div>Ollama reported GPU memory ' +
+                Math.round(model.residency.size_vram / 1048576) + ' MiB</div>' : '') + '</div>';
+        }).join("");
+        const score = value => value == null ? "—" : (value * 100).toFixed(1) + "%";
+        const benchmark = data.benchmark?.benchmarks || [];
+        $("#ocr-dashboard-results").innerHTML = cards + (benchmark.length ?
+            '<h4>Labelled PDF benchmark</h4><table><thead><tr><th>Engine</th><th>Language</th><th>CER</th>' +
+            '<th>WER</th><th>Table</th><th>Formula</th><th>Order</th><th>Time</th></tr></thead><tbody>' + benchmark.map(row =>
+                '<tr><td>' + esc(engineName(row.engine)) + '</td><td>' + esc(row.language) + '</td><td>' + score(row.cer) +
+                '</td><td>' + score(row.wer) + '</td><td>' + score(row.table_cell_accuracy) +
+                '</td><td>' + (row.formula_exact == null ? "—" : row.formula_structured ? "Equation" : row.formula_exact ? "Text" : "Missed") +
+                '</td><td>' + score(row.reading_order_accuracy) +
+                '</td><td>' + esc(row.ocr_seconds ?? "—") + '</td></tr>').join("") + '</tbody></table>' :
+            '<p>Accuracy requires a labelled reference. The workspace records execution measurements for uploaded PDFs.</p>');
+        for (const button of document.querySelectorAll("[data-ocr-probe]")) {
+            button.onclick = async () => {
+                if (ocrProbeInProgress) return;
+                ocrProbeInProgress = true;
+                document.querySelectorAll("[data-ocr-probe]").forEach(item => { item.disabled = true; });
+                button.textContent = "Testing with a real image…";
+                try {
+                    await workspaceFetch("/api/ocr-test", {method: "POST", headers: {"Content-Type": "application/json"},
+                                                          body: JSON.stringify({engine: button.dataset.ocrProbe})});
+                } catch (error) {
+                    showError(error);
+                } finally {
+                    ocrProbeInProgress = false;
+                    await loadOcrSettings();
+                }
+            };
+        }
+    } catch (error) {
+        $("#ocr-dashboard-results").textContent = error.message;
+        $("#ocr-choice-status").textContent = "Engine availability could not be checked.";
+    }
+}
+
+$("#ocr-engine").onchange = () => {
+    ocrPreferenceChanged = true;
+    showOcrChoice();
+    if ($("#ocr-remember").checked) {
+        const engine = $("#ocr-engine").value;
+        ocrPreferenceWrite = ocrPreferenceWrite.catch(() => {}).then(() => workspaceFetch("/api/ocr-settings", {
+            method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify({engine})
+        })).catch(showError);
+    }
+};
 const processingStatus = step => {
     if (!step) return "";
     if (step.stage === "diagnostics") return "Inspecting PDF pages";
-    if (step.stage === "ocr") return engineName(step.engine) + " · page " + step.page;
+    if (step.stage === "ocr" || step.stage === "ocr_attempt") return engineName(step.engine) + " · page " + step.page;
     if (step.stage === "extracted") return "Extracted page " + step.page;
     if (step.stage === "layout") return "Reconstructing layout · page " + step.page;
     if (step.stage === "validation") return "Validating document and XML";
     return "";
 };
+
+function showOcrTimeline(job, active) {
+    const pane = $("#ocr-timeline"), step = job?.processing;
+    pane.hidden = !active || !step;
+    if (pane.hidden) return;
+    const group = step.stage;
+    const remaining = Math.max(0, job.total - job.done);
+    const samples = step.page_seconds || [];
+    const ocr = samples.filter(sample => sample.ocr), native = samples.filter(sample => !sample.ocr);
+    const ocrLeft = Math.max(0, Math.min(remaining, (step.counts?.required || 0) - ocr.length));
+    const nativeLeft = remaining - ocrLeft;
+    const groupEstimate = (left, seen) => !left ? 0 : seen.length >= 2 ?
+        left * seen.reduce((sum, sample) => sum + sample.seconds, 0) / seen.length : null;
+    const parts = [groupEstimate(ocrLeft, ocr), groupEstimate(nativeLeft, native)];
+    const estimate = !remaining ? "" : parts.some(time => time === null) ? "ETA is being calculated" :
+        "Estimated page extraction time left " + Math.round(parts[0] + parts[1]) + " s";
+    const attempt = step.last_ocr_attempt;
+    const fallback = [...(step.history || [])].reverse().find(item => item.fallback_reason);
+    const stages = [group !== "diagnostics" && "Diagnostics", ["layout", "validation"].includes(group) && "Extraction",
+        group === "validation" && "Layout"].filter(Boolean);
+    pane.textContent = [processingStatus(step), step.model || (group.startsWith("ocr") ? attempt?.model : ""),
+        job.total ? job.done + " complete · " + remaining + " remaining" : "",
+        job.started ? Math.max(0, Math.floor((Date.now() - new Date(job.started).getTime()) / 1000)) + " s elapsed" : "",
+        estimate, attempt?.inference_ms != null ? "Last measured request " + (attempt.inference_ms / 1000).toFixed(2) + " s" : "",
+        step.counts?.failed ? step.counts.failed + " failed OCR pages" : "",
+        fallback ? "Fallback " + engineName(fallback.engine) + " · " + fallback.fallback_reason : "",
+        stages.length ? "Completed " + stages.join(", ") : ""].filter(Boolean).join(" · ");
+}
 const processingCounts = counts => counts ? '<div class="card" aria-live="polite">' +
     '<div>OCR required on ' + counts.required + ' pages</div>' +
-    '<div>GLM-OCR ' + counts.glm_ocr + ' · PaddleOCR ' + counts.paddle_ocr +
+    '<div>GLM-OCR ' + counts.glm_ocr + ' · PaddleOCR-VL ' + (counts.paddle_vl || 0) + ' · PaddleOCR Python ' + counts.paddle_ocr +
     ' · OCR failures ' + counts.failed + '</div>' +
     '<div>Manual review ' + counts.review + '</div></div>' : "";
 const analysisStatus = analysis => analysis ? '<p role="status">' + esc(analysis.model) + ' · ' +
@@ -96,17 +247,19 @@ async function selectWorkspace(id, reset = true) {
     const listed = W.documents.find(document => document.id === id);
     if (listed) listed.status = job.status;
     const active = job.status === "queued" || job.status === "running";
+    showOcrTimeline(job, active);
     const reviewPages = data.pages?.filter(page => page.requires_review).length || 0;
     const extractionStatus = data.content_validation?.status === "manual_review_required" ?
         "Extraction complete · manual review required" : data.content_validation?.status === "validation_partial" ?
             "Extraction complete · validation partial" : "Extraction complete";
     statusText((active && processingStatus(job.processing) || (job.status === "completed" ? extractionStatus : job.status)) +
         (job.total ? " · " + job.done + "/" + job.total + " pages" : "") +
+        (job.ocr_selection?.ocr_backend ? " · " + ocrModeName(job.ocr_selection.ocr_backend) : "") +
         (reviewPages && !active ? " · " + reviewPages + " for review" : ""));
     $("#reproc").disabled = active;
     $("#reproc").textContent = job.status === "failed" ? "Retry" : "Reprocess";
     $("#dlxml").disabled = !data.approved;
-    $("#dlxml").title = data.approved ? "Export XML" : "Approve metadata review before exporting";
+    $("#dlxml").title = data.approved ? "Downloads a ZIP when the XML has images" : "Approve metadata review before exporting";
     workspaceViewer();
     await reviewPanel();
     if (active && !W.batch && W.selection === selection) {
@@ -231,7 +384,9 @@ function pageDiagnostics(page) {
     const confidence = diag.confidence == null ? "Confidence unavailable" : badge(diag.confidence * 100);
     const selected = page.source === "ocr" ? engineName(page.ocr_engine || ocr?.engine) || "OCR" : "Native PDF";
     const attempts = (ocr?.attempts || []).map(attempt => '<div>' + esc(attempt.model || engineName(attempt.engine)) +
-        ' · ' + esc(attempt.status) + (attempt.issues.length ? ' · ' + esc(attempt.issues.join(" ")) : '') + '</div>').join("");
+        ' · ' + esc(attempt.status) + ' · ' + esc(attempt.seconds) + ' s' +
+        (attempt.fallback_reason ? ' · ' + esc(attempt.fallback_reason) : '') +
+        (attempt.issues.length ? ' · ' + esc(attempt.issues.join(" ")) : '') + '</div>').join("");
     return '<div class="sec">Page ' + page.n + ' diagnostics</div><div class="card">' +
         '<div>' + esc(selected) + ' · ' + confidence + '</div><div>' + esc(languageLabel(page.language)) + '</div>' +
         '<div>Native text: ' + esc(diag.health || "unknown") +
@@ -340,7 +495,7 @@ function exportCard(report, links) {
 
 function presentationLinks(base, id) {
     const url = base + "/" + encodeURIComponent(id);
-    return {xml: url + "/xml", pptx: url, zip: url + "/zip"};
+    return {xml: url + "/xml?format=auto", pptx: url, zip: url + "/zip"};
 }
 
 function changesPanel(data) {
@@ -457,6 +612,7 @@ $("#pdf-file").onchange = async event => {
     if (!file) return;
     const form = new FormData();
     form.append("pdf", file);
+    for (const [key, value] of Object.entries(ocrJobOptions())) form.append(key, value);
     const previous = S.data?.pages && window.confirm("Link this upload as a new version of the selected PDF?");
     if (previous) form.append("previous_id", S.id);
     $("#upload").disabled = true;
@@ -474,6 +630,8 @@ $("#batch").onclick = async () => {
     S.data = null;
     $("#batch").textContent = W.batch ? "Upload workspace" : "Batch review";
     $("#upload").hidden = W.batch;
+    $("#ocr-controls").hidden = W.batch;
+    $("#ocr-timeline").hidden = true;
     $("#page-tools").hidden = true;
     $("#rot").disabled = true;
     $("#nv-dash").hidden = !W.batch;
@@ -582,6 +740,7 @@ $("#startup-retry").onclick = async () => {
 
 $("#settings").onclick = () => {
     $("#settings-dialog").showModal();
+    loadOcrSettings();
     loadStartupStatus().then(loadDocumentAudit);
     $("#settings-info").textContent = "Checking local processing settings…";
     $("#profile-status").textContent = "";
@@ -597,11 +756,9 @@ $("#settings").onclick = () => {
         $("#settings-info").textContent = [
             health.runtime + " · " + health.xml_profile + " XML profile",
             "Ollama " + health.ollama,
-            "GLM-OCR " + health.glm_ocr.model + " · " + readiness(health.glm_ocr),
             "Qwen " + health.qwen.model + " · " + readiness(health.qwen) + (health.qwen.enabled ? "" : " · review disabled"),
             !health.ocr_enabled ? "OCR disabled" : health.ocr_backend === "tesseract" ?
-                "Tesseract languages " + health.ocr_languages.join(", ") : "OCR backend " + engineName(health.ocr_backend),
-            "PaddleOCR " + (health.paddle_ocr?.ready ? "ready" : "unavailable"),
+                "Tesseract languages " + health.ocr_languages.join(", ") : "Default OCR " + ocrModeName(health.ocr_backend),
             "Docling " + (health.docling?.ready ? "ready" : "unavailable"),
         ].join(" · ");
     }).catch(error => { $("#settings-info").textContent = error.message; });
@@ -623,4 +780,9 @@ $("#profile-form").onsubmit = async event => {
 };
 $("#nv-dash").hidden = true;
 workspaceFetch("/api/profile").then(profile => { $("#reviewer-label").textContent = profile.name; }).catch(showError);
-loadWorkspace().catch(showError);
+loadWorkspace().then(async () => {
+    const prefs = await workspaceFetch("/api/ocr-settings");
+    if (!ocrPreferenceChanged) $("#ocr-engine").value = prefs.engine;
+    showOcrChoice();
+    return loadOcrSettings();
+}).catch(showError);

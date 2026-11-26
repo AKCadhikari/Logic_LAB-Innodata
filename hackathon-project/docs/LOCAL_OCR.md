@@ -2,8 +2,10 @@
 
 The upload and batch entry points share one pipeline. PyMuPDF inspects each page for native character
 count, image coverage, and signs of a broken text layer. Reliable native text goes directly to layout.
-GLM-OCR processes pages that need recognition. PaddleOCR runs after a GLM-OCR error, timeout, or failed
-quality check. If both attempts fail, the page stays in the IR and XML and the source stays available for review.
+The workspace offers GLM-OCR, PaddleOCR-VL (Ollama), PaddleOCR (Python), and Automatic. Automatic
+defaults to GLM-OCR, PaddleOCR-VL, then PaddleOCR Python. If recognition attempts fail, the page stays
+in the IR and draft XML for review. The selected mode, each executed model, and the accepted output
+are recorded separately.
 
 ## Windows setup
 
@@ -25,7 +27,17 @@ from the app. Recognition confidence and region coordinates are nullable because
 provides text without those fields. [Ollama model](https://ollama.com/library/glm-ocr) ·
 [GLM-OCR Ollama guide](https://github.com/zai-org/GLM-OCR/blob/main/examples/ollama-deploy/README.md)
 
-### PaddleOCR fallback
+### PaddleOCR-VL through Ollama
+
+The default tag is `MedAIBase/PaddleOCR-VL:0.9b`. The installed release advertises completion only and
+rejects image requests with a missing-projector error. The adapter verifies image capability before
+submitting a document. The dashboard's synthetic test can verify the actual rejection without document
+content. Configure a separately installed vision-capable build through `PADDLE_VL_MODEL`. DocuSync
+loads secondary vision models on demand. Its PaddleOCR-VL inference defaults to CPU and a zero
+keep-alive so the runner can release memory when the request finishes.
+[Installed Ollama model listing](https://ollama.com/MedAIBase/PaddleOCR-VL:0.9b)
+
+### PaddleOCR Python
 
 Install the [Microsoft Visual C++ x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist/)
 on Windows. Stop the app before installing Python packages that replace OpenCV.
@@ -69,8 +81,10 @@ handles missing or ambiguous regions. [Docling offline setup](https://docling-pr
 ## Processing and review
 
 The review screen shows live job progress, native character counts, individual OCR attempts, the selected
-engine, layout status, and review flags. JSON in the job's `recognition/` folder contains page-keyed OCR
-and layout evidence. Keep this folder private alongside the source PDFs.
+engine, layout status, and review flags. Elapsed time comes from the job start timestamp. Extraction ETA
+uses completed pages of the same type when enough measurements exist. Audit reports contain hashes and
+metadata; approved local debugging can retain raw responses and Qwen prompts with
+`DOCUSYNC_AUDIT_PRIVATE_RESPONSES=true`.
 
 The quality gates check empty or truncated text, repetition, corrupt characters, page references,
 table structure, and formula delimiters. A recognition score does not verify facts.

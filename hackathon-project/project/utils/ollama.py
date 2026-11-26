@@ -67,11 +67,15 @@ def request_json(url: str, path: str, payload: dict | None, timeout: int, *, det
         hints = {404: " Check that the configured model is installed.", 500: " Check the Ollama server log."}
         status = "unavailable" if error.code in {404, 503} else "error"
         reason = ""
-        if detailed:
+        if detailed or event is not None:
             try:
-                value = json.loads(error.read(4096))
-                if isinstance(value, dict) and isinstance(value.get("error"), str):
-                    reason = " " + " ".join(value["error"].split())[:600]
+                body = error.read(4097)
+                if event is not None and len(body) <= 4096:
+                    event["response_sha256"] = audit.digest(body)
+                if detailed:
+                    value = json.loads(body)
+                    if isinstance(value, dict) and isinstance(value.get("error"), str):
+                        reason = " " + " ".join(value["error"].split())[:600]
             except (ValueError, OSError):
                 pass
         raise OllamaError(f"Ollama returned HTTP {error.code}.{reason or hints.get(error.code, '')}", status) from error

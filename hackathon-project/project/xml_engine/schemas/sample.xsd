@@ -1,0 +1,73 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:include schemaLocation="common.xsd"/>
+  <xs:complexType name="Milestone">
+    <xs:attribute name="num" type="xs:positiveInteger" use="required"/>
+    <xs:attribute name="width" type="PositiveSize" use="required"/>
+    <xs:attribute name="height" type="PositiveSize" use="required"/>
+    <xs:attribute name="lang" type="xs:string"/>
+    <xs:attribute name="dir" type="Direction"/>
+  </xs:complexType>
+  <xs:complexType name="Section">
+    <xs:choice minOccurs="0" maxOccurs="unbounded">
+      <xs:element name="h1" type="Text"/>
+      <xs:element name="h2" type="Text"/>
+      <xs:element name="h3" type="Text"/>
+      <xs:element name="h4" type="Text"/>
+      <xs:element name="h5" type="Text"/>
+      <xs:element name="h6" type="Text"/>
+      <xs:element name="p" type="Text"/>
+      <xs:element name="ul" type="List"/>
+      <xs:element name="ol" type="List"/>
+      <xs:element name="table" type="Table"/>
+      <xs:element name="figure" type="Figure"/>
+      <xs:element name="blockquote" type="Text"/>
+      <xs:element name="pre" type="Text"/>
+      <xs:element name="hr" type="EmptyBlock"/>
+      <xs:element name="aside" type="Text"/>
+      <xs:element name="section" type="Section"/>
+      <xs:element name="page" type="Milestone"/>
+      <xs:element name="figure_wrap" type="Figure"/>
+      <xs:element name="page_header" type="Text"/>
+      <xs:element name="page_footer" type="Text"/>
+      <xs:element name="reference" type="Text"/>
+    </xs:choice>
+    <xs:attribute name="level" type="xs:positiveInteger" use="required"/>
+    <xs:attribute name="kind" type="xs:string" use="required"/>
+    <xs:attribute name="id" type="xs:NCName"/>
+  </xs:complexType>
+  <xs:complexType name="Front">
+    <xs:sequence>
+      <xs:element name="title" type="xs:string" minOccurs="0"/>
+      <xs:choice minOccurs="0" maxOccurs="unbounded">
+        <xs:element name="p" type="Text"/>
+        <xs:element name="h1" type="Text"/>
+        <xs:element name="page" type="Milestone"/>
+        <xs:element name="figure_wrap" type="Figure"/>
+        <xs:element name="table" type="Table"/>
+        <xs:element name="ol" type="List"/>
+        <xs:element name="ul" type="List"/>
+        <xs:element name="aside" type="Text"/>
+        <xs:element name="pre" type="Text"/>
+        <xs:element name="blockquote" type="Text"/>
+        <xs:element name="hr" type="EmptyBlock"/>
+      </xs:choice>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="Body">
+    <xs:sequence>
+      <xs:element name="section" type="Section" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="Document">
+    <xs:sequence>
+      <xs:element name="header" type="Front"/>
+      <xs:element name="body" type="Body"/>
+    </xs:sequence>
+    <xs:attribute name="reading_order_layout_source" type="xs:string"/>
+    <xs:attribute name="reading_order_multicolumn_pages" type="xs:string"/>
+    <xs:attribute name="lang" type="xs:string" use="required"/>
+    <xs:attribute name="dir" type="Direction"/>
+  </xs:complexType>
+  <xs:element name="document" type="Document"/>
+</xs:schema>

@@ -33,7 +33,8 @@ def model_info(settings: Settings) -> dict:
 
 TABLE = re.compile(r"<table\b[^>]*>.*?</table\s*>", re.I | re.S)
 FORMULA = re.compile(r"\$\$(.+?)\$\$|\\\[(.+?)\\\]", re.S)
-UNORDERED = re.compile(r"^\s*[-*+]\s+(.+)$")
+UNORDERED = re.compile(r"^\s*([-*+•])\s+(.+)$")
+FENCED_CODE = re.compile(r"^\x60{3}[A-Za-z][\w+-]*[ \t]*\r?\n[\s\S]*?^\x60{3}[ \t]*$", re.M)
 ORDERED = re.compile(r"^\s*(\d+[.)])\s+(.+)$")
 MARKDOWN_TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
 INLINE_FORMULA = re.compile(r"(?<!\\)\$([^$\n]+)\$|\\\((.+?)\\\)")
@@ -113,7 +114,7 @@ def prose(text: str):
         elif heading:
             yield text_block("h" + str(len(heading[1])), heading[2], "section_heading")
         elif unordered or ordered:
-            tag, marker, value = ("ol", ordered[1], ordered[2]) if ordered else ("ul", "•", unordered[1])
+            tag, marker, value = ("ol", ordered[1], ordered[2]) if ordered else ("ul", unordered[1], unordered[2])
             if listing is None or listing.tag != tag:
                 listing = Block(tag, kind="body")
                 yield listing
@@ -129,22 +130,27 @@ def prose(text: str):
         yield text_block("p", "\n".join(paragraph), "body")
 
 
-def parse(page: int, data: dict) -> Recognition:
-    result = Recognition(page, "glm-ocr", raw=data)
+def parse(page: int, data: dict, *, engine: str = "glm-ocr") -> Recognition:
+    result = Recognition(page, engine, raw=data)
     text = data.get("response")
     if not isinstance(text, str):
-        result.issues.append("GLM-OCR did not return recognised text.")
+        result.issues.append("The model did not return recognised text.")
         return result
     if data.get("done") is not True or data.get("done_reason") not in {"stop", None}:
-        result.issues.append("GLM-OCR did not finish the page cleanly.")
+        result.issues.append("The model did not finish the page cleanly.")
     if fence := re.fullmatch(r"\s*```(?:markdown|text|html)?\s*\n(.*?)\n```\s*", text, re.I | re.S):
         text = fence[1]
-    pattern = re.compile(f"(?P<table>{TABLE.pattern})|(?P<formula>{FORMULA.pattern})", re.I | re.S)
+    pattern = re.compile(f"(?P<code>{FENCED_CODE.pattern})|(?P<table>{TABLE.pattern})|(?P<formula>{FORMULA.pattern})",
+                         re.I | re.S | re.M)
     cursor = 0
     try:
         for match in pattern.finditer(text):
             result.blocks.extend(prose(text[cursor:match.start()]))
-            if match.group("table"):
+            if match.group("code"):
+                value = "\n".join(match[0].splitlines()[1:-1])
+                if value:
+                    result.blocks.append(Block("p", value, kind="pseudocode", original_text=value))
+            elif match.group("table"):
                 result.blocks.append(table_block(match[0]))
             else:
                 formula = match[0][2:-2].strip()
@@ -155,14 +161,15 @@ def parse(page: int, data: dict) -> Recognition:
         result.blocks.extend(prose(text[cursor:]))
     except RecognitionError as error:
         result.issues.append(str(error))
-    if len(re.findall(r"<table\b", text, re.I)) != len(TABLE.findall(text)):
+    markup = FENCED_CODE.sub("", text)
+    if len(re.findall(r"<table\b", markup, re.I)) != len(TABLE.findall(markup)):
         result.issues.append("GLM-OCR returned unfinished table markup.")
-    if text.count("$$") % 2 or text.count(r"\[") != text.count(r"\]"):
+    if markup.count("$$") % 2 or markup.count(r"\[") != markup.count(r"\]"):
         result.issues.append("GLM-OCR returned unfinished formula delimiters.")
 
     def mark(block: Block) -> None:
         block.source = "ocr"
-        block.ocr_engine = "glm-ocr"
+        block.ocr_engine = engine
         block.conf = 0  # Legacy numeric readers must not treat absent model confidence as 100%.
         for child in block.children:
             mark(child)
@@ -176,14 +183,15 @@ RecognitionMode = Literal["text", "table", "formula"]
 PROMPTS = {"text": "Text Recognition:", "table": "Table Recognition:", "formula": "Formula Recognition:"}
 
 
-def recognise_image(image: bytes, page: int, settings: Settings, mode: RecognitionMode = "text") -> Recognition:
+def recognise_image(image: bytes, page: int, settings: Settings, mode: RecognitionMode = "text", *,
+                    input_reference: str | None = None) -> Recognition:
     payload = {"model": settings.glm_ocr_model, "prompt": PROMPTS[mode], "stream": False,
                "images": [base64.b64encode(image).decode("ascii")], "keep_alive": settings.glm_ocr_keep_alive,
                "options": {"temperature": 0, "num_gpu": 0,
                            "num_ctx": max(8192, settings.glm_ocr_tokens + 4096),
                            "num_predict": settings.glm_ocr_tokens}}
     with audit.execution("page_ocr", "ollama", settings.glm_ocr_model, page=page, input_type="rendered_png",
-                         input_sha256=audit.digest(image), input_reference=f"pdf/page/{page}/render",
+                         input_sha256=audit.digest(image), input_reference=input_reference or f"pdf/page/{page}/render",
                          prompt_template=f"glm-ocr/{mode}/v1") as event:
         data = request_json(settings, "/api/generate", payload)
         result = parse(page, data)

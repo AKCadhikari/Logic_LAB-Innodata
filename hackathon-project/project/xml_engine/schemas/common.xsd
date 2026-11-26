@@ -1,0 +1,169 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:simpleType name="Direction">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="ltr"/>
+      <xs:enumeration value="rtl"/>
+      <xs:enumeration value="auto"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="Alignment">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="left"/>
+      <xs:enumeration value="center"/>
+      <xs:enumeration value="right"/>
+      <xs:enumeration value="justify"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="MathEncoding">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="latex"/>
+      <xs:enumeration value="unicode"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="FormulaStatus">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="review_required"/>
+      <xs:enumeration value="native_text"/>
+      <xs:enumeration value="two_pass_agreement"/>
+      <xs:enumeration value="source_reviewed"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="PositiveSize">
+    <xs:restriction base="xs:decimal">
+      <xs:minExclusive value="0"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:attributeGroup name="Coordinates">
+    <xs:attribute name="x0" type="xs:decimal"/>
+    <xs:attribute name="y0" type="xs:decimal"/>
+    <xs:attribute name="x1" type="xs:decimal"/>
+    <xs:attribute name="y1" type="xs:decimal"/>
+  </xs:attributeGroup>
+  <xs:attributeGroup name="Metadata">
+    <xs:attribute name="class" type="xs:string"/>
+    <xs:attribute name="kind" type="xs:string"/>
+    <xs:attribute name="lang" type="xs:string"/>
+    <xs:attribute name="data-bbox" type="xs:string"/>
+    <xs:attribute name="sub_bboxes" type="xs:string"/>
+    <xs:attribute name="id" type="xs:NCName"/>
+    <xs:attribute name="continues_from" type="xs:NCName"/>
+    <xs:attribute name="page" type="xs:positiveInteger"/>
+    <xs:attribute name="num" type="xs:positiveInteger"/>
+    <xs:attribute name="dir" type="Direction"/>
+    <xs:attribute name="align" type="Alignment"/>
+    <xs:attribute name="font_size" type="PositiveSize"/>
+    <xs:attribute name="serif" type="xs:boolean"/>
+    <xs:attribute name="level" type="xs:positiveInteger"/>
+    <xs:attributeGroup ref="Coordinates"/>
+  </xs:attributeGroup>
+  <xs:attributeGroup name="Math">
+    <xs:attribute name="formula_status" type="FormulaStatus"/>
+    <xs:attribute name="formula_encoding" type="MathEncoding"/>
+    <xs:attribute name="equation_number" type="xs:string"/>
+  </xs:attributeGroup>
+  <xs:complexType name="Inline" mixed="true">
+    <xs:choice minOccurs="0" maxOccurs="unbounded">
+      <xs:element name="strong" type="Inline"/>
+      <xs:element name="em" type="Inline"/>
+      <xs:element name="u" type="Inline"/>
+      <xs:element name="del" type="Inline"/>
+      <xs:element name="ins" type="Inline"/>
+      <xs:element name="sup" type="Inline"/>
+      <xs:element name="sub" type="Inline"/>
+      <xs:element name="br" type="Inline"/>
+      <xs:element name="code" type="Inline"/>
+      <xs:element name="a" type="Inline"/>
+      <xs:element name="span" type="Inline"/>
+      <xs:element name="all-caps" type="Inline"/>
+      <xs:element name="small-caps" type="Inline"/>
+    </xs:choice>
+    <xs:attribute name="kind" type="xs:string"/>
+    <xs:attribute name="href" type="xs:string"/>
+  </xs:complexType>
+  <xs:complexType name="Text" mixed="true">
+    <xs:choice minOccurs="0" maxOccurs="unbounded">
+      <xs:element name="strong" type="Inline"/>
+      <xs:element name="em" type="Inline"/>
+      <xs:element name="u" type="Inline"/>
+      <xs:element name="del" type="Inline"/>
+      <xs:element name="ins" type="Inline"/>
+      <xs:element name="sup" type="Inline"/>
+      <xs:element name="sub" type="Inline"/>
+      <xs:element name="br" type="Inline"/>
+      <xs:element name="code" type="Inline"/>
+      <xs:element name="a" type="Inline"/>
+      <xs:element name="span" type="Inline"/>
+      <xs:element name="all-caps" type="Inline"/>
+      <xs:element name="small-caps" type="Inline"/>
+    </xs:choice>
+    <xs:attributeGroup ref="Metadata"/>
+    <xs:attributeGroup ref="Math"/>
+    <xs:anyAttribute namespace="http://www.w3.org/XML/1998/namespace" processContents="skip"/>
+  </xs:complexType>
+  <xs:complexType name="EmptyBlock">
+    <xs:attributeGroup ref="Metadata"/>
+  </xs:complexType>
+  <xs:complexType name="Image">
+    <xs:attributeGroup ref="Metadata"/>
+    <xs:attributeGroup ref="Math"/>
+    <xs:attribute name="alt" type="xs:string"/>
+    <xs:attribute name="type" type="xs:string"/>
+    <xs:attribute name="src" type="xs:anyURI"/>
+    <xs:attribute name="format" type="xs:string"/>
+    <xs:attribute name="width" type="xs:positiveInteger"/>
+    <xs:attribute name="height" type="xs:positiveInteger"/>
+  </xs:complexType>
+  <xs:complexType name="Figure">
+    <xs:sequence>
+      <xs:element name="img" type="Image"/>
+      <xs:element name="figcaption" type="Text" minOccurs="0"/>
+    </xs:sequence>
+    <xs:attributeGroup ref="Metadata"/>
+  </xs:complexType>
+  <xs:complexType name="List">
+    <xs:sequence>
+      <xs:element name="li" type="Text" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attributeGroup ref="Metadata"/>
+  </xs:complexType>
+  <xs:complexType name="Cell" mixed="true">
+    <xs:choice minOccurs="0" maxOccurs="unbounded">
+      <xs:element name="strong" type="Inline"/>
+      <xs:element name="em" type="Inline"/>
+      <xs:element name="u" type="Inline"/>
+      <xs:element name="del" type="Inline"/>
+      <xs:element name="ins" type="Inline"/>
+      <xs:element name="sup" type="Inline"/>
+      <xs:element name="sub" type="Inline"/>
+      <xs:element name="br" type="Inline"/>
+      <xs:element name="code" type="Inline"/>
+      <xs:element name="a" type="Inline"/>
+      <xs:element name="span" type="Inline"/>
+      <xs:element name="all-caps" type="Inline"/>
+      <xs:element name="small-caps" type="Inline"/>
+    </xs:choice>
+    <xs:attributeGroup ref="Metadata"/>
+    <xs:attribute name="rowspan" type="xs:positiveInteger"/>
+    <xs:attribute name="colspan" type="xs:positiveInteger"/>
+  </xs:complexType>
+  <xs:complexType name="Row">
+    <xs:choice maxOccurs="unbounded">
+      <xs:element name="td" type="Cell"/>
+      <xs:element name="th" type="Cell"/>
+    </xs:choice>
+  </xs:complexType>
+  <xs:complexType name="Rows">
+    <xs:sequence>
+      <xs:element name="tr" type="Row" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:complexType name="Table">
+    <xs:sequence>
+      <xs:element name="caption" type="Text" minOccurs="0"/>
+      <xs:element name="thead" type="Rows" minOccurs="0"/>
+      <xs:element name="tbody" type="Rows"/>
+    </xs:sequence>
+    <xs:attributeGroup ref="Metadata"/>
+  </xs:complexType>
+</xs:schema>

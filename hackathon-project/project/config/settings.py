@@ -14,7 +14,10 @@ class Settings:
     emit_bbox: bool = False                # debug: data-bbox on blocks
     # --- diagnostics / OCR -----------------------------------------------------
     ocr_enabled: bool = True
-    ocr_backend: str = "glm-ocr"           # glm-ocr with Paddle fallback, or explicit legacy tesseract
+    ocr_backend: str = "automatic"         # automatic | glm-ocr | paddleocr-vl | paddleocr | tesseract
+    ocr_automatic_primary: str = "glm-ocr"
+    ocr_automatic_secondary: str = "paddleocr-vl"
+    ocr_automatic_tertiary: str = "paddleocr"  # empty disables the third attempt
     glm_ocr_url: str = "http://localhost:11434"
     glm_ocr_model: str = "glm-ocr:q8_0"
     glm_ocr_timeout_s: int = 300
@@ -22,10 +25,17 @@ class Settings:
     glm_ocr_retries: int = 0
     glm_ocr_max_edge: int = 1800
     glm_ocr_tokens: int = 4096
+    formula_glm_on_other_engines: bool = False
+    paddle_vl_url: str = "http://localhost:11434"
+    paddle_vl_model: str = "MedAIBase/PaddleOCR-VL:0.9b"
+    paddle_vl_timeout_s: int = 300
+    paddle_vl_keep_alive: str = "0"
     paddle_ocr_timeout_s: int = 90
     paddle_det_model_dir: str = ""
     paddle_rec_model_dir: str = ""
     paddle_ocr_lang: str = ""              # override the language inferred from native text
+    paddle_ocr_unknown_lang: str = "en"   # default for image-only pages without language evidence
+    workspace_workers: int = 1
     ocr_min_chars: int = 2
     ocr_max_chars: int = 42000
     ocr_min_native_ratio: float = 0.30
@@ -105,10 +115,11 @@ class Settings:
                     value = value.strip()
                     env_values[key.strip()] = value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'} else value
         aliases = (
-            ("OLLAMA_BASE_URL", ("glm_ocr_url", "ollama_url"), str),
+            ("OLLAMA_BASE_URL", ("glm_ocr_url", "paddle_vl_url", "ollama_url"), str),
             ("OLLAMA_TIMEOUT", ("glm_ocr_timeout_s", "ollama_timeout_s"), int),
             ("OLLAMA_KEEP_ALIVE", ("glm_ocr_keep_alive", "ollama_keep_alive"), str),
             ("GLM_OCR_MODEL", ("glm_ocr_model",), str),
+            ("PADDLE_VL_MODEL", ("paddle_vl_model",), str),
             ("QWEN_MODEL", ("ollama_model",), str),
             ("OLLAMA_STARTUP_ENABLED", ("ollama_startup_enabled",), lambda value: value.casefold() in {"1", "true", "yes"}),
             ("OLLAMA_STARTUP_MODE", ("ollama_startup_mode",), str),

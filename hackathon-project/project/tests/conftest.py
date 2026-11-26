@@ -7,7 +7,8 @@ import pytest
 @pytest.fixture
 def settings():
     from config.settings import Settings
-    s = Settings(); s.use_cache = False; s.workers = 1
+    s = Settings(ocr_automatic_secondary="paddleocr", ocr_automatic_tertiary="")
+    s.use_cache = False; s.workers = 1
     return s
 
 

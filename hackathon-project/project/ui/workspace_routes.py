@@ -17,12 +17,17 @@ from werkzeug.exceptions import HTTPException
 
 from comparison.differ import compare_ir
 from layout.model import DocIR
-from reporting.exports import output_stem, publish_document, write_zip
+from reporting.exports import materialize_assets, output_stem, publish_document, save_original_images, write_zip
 from ui.workspace import Workspace, now
 from utils.textutil import xml_safe
+from xml_engine.assets import inspect_assets, validate_archive
+from xml_engine.completeness import compare_content
+from xml_engine.serializer import to_xml
+from xml_engine.validate import validate_xml, verify_unicode
 
 api = Blueprint("workspace", __name__, url_prefix="/api")
 SESS_COOKIE = "docusync_workspace"
+WORKSPACE_XML_PROFILE = "sample"
 _retry_lock = Lock()
 
 
@@ -87,7 +92,7 @@ def health():
     ws = workspace()
     glm_info, qwen = glm.model_info(ws.settings), qwen_info(ws.settings)
     return jsonify(status="ok", runtime="local CPU", ocr_enabled=ws.settings.ocr_enabled,
-                   ocr_languages=sorted(available_langs(ws.settings)), xml_profile=ws.settings.schema_profile,
+                   ocr_languages=sorted(available_langs(ws.settings)), xml_profile=WORKSPACE_XML_PROFILE,
                    ollama="connected" if glm_info["connected"] or qwen["connected"] else "unavailable",
                    ocr_backend=ws.settings.ocr_backend, qwen={**qwen, "enabled": ws.settings.ollama_enabled},
                    glm_ocr=glm_info, paddle_ocr=paddle.readiness(ws.settings),
@@ -151,6 +156,68 @@ def documents():
     return jsonify(workspace().documents(browser_owner(create=True)))
 
 
+@api.route("/ocr-settings", methods=["GET", "PATCH"])
+def ocr_settings():
+    from ocr.recognition import ENGINE_MODES
+    from ocr.summary import health, observed_runs
+    from startup import ROOT, read_json
+
+    ws, owner = workspace(), browser_owner(create=True)
+    if request.method == "PATCH":
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or body.get("engine") not in ENGINE_MODES:
+            return fail("Choose a supported OCR engine or Automatic.", 400)
+        ws.set_ocr_preference(owner, body["engine"])
+    data = {"engine": ws.ocr_preference(owner), "automatic_primary": ws.settings.ocr_automatic_primary,
+            "automatic_secondary": ws.settings.ocr_automatic_secondary,
+            "automatic_tertiary": ws.settings.ocr_automatic_tertiary}
+    if request.method == "PATCH" or request.args.get("detail") != "1":
+        return jsonify(data)
+    with ws.db() as db:
+        jobs = db.execute("""SELECT j.result, j.finished FROM jobs j JOIN documents d ON d.id=j.document_id
+                             WHERE d.owner=? AND j.finished IS NOT NULL AND j.result IS NOT NULL
+                             ORDER BY j.finished DESC LIMIT 50""", (owner,)).fetchall()
+        probes = {row["engine"]: json.loads(row["result"]) for row in db.execute(
+            "SELECT engine, result FROM ocr_probes WHERE owner=?", (owner,))}
+    results = [{**json.loads(row["result"]), "finished": row["finished"]} for row in jobs]
+    runs = observed_runs(results)
+    logs = current_app.extensions.get("startup_logs", ROOT / "logs")
+    return jsonify(**data, engines=health(ws.settings, runs, probes), measurements=runs, jobs_sampled=len(jobs),
+                   benchmark=read_json(logs / "ocr-comparison.json"))
+
+
+@api.post("/ocr-test")
+def test_ocr_engine():
+    from ocr.probe import test_engine
+    from ocr.recognition import OCR_ENGINES
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or body.get("engine") not in OCR_ENGINES:
+        return fail("Choose one OCR engine to test.", 400)
+    owner, ws = browser_owner(create=True), workspace()
+    engine = body["engine"]
+    try:
+        result = ws.worker.submit(test_engine, ws.settings, engine).result()
+    except (OSError, RuntimeError, ValueError):
+        current_app.logger.exception("The local OCR engine test could not be completed.")
+        return fail("The OCR test worker stopped. See the local application log.", 503)
+    with ws.db() as db:
+        db.execute("INSERT INTO ocr_probes VALUES (?, ?, ?) ON CONFLICT(owner,engine) DO UPDATE SET result=excluded.result",
+                   (owner, engine, json.dumps(result)))
+    return jsonify(result)
+
+
+def requested_ocr(engine, language):
+    from ocr.paddle import LANGUAGES
+    from ocr.recognition import ENGINE_MODES
+
+    if engine is not None and engine not in ENGINE_MODES:
+        raise ValueError("Choose a supported OCR engine or Automatic.")
+    if language is not None and (not isinstance(language, str) or language not in {"", *LANGUAGES}):
+        raise ValueError("Choose a supported PaddleOCR language.")
+    return engine, language
+
+
 @api.route("/profile", methods=["GET", "PATCH"])
 def profile():
     ws = workspace()
@@ -165,6 +232,10 @@ def profile():
 
 @api.post("/documents")
 def create_document():
+    try:
+        engine, language = requested_ocr(request.form.get("ocr_engine"), request.form.get("ocr_language"))
+    except ValueError as error:
+        return fail(str(error), 400)
     uploaded, error = upload_file("pdf", ".pdf", b"%PDF-")
     if error:
         return fail(error, 400)
@@ -173,7 +244,7 @@ def create_document():
     if previous and not ws.owns(previous, browser_owner()):
         return fail("The previous document version does not exist.", 400)
     filename, stream = uploaded
-    document_id = ws.upload(filename, stream, previous, browser_owner(create=True))
+    document_id = ws.upload(filename, stream, previous, browser_owner(create=True), engine=engine, language=language)
     return jsonify(ws.get(document_id)), 202
 
 
@@ -204,10 +275,11 @@ def view(ir: DocIR) -> dict:
                            "n_items": len(block.children) or len(block.cells)})
             if block.kind == "title" and title is None:
                 title = {"value": block.text, "page": page.n, "bbox": block.bbox if aligned else None,
-                         "confidence": None if block.ocr_engine == "glm-ocr" else block.conf}
+                         "confidence": None if block.ocr_engine in {"glm-ocr", "paddleocr-vl"} else block.conf}
         diag = {key: page.diag[key] for key in ("health", "decision", "reasons", "ocr", "confidence", "rotation",
                                               "layout", "native_chars", "has_native_text", "short_native_text",
-                                              "appears_scanned", "has_images", "ocr_required", "review_reasons")
+                                              "appears_scanned", "has_images", "ocr_required", "review_reasons",
+                                              "selected_ocr_engine")
                 if key in page.diag}
         pages.append({"n": page.n, "w": page.width, "h": page.height, "source": page.source,
                       "diag": diag, "blocks": blocks, "ocr_engine": page.ocr_engine,
@@ -236,7 +308,14 @@ def retry(document_id: str):
     ws = workspace()
     if ws.get(document_id) is None:
         return fail("Document not found.", 404)
-    if not ws.enqueue(document_id):
+    body = request.get_json(silent=True) if request.is_json else {}
+    if not isinstance(body, dict):
+        return fail("Send OCR options as an object.", 400)
+    try:
+        engine, language = requested_ocr(body.get("ocr_engine"), body.get("ocr_language"))
+    except ValueError as error:
+        return fail(str(error), 400)
+    if not ws.enqueue(document_id, engine=engine, language=language):
         return fail("A processing attempt is already active.", 409)
     return jsonify(ws.get(document_id)), 202
 
@@ -283,20 +362,79 @@ def xml(document_id: str):
     if info is None:
         return fail("Document not found.", 404)
     download = request.args.get("download") == "1"
+    profile = request.args.get("profile", WORKSPACE_XML_PROFILE)
+    download_format = request.args.get("format", "auto")
+    if profile not in {"sample", "brief", "example"}:
+        return fail("Choose the sample, brief, or example XML profile.", 400)
+    if download_format not in {"auto", "xml", "zip"}:
+        return fail("Choose XML or ZIP for the download format.", 400)
     if download and not info["approved"]:
         return fail("Approve the review before exporting the XML.", 409)
-    result = ws.xml(document_id)
-    if result is None:
+    snapshot = ws.extracted(document_id)
+    if snapshot is None:
         return fail("Extracted XML is unavailable.", 409)
-    data, validation = result
+    ir, settings, extraction = snapshot
+    settings = replace(settings, schema_profile=profile)
+    stem = output_stem(info["filename"])
+    ir.meta["asset_stem"] = stem
+    assets, locations = {}, {}
+    data = to_xml(ir, settings, locations=locations, assets=assets)
+    validation = validate_xml(data, len(ir.pages), settings)
     if not validation["well_formed"] or validation["issues"]:
         return fail("XML validation failed. " + " ".join(validation["issues"]), 422)
     if download:
-        extracted = ws.extracted(document_id)
-        draft = bool(extracted and extracted[2].get("multilingual_validation", {}).get("blocking_pages"))
+        completeness = compare_content(data, ir, locations, sample=profile == WORKSPACE_XML_PROFILE)
+        draft = bool(extraction.get("multilingual_validation", {}).get("blocking_pages") or completeness["issues"])
+        filename = f"{stem}{'_draft' if draft else ''}.xml"
+        if download_format == "zip" or (download_format == "auto" and assets):
+            try:
+                with TemporaryDirectory(prefix="xml-export-", dir=ws.source(document_id).parent) as temp:
+                    folder = Path(temp)
+                    if assets:
+                        data = materialize_assets(data, assets, ir.path, folder, deduplicate=False)
+                    path = folder / filename
+                    path.write_bytes(data)
+                    images = inspect_assets(data, folder)
+                    save_original_images(data, ir, locations, folder, images)
+                    reports = {
+                        "manifest.json": {"document_id": document_id, "xml_profile": profile, "xml": filename,
+                                          "images": images["files"], "image_originals": images["original_files"],
+                                          "status": "review_required" if draft else completeness["status"]},
+                        "reports/xml_validation_report.json": {**validation, "unicode": verify_unicode(data, ir, locations)},
+                        "reports/content_completeness_report.json": {
+                            key: value for key, value in completeness.items() if key != "formatting"},
+                        "reports/formatting_report.json": completeness["formatting"],
+                        "reports/image_asset_report.json": images,
+                    }
+                    return download_saved_xml(path, force_zip=True, images=images, reports=reports)
+            except (OSError, ValueError, RuntimeError):
+                current_app.logger.exception("Could not package the document XML")
+                return fail("The XML and its images could not be packaged.", 422)
         return send_file(io.BytesIO(data), mimetype="application/xml", as_attachment=True,
-                         download_name=f'{Path(info["filename"]).stem}{"_draft" if draft else ""}.xml')
+                         download_name=filename)
     return Response(data, mimetype="text/plain; charset=utf-8")
+
+
+def download_saved_xml(path, *, force_zip=False, images=None, reports=None):
+    """Download saved XML together with its exact existing asset files."""
+    if request.args.get("format") != "xml":
+        assets = images if images is not None else inspect_assets(path.read_bytes(), path.parent)
+        if not assets["valid"]:
+            return fail("The XML has unresolved pictures. Re-export it from the source PDF.", 422)
+        if assets["files"] or force_zip or request.args.get("format") == "zip":
+            archive = SpooledTemporaryFile(max_size=8 * 1024 * 1024)
+            try:
+                write_zip(archive, path.parent, [path.name, *assets["files"], *assets.get("original_files", [])], reports)
+                if not validate_archive(archive, path.name)["valid"]:
+                    raise ValueError("The extracted XML has unresolved image references.")
+                archive.seek(0)
+            except (OSError, ValueError, RuntimeError):
+                archive.close()
+                current_app.logger.exception("Could not package the saved XML")
+                return fail("The XML and its images could not be packaged.", 422)
+            return send_file(archive, mimetype="application/zip", as_attachment=True,
+                             download_name=f"{path.stem}.zip")
+    return send_file(path, as_attachment=True, download_name=path.name)
 
 
 def version_changes(document_id: str, previous_id: str, current=None, previous=None) -> list[dict] | None:
@@ -310,7 +448,7 @@ def version_changes(document_id: str, previous_id: str, current=None, previous=N
         return None
     ir, settings, _ = new
     locations = {}
-    to_xml(ir, settings, locations)
+    to_xml(ir, replace(settings, schema_profile=WORKSPACE_XML_PROFILE), locations)
     changes = compare_ir(old[0], ir)
     for change in changes:
         target = change["new_location"]
@@ -413,7 +551,7 @@ def sync_deck(document_id: str):
     ir, settings, extraction = extracted
     if ir.meta.get("ocr_metadata_version") != 2:
         return fail("Retry PDF extraction to generate current language and source validation before exporting.", 409)
-    settings = replace(settings, schema_profile="sample")
+    settings = replace(settings, schema_profile=WORKSPACE_XML_PROFILE)
     previous = None
     if mode == "version":
         if previous_id and previous_id != document_id and ws.owns(previous_id, browser_owner()):
@@ -500,6 +638,8 @@ def download_export(document_id: str, export_id: UUID):
         folder, report = found
         item = report["outputs"].get(kind)
         if item and item["valid"] and (file := export_file(folder, item["filename"])):
+            if kind == "xml" and request.args.get("format") in {"auto", "zip"}:
+                return download_saved_xml(file)
             return send_file(file, as_attachment=True, download_name=item["filename"])
     else:
         legacy = workspace().source(document_id).parent / "presentations" / export_id.hex

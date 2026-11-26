@@ -127,12 +127,15 @@ def preprocess(gray: np.ndarray, settings, orient: bool = True, deskew: bool = T
     return img, info
 
 
-def ocr_image(img: np.ndarray, langs: str, dpi: int, settings, psm: int | None = None) -> list[Line]:
+def ocr_image(img: np.ndarray, langs: str, dpi: int, settings, psm: int | None = None, *,
+              character_whitelist: str = "", input_reference: str = "pdf/page/render") -> list[Line]:
     ok, buf = cv2.imencode(".png", img)
     cmd = [find_tesseract(settings), "stdin", "stdout", "-l", langs, "--psm", str(psm or settings.ocr_psm), "-c", "preserve_interword_spaces=0", "tsv"]
+    if character_whitelist:
+        cmd[-1:-1] = ["-c", f"tessedit_char_whitelist={character_whitelist}"]
     image = buf.tobytes()
     with audit.execution("ocr", "tesseract", langs, input_type="rendered_png",
-                         input_sha256=audit.digest(image), input_reference="pdf/page/render") as event:
+                         input_sha256=audit.digest(image), input_reference=input_reference) as event:
         if event:
             event["request_status"] = "sent"
         r = _run(cmd, image, settings.ocr_timeout_s, settings)

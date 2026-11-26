@@ -1,4 +1,4 @@
-"""Page-by-page PaddleOCR fallback with a bounded local CPU worker."""
+"""Page-by-page PaddleOCR with a bounded local CPU worker."""
 from __future__ import annotations
 
 import importlib.util
@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from importlib.metadata import PackageNotFoundError, version
 
 from config.settings import Settings
 from layout.model import Line
@@ -18,6 +19,7 @@ from utils import execution_audit as audit
 LATIN = {"en", "fr", "de", "nl", "it", "cs", "sk"}
 RECOGNIZERS = {"ja": "PP-OCRv5_mobile_rec", "zh": "PP-OCRv5_mobile_rec",
                "ko": "korean_PP-OCRv5_mobile_rec", "ar": "arabic_PP-OCRv3_mobile_rec"}
+LANGUAGES = LATIN | RECOGNIZERS.keys()
 
 
 def models(settings: Settings, language: str) -> tuple[Path, Path]:
@@ -31,15 +33,30 @@ def models(settings: Settings, language: str) -> tuple[Path, Path]:
 
 
 def readiness(settings: Settings, language: str = "en") -> dict:
+    installed = bool(importlib.util.find_spec("paddle") and importlib.util.find_spec("paddleocr"))
     try:
         detector, recogniser = models(settings, language)
     except RecognitionError as error:
-        return {"ready": False, "reason": str(error)}
-    if not importlib.util.find_spec("paddle") or not importlib.util.find_spec("paddleocr"):
-        return {"ready": False, "reason": "Install PaddlePaddle CPU and PaddleOCR in this environment."}
-    if not all((folder / "inference.yml").is_file() for folder in (detector, recogniser)):
-        return {"ready": False, "reason": "PaddleOCR detector or recognition weights are not provisioned."}
-    return {"ready": True, "reason": None, "model": recogniser.name}
+        return {"ready": False, "installed": installed, "model_available": False, "reason": str(error)}
+    provisioned = all((folder / "inference.yml").is_file() for folder in (detector, recogniser))
+    reason = ("Install PaddlePaddle CPU and PaddleOCR in this environment." if not installed else
+              "PaddleOCR detector or recognition weights are not provisioned." if not provisioned else None)
+    versions = {}
+    for package in ("paddleocr", "paddlepaddle"):
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            continue
+    return {"ready": reason is None, "installed": installed, "model_available": provisioned,
+            "versions": versions,
+            "reason": reason, "model": recogniser.name, "language": settings.paddle_ocr_lang or language}
+
+
+def available_languages(settings: Settings) -> list[str]:
+    from dataclasses import replace
+
+    discovered = replace(settings, paddle_ocr_lang="")
+    return [language for language in sorted(LANGUAGES) if readiness(discovered, language)["model_available"]]
 
 
 def worker(connection, detector: Path, recogniser: Path) -> None:
@@ -113,12 +130,30 @@ class PaddleOCR:
         number = page.number + 1
         with audit.execution("page_ocr", "paddleocr", status["model"], page=number, language=language,
                              input_type="rendered_grayscale_pixels", input_sha256=audit.digest(image.tobytes()),
-                             input_reference=f"pdf/page/{number}/render", image_shape=list(image.shape)) as event:
+                             input_reference=f"pdf/page/{number}/render", image_shape=list(image.shape),
+                             runtime_versions=status.get("versions", {})) as event:
+            worker_process = None
+            before = None
             if event:
+                import psutil
+                try:
+                    worker_process = psutil.Process(self.process.pid)
+                    clocks = worker_process.cpu_times()
+                    before = clocks.user + clocks.system
+                except psutil.Error:
+                    pass
                 event["request_status"] = "sent"
             self.connection.send(image)
             payload = self._receive(deadline)
             audit.response(event, payload, executed=True)
+            if event and worker_process:
+                try:
+                    event["worker_rss_bytes"] = worker_process.memory_info().rss
+                    if before is not None:
+                        clocks = worker_process.cpu_times()
+                        event["worker_cpu_seconds"] = round(max(0, clocks.user + clocks.system - before), 3)
+                except psutil.Error:
+                    pass
             result = parse(number, payload["output"], effective_dpi, status["model"])
             if event:
                 result.execution_ids.append(event["execution_id"])

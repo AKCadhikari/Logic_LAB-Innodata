@@ -6,7 +6,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from tempfile import TemporaryDirectory
 from zipfile import ZipFile
 
-import pymupdf
+from PIL import Image
 
 from quality.conformance import tree
 
@@ -29,7 +29,11 @@ def inspect_assets(data: bytes, folder: Path) -> dict:
         meaning = node.get("type") or node.get("kind") or node.getparent().get("kind")
         kind = "equation" if meaning in {"formula", "equation"} else "pseudocode" if meaning == "pseudocode" else "figure"
         row = {"src": source, "kind": kind, "page": node.get("page"),
+               "id": node.get("id"), "caption": node.getparent().findtext("figcaption"),
+               "bbox": [node.get(key) for key in ("x0", "y0", "x1", "y1")],
                "xml_node": root.getroottree().getpath(node)}
+        if not row["page"]:
+            row["page"] = node.xpath("string(ancestor::page[1]/@n | ancestor::page[1]/@num)") or None
         if not source:
             unknown_geometry.append({**row, "status": "MANUAL_REVIEW_REQUIRED"})
             continue
@@ -41,14 +45,27 @@ def inspect_assets(data: bytes, folder: Path) -> dict:
                 verified[source] = "missing"
             else:
                 try:
-                    pixmap = pymupdf.Pixmap(str(base / source))
-                    verified[source] = "resolved" if pixmap.width and pixmap.height else "missing"
-                except (RuntimeError, ValueError, OSError):
+                    with Image.open(base / source) as image:
+                        width, height = image.size
+                        fmt = image.format.lower()
+                        image.verify()
+                    extension = Path(source).suffix.lstrip(".").lower()
+                    if extension == "jpg":
+                        extension = "jpeg"
+                    verified[source] = ({"format": fmt, "width": width, "height": height}
+                                        if fmt == extension and width > 0 and height > 0 else "invalid")
+                except (RuntimeError, ValueError, OSError, Image.DecompressionBombError):
                     verified[source] = "missing"
         if verified[source] == "invalid":
             invalid.append(row)
         elif verified[source] == "missing":
             missing.append(row)
+        else:
+            row.update(verified[source])
+            declared = node.get("format")
+            if (declared and declared.lower().replace("jpg", "jpeg") != row["format"]) or any(
+                    node.get(key) is not None and node.get(key) != str(row[key]) for key in ("width", "height")):
+                invalid.append(row)
     for node in root.xpath("//p[@kind='equation']"):
         unknown_geometry.append({"kind": "equation", "page": node.get("page"),
                                  "xml_node": root.getroottree().getpath(node), "status": "MANUAL_REVIEW_REQUIRED"})
@@ -60,7 +77,7 @@ def inspect_assets(data: bytes, folder: Path) -> dict:
             "missing_figure_assets": [row for row in [*missing, *invalid] if row["kind"] == "figure"],
             "missing_equation_assets": [row for row in [*missing, *invalid] if row["kind"] == "equation"],
             "manual_review": unknown_geometry, "references": references,
-            "files": sorted(source for source, status in verified.items() if status == "resolved")}
+            "files": sorted(source for source, status in verified.items() if isinstance(status, dict))}
 
 
 def validate_archive(archive, xml_name: str, deck_name: str | None = None) -> dict:

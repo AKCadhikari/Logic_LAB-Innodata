@@ -1,20 +1,54 @@
 """Post-serialization validation: well-formedness, vocabulary, page numbering, language, heading sanity."""
 from __future__ import annotations
 import re
+from functools import lru_cache
+from math import isfinite
+from pathlib import Path
 from lxml import etree
 from utils.textutil import norm_ws
 from xml_engine.serializer import ALLOWED, PROFILES
 
 
+DECLARATION = re.compile(rb"""^<\?xml\s+version=(["'])1\.0\1\s+encoding=(["'])UTF-8\2(?:\s+standalone=(["'])(?:yes|no)\3)?\s*\?>""", re.I)
+
+
+@lru_cache
+def profile_schema(profile):
+    source = Path(__file__).with_name("schemas") / f"{profile}.xsd"
+    return etree.XMLSchema(etree.parse(str(source), parser=etree.XMLParser(resolve_entities=False, no_network=True)))
+
+
+def _valid_box(values):
+    try:
+        x0, y0, x1, y1 = map(float, values)
+        return all(map(isfinite, (x0, y0, x1, y1))) and x0 <= x1 and y0 <= y1
+    except (TypeError, ValueError):
+        return False
+
+
 def validate_xml(data: bytes, expected_pages: int, settings) -> dict:
     issues: list[str] = []
+    profile = settings.schema_profile if settings.schema_profile in {*PROFILES, "sample"} else "brief"
+    schema = {"profile": profile, "file": f"{profile}.xsd", "authority": "DocuSync local schema",
+              "valid": False, "errors": []}
     cfg = PROFILES.get(settings.schema_profile, PROFILES["brief"])
     try:
         root = etree.fromstring(data, parser=etree.XMLParser(resolve_entities=False, no_network=True))
     except etree.XMLSyntaxError as e:
-        return {"well_formed": False, "issues": [f"not well-formed: {e}"], "pages": 0}
+        return {"well_formed": False, "issues": [f"not well-formed: {e}"], "pages": 0, "xsd": schema}
+    declaration_ok = bool(DECLARATION.match(data.removeprefix(b"\xef\xbb\xbf")))
+    if not declaration_ok:
+        issues.append("An XML 1.0 declaration with UTF-8 encoding is required.")
     if root.getroottree().docinfo.doctype:
         issues.append("Document type declarations are unsupported.")
+    else:
+        try:
+            profile_schema(profile).assertValid(root)
+            schema["valid"] = True
+        except etree.DocumentInvalid as error:
+            schema["errors"] = [{"line": item.line, "path": item.path, "message": item.message}
+                                for item in error.error_log]
+            issues.append(f"XSD {profile}.xsd rejected the XML structure.")
     if root.tag != "document":
         issues.append("root element is not <document>")
     if not root.get("lang"):
@@ -38,6 +72,26 @@ def validate_xml(data: bytes, expected_pages: int, settings) -> dict:
         valid_pages = {str(number) for number in range(1, expected_pages + 1)}
         if any(node.get("page") not in valid_pages for node in root.iter() if node.get("page") is not None):
             issues.append("A sample-format element refers to a page outside the source PDF.")
+        ids = set()
+        for node in root.iter():
+            if anchor := node.get("continues_from"):
+                if anchor not in ids:
+                    issues.append("A continuation must refer to an earlier XML element.")
+                    break
+            if identifier := node.get("id"):
+                if identifier in ids:
+                    issues.append("Sample-format element IDs must be unique.")
+                    break
+                ids.add(identifier)
+        for node in root.iter():
+            box = [node.get(key) for key in ("x0", "y0", "x1", "y1")]
+            if any(value is not None for value in box) and not _valid_box(box):
+                issues.append("A sample-format bounding box is incomplete or invalid.")
+                break
+            if "sub_bboxes" in node.attrib and not all(
+                    _valid_box(box.split(",")) for box in node.get("sub_bboxes").split("|")):
+                issues.append("A sample-format line bounding box is invalid.")
+                break
     else:
         pages = root.findall("page")
         page_attr = cfg["page_attr"]
@@ -62,8 +116,12 @@ def validate_xml(data: bytes, expected_pages: int, settings) -> dict:
     content_pages = {e.get("page") for e in root.iter() if e.get("page")} if sample else set()
     empty = ([number for number in nums if number not in content_pages] if sample else
              [p.get(page_attr) for p in pages if not "".join(p.itertext()).strip() and p.find(".//figure") is None])
-    return {"well_formed": True, "issues": issues, "pages": len(pages), "empty_pages": empty,
+    formulas = root.xpath(".//img[@type='formula']|.//p[@kind='equation']")
+    return {"well_formed": True, "declaration_utf8": declaration_ok, "xsd": schema,
+            "issues": issues, "pages": len(pages), "empty_pages": empty,
             "tables": len(root.findall(".//table")), "figures": len(root.findall(".//figure_wrap" if sample else ".//figure")),
+            "formulas": len(formulas), "formula_transcriptions": sum(bool(node.get("formula_encoding")) for node in formulas),
+            "formulas_for_review": sum(node.get("formula_status") == "review_required" for node in formulas),
             "headings": sum(len(root.findall(f".//h{i}")) for i in range(1, 7)), "chars": len("".join(root.itertext()))}
 
 

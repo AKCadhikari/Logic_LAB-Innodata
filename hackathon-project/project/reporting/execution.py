@@ -38,6 +38,12 @@ def reports(ir, evidence, xml=None, locations=None, *, edits=(), analysis=None, 
             paddle_attempted |= any(item["engine"] == "paddleocr" for item in page.diag.get("ocr", {}).get("attempts", []))
             method = "NATIVE_EXTRACTION_USED" if page.source == "native" else "OCR_OUTPUT_USED" if page.source == "ocr" else page.source
             pages.append({"page": page.n, "method": method, "ocr_required": page.diag.get("ocr_required"),
+                          "selected_ocr_engine": page.diag.get("selected_ocr_engine"),
+                          "ocr_engine_used": page.ocr_engine or None,
+                          "executed_ocr_engines": sorted({row.get("ocr_engine") or row["provider"] for row in executions
+                                                         if row.get("page") == page.n and row["executed"]
+                                                         and (row["task"] == "page_ocr" or row.get("ocr_engine") == "tesseract")}),
+                          "ocr_attempts": page.diag.get("ocr", {}).get("attempts", []),
                           "ocr_status": page.diag.get("ocr", {}).get("status"),
                           "source_execution_ids": page.diag.get("ocr", {}).get("selected_execution_ids", []),
                           "reused_cache": bool(page.diag.get("ocr", {}).get("cached")),

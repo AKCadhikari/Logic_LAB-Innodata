@@ -17,6 +17,7 @@ from quality.conformance import tree
 from lxml import etree
 from xml_engine.serializer import to_xml
 from xml_engine.validate import validate_xml, verify_unicode
+from xml_engine.completeness import compare_content
 from reporting.execution import reports as execution_reports
 
 
@@ -27,6 +28,7 @@ def output_stem(filename: str) -> str:
 
 
 def write_report(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     staged = path.with_suffix(".tmp")
     staged.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     staged.replace(path)
@@ -52,7 +54,7 @@ def correction_record(document_id: str, item: dict) -> dict:
             "manual_review_required": review, "change_type": item.get("change_type")}
 
 
-def materialize_assets(data: bytes, assets: dict, pdf_path: str, folder: Path) -> bytes:
+def materialize_assets(data: bytes, assets: dict, pdf_path: str, folder: Path, *, deduplicate: bool = True) -> bytes:
     seen, aliases = {}, {}
     with pymupdf.open(pdf_path) as pdf:
         for name, (page, box) in assets.items():
@@ -64,7 +66,7 @@ def materialize_assets(data: bytes, assets: dict, pdf_path: str, folder: Path) -
                 raise ValueError("An image crop lies outside its source page.")
             pixels = source.get_pixmap(dpi=180, clip=clip, alpha=False).tobytes("png")
             fingerprint = sha256(pixels).digest()
-            if fingerprint in seen:
+            if deduplicate and fingerprint in seen:
                 aliases[name] = seen[fingerprint]
                 continue
             seen[fingerprint] = name
@@ -80,6 +82,45 @@ def materialize_assets(data: bytes, assets: dict, pdf_path: str, folder: Path) -
     return etree.tostring(root, encoding="UTF-8", xml_declaration=True, pretty_print=True)
 
 
+def save_original_images(data, ir, locations, folder, asset_report):
+    """Keep embedded picture bytes beside the positioned render used by the XML."""
+    candidates = [(block, locations.get(id(block))) for page in ir.pages for block in page.blocks
+                  if block.tag == "figure" and block.source_reference.get("image", {}).get("xref")]
+    asset_report["original_files"] = []
+    if not candidates:
+        return
+    root = tree(data)
+    references = {item["xml_node"]: item for item in asset_report["references"]}
+    with pymupdf.open(ir.path) as pdf:
+        for block, path in candidates:
+            nodes = root.xpath(path + "/img") if path else []
+            if not nodes:
+                continue
+            image = nodes[0]
+            entry = references.get(root.getroottree().getpath(image))
+            if not entry or not entry["src"]:
+                continue
+            xref = block.source_reference["image"]["xref"]
+            try:
+                info = pdf.extract_image(xref)
+                ext = info.get("ext") if info else None
+                if ext not in {"png", "jpeg", "jpg", "jp2", "webp", "tiff", "bmp", "gif"} or not info["image"]:
+                    raise ValueError("The embedded image encoding has no portable original file.")
+                asset = Path(entry["src"])
+                original = asset.parent / "originals" / (asset.stem + "." + ext)
+                if not relative_path(original.as_posix()):
+                    raise ValueError("The original image path is invalid.")
+                target = folder / original
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(info["image"])
+                entry["original"] = {"file": original.as_posix(), "pdf_object": xref, "format": ext,
+                                     "width": info["width"], "height": info["height"],
+                                     "sha256": sha256(info["image"]).hexdigest()}
+                asset_report["original_files"].append(original.as_posix())
+            except (OSError, RuntimeError, ValueError) as error:
+                entry["original"] = {"status": "unavailable", "pdf_object": xref, "reason": str(error)}
+
+
 def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, report: dict,
                      transform, *, xml_only: bool = False) -> dict:
     """Write validated XML first, then publish the deck and the final status."""
@@ -91,6 +132,7 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
     result = {**report, "output_folder": str(folder), "outputs": outputs, "applied": [], "review": [],
               "status": "failed", "xml_profile": settings.schema_profile}
     assets = {}
+    completeness = {"status": "unavailable"}
     corrections = []
     audited_edits = []
     verification_executions = []
@@ -121,6 +163,15 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         ]
         if not asset_report["valid"]:
             raise ValueError("The generated XML refers to unresolved image assets.")
+        save_original_images(data, ir, locations, folder, asset_report)
+        completeness = compare_content(data, ir, locations, sample=settings.schema_profile == "sample")
+        quality["completeness"] = {"status": completeness["status"], "issues": len(completeness["issues"]),
+                                   "source_review": len(completeness["source_review"])}
+        if completeness["status"] == "review_required" and quality.get("status") != "manual_review_required":
+            quality["status"] = "validation_partial"
+        if completeness["issues"]:
+            quality["blocking_pages"] = sorted(set(quality.get("blocking_pages", [])) |
+                                               {row["page"] for row in completeness["issues"] if row["page"]})
         staged.replace(xml_path)
         outputs["xml"] = file_info(xml_path)
         validation["xml"]["valid"] = True
@@ -131,7 +182,7 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
     finally:
         staged.unlink(missing_ok=True)
 
-    if outputs["xml"] and quality.get("blocking_pages"):
+    if outputs["xml"] and (quality.get("blocking_pages") or completeness.get("issues")):
         outputs["xml"]["draft"] = True
         result.update(status="manual_review_required",
                       error="The XML is a draft. Resolve missing or corrupt source text before updating PowerPoint.")
@@ -167,6 +218,7 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
     result["validation"] = validation
     result["content_validation"] = quality
     result["xml_assets"] = validation["xml"]["assets"]["files"] if outputs["xml"] else []
+    originals = validation["xml"]["assets"].get("original_files", []) if outputs["xml"] else []
     result["archive"] = None
     reports = {
         "ocr_report.json": {"summary": extraction.get("processing_counts"), "pages": extraction.get("page_log", [])},
@@ -174,6 +226,14 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         "correction_report.json": {"document_id": report["document_id"], "corrections": corrections},
         "document_profile.json": extraction.get("document_profile", {}),
         "multilingual_validation_report.json": quality,
+        "reports/xml_validation_report.json": validation["xml"],
+        "reports/content_completeness_report.json": {key: value for key, value in completeness.items() if key != "formatting"},
+        "reports/formatting_report.json": completeness.get("formatting", {}),
+        "reports/image_asset_report.json": validation["xml"].get("assets", {"valid": False}),
+        "manifest.json": {"document_id": report["document_id"], "xml_profile": settings.schema_profile,
+                          "status": result["status"], "outputs": {key: item["filename"] if item else None
+                                                                 for key, item in outputs.items()},
+                          "images": result["xml_assets"], "image_originals": originals},
     }
     evidence = extraction.get("execution_evidence", {})
     evidence = {**evidence, "executions": [*evidence.get("executions", []), *verification_executions]}
@@ -182,28 +242,32 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
                                      locations if outputs["xml"] else None,
                                      edits=audited_edits, analysis=result.get("analysis"),
                                      pptx=deck_path if outputs["pptx"] else None))
-    if result["status"] == "completed":
+    complete = result["status"] == "completed"
+    if complete or (outputs["xml"] and result["xml_assets"] and not outputs["pptx"]):
         archive = folder / f"{stem}.zip"
         temp_zip = archive.with_suffix(".tmp")
-        files = [xml_path.name, deck_path.name, *result["xml_assets"]]
+        deck_name = deck_path.name if complete else None
+        files = [xml_path.name, *([deck_name] if deck_name else []), *result["xml_assets"], *originals]
         try:
             write_zip(temp_zip, folder, files)
-            validation["zip"] = validate_archive(temp_zip, xml_path.name, deck_path.name)
+            validation["zip"] = validate_archive(temp_zip, xml_path.name, deck_name)
             if not validation["zip"]["valid"]:
                 raise ValueError("Image references are missing after extracting the ZIP.")
             reports["processing_report.json"] = {**result, "metadata": ir.meta,
                                                   "extraction_seconds": extraction.get("seconds")}
             validation["zip"]["entries"] = len(files) + len(reports)
             write_zip(temp_zip, folder, files, reports)
-            final_check = validate_archive(temp_zip, xml_path.name, deck_path.name)
+            final_check = validate_archive(temp_zip, xml_path.name, deck_name)
             if not final_check["valid"]:
                 raise ValueError("Final ZIP validation failed.")
             temp_zip.replace(archive)
             result["archive"] = file_info(archive)
         except Exception:
             logging.getLogger(__name__).exception("ZIP export failed")
-            result.update(status="partial", error="The validated XML and PowerPoint are available. ZIP validation failed.")
-            validation["zip"] = {"valid": False, "error": result["error"]}
+            message = "ZIP validation failed. The validated XML and its image folder are available."
+            if complete:
+                result.update(status="partial", error=message)
+            validation["zip"] = {"valid": False, "error": message}
         finally:
             temp_zip.unlink(missing_ok=True)
     reports["processing_report.json"] = {**result, "metadata": ir.meta if ir else {},

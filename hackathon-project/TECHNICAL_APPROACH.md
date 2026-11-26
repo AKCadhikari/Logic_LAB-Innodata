@@ -1,7 +1,8 @@
 # Technical approach
 
 The batch pipeline and the Flask workspace share the same [local OCR pipeline](docs/LOCAL_OCR.md).
-GLM-OCR uses the loopback Ollama API when a page requires recognition. The workspace uses Qwen3 4B to
+GLM-OCR and the PaddleOCR-VL adapter use the loopback Ollama API. PaddleOCR Python uses a bounded local
+worker with provisioned weights. Each processing attempt snapshots its OCR selector settings. The workspace uses Qwen3 4B to
 classify selected version changes and suggest review priorities. Deterministic source and slide matches
 control PowerPoint edits.
 
@@ -24,7 +25,7 @@ predate the package-preserving repair engine.
 |---|---|---|
 | Ingestion | `ingestion/discover.py` | recursive discovery, header validation, SHA-1, duplicates, manifest |
 | Document analysis | `diagnostics/page_diagnostics.py` | control chars, private-use glyphs, mojibake, word plausibility, image coverage, scripts |
-| OCR | `ocr/router.py`, `ocr/glm.py`, `ocr/paddle.py`, `ocr/quality.py` | GLM-OCR via local Ollama with quality checks and page-level PaddleOCR fallback |
+| OCR | `ocr/router.py`, `ocr/glm.py`, `ocr/paddle_vl.py`, `ocr/paddle.py`, `ocr/quality.py` | Per-job engine selection, common page results, validation and audited fallback |
 | Layout | `layout/docling_adapter.py`, `layout/reconstruct.py`, `layout/kinds.py` | Docling regions and reading order, native geometry, deterministic reconstruction |
 | Shared IR | `layout/model.py` | Pydantic document, page, block, cell, span, coordinates, extraction method and confidence |
 | XML | `xml_engine/` | `lxml` serializer and validation for the brief and sample profiles |

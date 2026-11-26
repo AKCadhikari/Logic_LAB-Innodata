@@ -3,6 +3,9 @@ from dataclasses import dataclass, field
 
 from layout.model import Block, Line
 
+OCR_ENGINES = ("glm-ocr", "paddleocr-vl", "paddleocr")
+ENGINE_MODES = ("automatic", *OCR_ENGINES)
+
 
 class RecognitionError(RuntimeError):
     def __init__(self, message: str, *, unavailable: bool = False, status: str = "rejected"):
@@ -21,6 +24,14 @@ class Recognition:
     issues: list[str] = field(default_factory=list)
     confidence: float | None = None
     execution_ids: list[str] = field(default_factory=list)
+    duration_ms: float | None = None
+    language: dict = field(default_factory=dict)
+    extraction_method: str = "ocr"
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def model(self) -> str | None:
+        return self.raw.get("model")
 
     def text(self) -> str:
         def content(block: Block) -> str:

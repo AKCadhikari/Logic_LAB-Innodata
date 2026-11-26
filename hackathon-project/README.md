@@ -78,6 +78,34 @@ launcher. `-NoBrowser` suppresses the browser for smoke tests. Advanced commands
 
 Upload one PDF at a time. The local workspace stores each original and its processing attempts under `storage/`
 and shows job progress, native-text diagnostics, OCR attempts, layout status, and pages flagged for review.
+Choose **OCR engine** before upload or reprocessing. **GLM-OCR**, **PaddleOCR-VL (Ollama)** and
+**PaddleOCR (Python)** are strict choices. **Automatic** defaults to GLM-OCR, then PaddleOCR-VL, then
+PaddleOCR Python. It advances after an unavailable engine, a timeout, rejected output, or a result
+requiring corroboration. A disagreement leaves one result flagged for review.
+Pages with a usable native layer continue through native extraction. Uncheck **Remember engine** for an override
+that applies only to the next submission. Each attempt retains its own engine and model settings.
+
+Use **PaddleOCR language** for an image-only page with a known language. When there is no language evidence,
+PaddleOCR uses the configured default (`DOCUSYNC_PADDLE_OCR_UNKNOWN_LANG`, initially `en`).
+`GLM_OCR_MODEL` accepts `glm-ocr:q8_0` or `glm-ocr:latest`. `PADDLE_VL_MODEL` defaults to
+`MedAIBase/PaddleOCR-VL:0.9b`. The installed MedAIBase artifact exposes completion only and rejects document images.
+DocuSync records this as an unavailable OCR engine. Its **Test Engine** still submits a synthetic image to verify
+the server's response. A vision-capable tag can be configured separately after it is installed.
+Configure Automatic with `DOCUSYNC_OCR_AUTOMATIC_PRIMARY`, `DOCUSYNC_OCR_AUTOMATIC_SECONDARY`, and
+`DOCUSYNC_OCR_AUTOMATIC_TERTIARY`. An empty tertiary value disables the third attempt.
+The workspace queues jobs by default and can run more concurrently through `DOCUSYNC_WORKSPACE_WORKERS`.
+The CLI accepts `--ocr-backend automatic|glm-ocr|paddleocr-vl|paddleocr|tesseract`.
+
+**Settings → OCR health and comparison** separates installation, availability, observed residency, and previous
+successful inference. Use the engine's **Test** button to submit a generated image with a known value.
+The workspace shows elapsed time, measured requests, fallback events, and an estimate after two completed
+page measurements. The estimate covers extraction. Labelled accuracy appears after running a
+benchmark. Run this from the project directory to publish a local comparison in the dashboard.
+
+```powershell
+.\.venv\Scripts\python.exe -B project/ocr_selector_check.py --out storage/new-ocr-comparison --dashboard-file logs/ocr-comparison.json
+```
+
 Review a page in Source PDF, Text, Zoning or Reading Order, correct the title or language,
 then approve and export XML. Locate an extracted title in the PDF when the source region is available. Use Changes
 to compare two versions and apply matching text updates to an uploaded PowerPoint deck.
@@ -132,6 +160,32 @@ The [official sample validation](../docs/OFFICIAL_SAMPLE_VALIDATION.md) records 
 the remaining differences, and the command for reproducing the reports. The [repository audit](../docs/REPOSITORY_AUDIT.md)
 and [implementation roadmap](../docs/IMPLEMENTATION_ROADMAP.md) record the earlier Windows verification.
 For a saved bundle, use `project/sample_check.py --export-dir <folder>` with the reference inputs described there.
+In an individual workspace document, **XML preview** and **Export XML** use the organizer's sample hierarchy.
+Approve the metadata review, then choose **Export XML**. If the XML links to figures or equation crops, the download
+is a ZIP with the XML and its `output_images/<document>/` folder. Extract the ZIP and keep the folder beside the XML.
+For command-line extraction in the same format, use
+`--profile sample --skip-pptx`. Integrations that need the written-brief format can request
+`?profile=brief` on the individual document XML endpoint.
+For OCR-derived equations, Automatic and GLM-OCR run formula recognition on independently rendered crops.
+The XML keeps the source image. When the readings agree, the formula image also carries a
+`formula_encoding="latex"` attribute and searchable LaTeX in `alt`. The validation report counts formulas
+with text and flags unresolved readings for review.
+
+All XML profiles are checked against local XSDs in \`project/xml_engine/schemas/\`. The sample XSD is derived
+from the organizer's reference XML. The supplied archive has no organizer XSD. The export package includes
+\`manifest.json\` and reports for schema validation, source-linked completeness, formatting, and image assets.
+The completeness report compares XML with the intermediate representation and records source uncertainty by page.
+The formatting report distinguishes measured PDF font and geometry data from heuristics.
+
+### Compare an engineering reference
+
+Generate a sample-profile export with `project/main.py --input <folder> --output <output> --profile sample`.
+Then run `project/xml_quality_check.py --reference <expected.xml> --actual <generated.xml> --report <report.json>`.
+Add `--baseline <prior.xml>` for a before-and-after report. The comparison aligns text within each page and
+allows adjacent split or merged blocks. It reports schema and page checks, CER and WER, semantics, reading order,
+headings, references, captions, and equation labels. Use `--equation-evidence <review.json>` to supply
+source-reviewed printed labels when the reference stores equations solely as images. Reference files are used by
+the evaluator. PDF conversion and PowerPoint repair use the source PDF and shared intermediate representation.
 All documents use the same page-level profiling, OCR, layout, and presentation-matching pipeline. The earlier
 source-region map remains available to the offline sample comparison command as historical ground truth.
 

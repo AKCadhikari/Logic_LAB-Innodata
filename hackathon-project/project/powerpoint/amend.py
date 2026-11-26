@@ -43,7 +43,7 @@ class Unit:
         return {"page": self.page, "xml_node": self.node, "text": self.text,
                 "extraction": self.source, "ocr_engine": self.engine or None,
                 "block_id": self.block_id, "execution_ids": list(self.execution_ids),
-                "extraction_confidence": None if self.engine == "glm-ocr" else self.confidence}
+                "extraction_confidence": None if self.engine in {"glm-ocr", "paddleocr-vl"} else self.confidence}
 
 
 @dataclass(frozen=True)
@@ -207,7 +207,7 @@ def candidate_matches(text: str, evidence: list[Unit], normalized: list[str],
         alignment = labeled_number(text, unit.text)
         if alignment is None:
             alignment = align_correct(text, unit.text, vocab,
-                                      strict=unit.confidence < 80 and unit.engine != "glm-ocr",
+                                      strict=unit.confidence < 80 and unit.engine not in {"glm-ocr", "paddleocr-vl"},
                                       ocr=unit.source == "ocr", nonlatin_auto=settings.amend_nonlatin_auto)
         if alignment.match_frac >= 0.5:
             scored.append(Match(unit, alignment, score))
@@ -237,7 +237,7 @@ def confirm_ocr(ir: DocIR, match: Match, replacements: list[dict], settings: Set
     from ocr.engine import available_langs, ocr_page
 
     unit = match.unit
-    if (unit.confidence < 86 and unit.engine != "glm-ocr") or not settings.ocr_enabled:
+    if (unit.confidence < 86 and unit.engine not in {"glm-ocr", "paddleocr-vl"}) or not settings.ocr_enabled:
         return False
     if unit.page not in cache:
         cache[unit.page] = ""
@@ -403,9 +403,10 @@ def change_record(ir: DocIR, slide: int, shape, paragraph: int, old: str, new: s
             "source": unit.reference() if unit else None}
 
 
-def amend_deck(pdf: Path, pptx: Path, target: Path, work: Path, settings: Settings, audit: AuditLog) -> dict:
+def amend_deck(pdf: Path, pptx: Path, target: Path, work: Path, settings: Settings, audit: AuditLog, *,
+               ir: DocIR | None = None) -> dict:
     started = time.monotonic()
-    ir = load_ir(pdf, work, settings, audit)
+    ir = ir if ir is not None else load_ir(pdf, work, settings, audit)
     report = repair_presentation(ir, pptx, target, settings)
     changes_dir = work / "changes"
     changes_dir.mkdir(parents=True, exist_ok=True)

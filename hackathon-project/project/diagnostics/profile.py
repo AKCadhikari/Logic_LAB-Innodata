@@ -48,6 +48,8 @@ def decorate_document(ir) -> dict:
                 issues.append("At least one source block contains replacement or XML-incompatible characters.")
             if block.kind == "equation" and not block.bbox:
                 issues.append("At least one equation has no verified source coordinates.")
+            if block.source_reference.get("formula", {}).get("status") == "review_required":
+                issues.append("At least one equation has no corroborated text transcription.")
             reasons.extend(issues)
             for cell in block.cells:
                 cell.language = language_profile(cell.text, block.lang)

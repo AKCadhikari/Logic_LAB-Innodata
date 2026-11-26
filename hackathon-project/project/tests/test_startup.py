@@ -23,7 +23,7 @@ def free_port():
 @pytest.fixture
 def fake_api(monkeypatch):
     calls, resident = [], {}
-    settings = Settings()
+    settings = Settings(ocr_automatic_secondary="paddleocr")
     tags = [{"name": model["name"], "size": 1, "digest": model["role"]}
             for model in startup.configured_models(settings)]
     failures = {}

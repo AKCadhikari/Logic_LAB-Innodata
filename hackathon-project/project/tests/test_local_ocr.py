@@ -56,8 +56,8 @@ def test_glm_page_flows_through_ir_and_xml(tmp_path, settings, audit, monkeypatc
     stages = []
     result = process_pdf(source, settings, tmp_path / "out", tmp_path / "run", audit, processing=stages.append)
     assert result["ok"] and result["page_log"][0]["ocr"]["engine"] == "glm-ocr"
-    assert [step["stage"] for step in stages] == ["diagnostics", "ocr", "extracted", "layout", "validation"]
-    assert stages[2]["counts"] == {"required": 1, "glm_ocr": 1, "paddle_ocr": 0, "failed": 0, "review": 0}
+    assert [step["stage"] for step in stages] == ["diagnostics", "ocr", "ocr_attempt", "extracted", "layout", "validation"]
+    assert stages[3]["counts"] == {"required": 1, "glm_ocr": 1, "paddle_ocr": 0, "failed": 0, "review": 0}
     xml = etree.parse(str(tmp_path / "out" / "scan.xml"))
     assert xml.findtext(".//table/tbody/tr/td") == "μ"
     assert xml.findtext(".//p[@kind='equation']") == "E = mc^2"

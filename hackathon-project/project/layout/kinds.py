@@ -13,6 +13,16 @@ RIGHTS = R(r"(©|\(c\)|copyright|all rights reserved|licen[cs]e|creative commons
 PUBMETA = R(r"(issn|isbn|doi\b|doi\.org|\bvol(ume)?\.?\s*\d|\bissue\b|journal of|received:|accepted:|published:|proceedings)")
 AFFIL = R(r"(universit|institut|department|faculty|college|school of|laborator|hospital|academy|centre|center|@|université|universität|hochschule|جامعة|كلية|大学|研究所|대학)")
 NUMBERED_HEADING = re.compile(r"^(\d+(?:\.\d+){0,4})\s+[A-Z][^\n.:!?]{2,90}$")
+CLASSIFICATION = R(r"^\W*(mathematics subject classification|computing classification system)\b")
+ADDRESS = R(r"\b(street|road|avenue|postal code|p\.?\s*o\.?\s+box)\b")
+AUTHOR_SEPARATOR = R(r",|\s+(?:and|und|et)\s+|،")
+AFTER_REFERENCES = R(r"^(?:appendix|appendices|annex|supplementary (?:material|information))(?:\s+[A-Z0-9]+)?[.:]?$")
+
+
+def metadata_kind(text):
+    if RIGHTS.search(text):
+        return "rights"
+    return "publication_metadata" if PUBMETA.search(text) else ""
 
 
 def _pick_title(doc: DocIR):
@@ -46,9 +56,13 @@ def assign_kinds(doc: DocIR) -> None:
                     similar_size = abs(nb.size - chosen.size) < 0.1 * chosen.size
                     short_centered = (centers_close and 0.78 * chosen.size <= nb.size
                                       and 1 <= len(nb.text.split()) <= 7 and not nb.text.endswith((".", ":")))
-                    if (nb.tag == "p" and nb.writing_mode == chosen.writing_mode and (similar_size or short_centered)
+                    if (nb.tag in {"p", "h1", "h2"} and nb.writing_mode == chosen.writing_mode
+                            and (centers_close and similar_size and len(nb.text.split()) <= 15 or short_centered)
+                            and not AFFIL.search(nb.text)
+                            and not AUTHOR_SEPARATOR.search(nb.text) and not ABSTRACT.match(nb.text)
                             and 0 <= nb.bbox[1] - chosen.bbox[3] < 1.5 * chosen.size):
                         chosen.original_text = "\n".join((chosen.original_text or chosen.text, nb.original_text or nb.text))
+                        chosen.line_boxes = [*(chosen.line_boxes or [chosen.bbox]), *(nb.line_boxes or [nb.bbox])]
                         chosen.text = (chosen.text + " " + nb.text).strip(); chosen.bbox = (min(chosen.bbox[0], nb.bbox[0]), chosen.bbox[1], max(chosen.bbox[2], nb.bbox[2]), nb.bbox[3])
                         chosen.spans = []; page.blocks.remove(nb); break
                 break
@@ -56,9 +70,10 @@ def assign_kinds(doc: DocIR) -> None:
     for pi, page in enumerate(doc.pages):
         for b in page.blocks:
             if b.tag in ("header", "footer"):
-                b.kind = "publication_metadata"; continue
+                b.kind = metadata_kind(b.text) or "publication_metadata"; continue
             if b.tag in ("table", "figure"):
-                b.kind = "figure_caption" if False else b.kind
+                continue
+            if b.kind in {"equation", "pseudocode", "algorithm_caption"}:
                 continue
             txt = b.text or " ".join(c.text for c in b.children)
             number = NUMBERED_HEADING.fullmatch(txt.strip()) if b.tag == "p" and b.source == "ocr" else None
@@ -66,6 +81,8 @@ def assign_kinds(doc: DocIR) -> None:
                 b.tag = f"h{2 + number[1].count('.')}"
             if b.tag == "p" and len(txt.split()) <= 3 and (REFS.match(txt) or ACK.match(txt)) and len(txt) < 32:
                 b.tag = "h2"
+            elif section == "references" and AFTER_REFERENCES.fullmatch(txt.strip()):
+                b.tag, section = "h2", "body"
             elif section == "references" and not (REFS.match(txt) or ACK.match(txt)):
                 if b.tag in ("p", "h2", "h3", "h4", "h5", "h6", "ul", "ol"):
                     b.kind = "reference_entry"
@@ -74,6 +91,20 @@ def assign_kinds(doc: DocIR) -> None:
                     continue
             if b is chosen:
                 title_done = True; section = "front"; continue
+            if pi == 0 and section == "front" and b.tag in {"p", "h2", "h3", "h4", "h5", "h6"}:
+                front_kind = metadata_kind(txt) if len(txt) < 300 else ""
+                if not front_kind and title_done and len(txt) < 300 and (AFFIL.search(txt) or ADDRESS.search(txt)):
+                    front_kind = "affiliation"
+                    seen_aff = True
+                if (not front_kind and title_done and not seen_aff and len(txt) < 180
+                        and AUTHOR_SEPARATOR.search(txt) and not txt.endswith(".")
+                        and sum(char.isupper() for char in txt) >= sum(char.islower() for char in txt)):
+                    front_kind = "byline"
+                if front_kind:
+                    b.tag, b.kind = "p", front_kind
+                    continue
+            if section == "front" and ABSTRACT.fullmatch(txt.strip()) and b.tag == "p":
+                b.tag = "h2"
             if b.tag.startswith("h"):
                 if b is chosen:
                     title_done = True; section = "front"; continue
@@ -87,14 +118,14 @@ def assign_kinds(doc: DocIR) -> None:
                 elif ACK.match(head): section = "acknowledgment"; b.kind = "acknowledgment"
                 else: section = "body"
                 continue
-            if b.tag == "aside" or b.kind == "equation":
+            if b.tag == "aside":
                 continue
             items = b.children if b.tag in ("ul", "ol") else [b]
             for it in items:
                 t = (it.text or "").strip()
                 if b.kind == "figure_caption" or it.kind == "figure_caption":
                     it.kind = "figure_caption"; continue
-                if KEYW.match(t) or t.lower().startswith(("mathematics subject classification", "computing classification system")): k = "keywords"
+                if KEYW.match(t) or CLASSIFICATION.match(t): k = "keywords"
                 elif ABSTRACT.match(t) and section in ("front", "abstract"): k = "abstract"; section = "abstract"
                 elif section == "references": k = "reference_entry"
                 elif section == "abstract": k = "abstract"

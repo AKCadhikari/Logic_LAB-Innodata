@@ -75,8 +75,12 @@ def extract_lines(page) -> list[Line]:
                 for r, uri in links:
                     if r.intersects(sb):
                         href = uri; break
+                font_name = s["font"].lower().replace("-", "").replace(" ", "")
+                sans = any(name in font_name for name in ("sans", "verdana", "arial", "helvetica", "calibri"))
                 spans.append(Span(text=t, size=s["size"], bold=bold, italic=ital, sup=sup, sub=sub,
-                                  strike=strike, link=href, font=s.get("font", "")))
+                                  strike=strike, link=href, font=s["font"], serif=bool(s["flags"] & 4) and not sans,
+                                  small_caps="smallcap" in font_name, underline=bool(s.get("char_flags", 0) & 2),
+                                  color=f"#{s['color']:06x}" if isinstance(s.get("color"), int) else None))
                 texts.append(t)
                 tot += n; sizes.append((s["size"], n))
                 bold_chars += n if bold else 0; ital_chars += n if ital else 0
@@ -88,7 +92,11 @@ def extract_lines(page) -> list[Line]:
                             italic=tot > 0 and ital_chars / tot > 0.6, spans=spans, source="native", rtl=is_rtl(text),
                             original_text="".join(span["text"] for span in ln["spans"]),
                             writing_mode="vertical" if ln.get("wmode") == 1 else "horizontal"))
-    return out
+    distinct = {}
+    for line in out:
+        key = (line.text, tuple(round(value * 2) for value in line.bbox))
+        distinct.setdefault(key, line)
+    return list(distinct.values())
 
 
 def recover_running_text(page, recognized: list[Line], band: float) -> list[Line]:
@@ -128,7 +136,12 @@ def extract_tables(page, settings) -> list[Block]:
     if len(page.get_drawings()) < 4:
         return []
     try:
-        found = page.find_tables()
+        try:
+            found = page.find_tables(use_layout=False)
+            if not found.tables:
+                found = page.find_tables()
+        except TypeError:
+            found = page.find_tables()
     except Exception:
         return []
     W, H = page.rect.width, page.rect.height
@@ -184,7 +197,7 @@ def extract_figures(page, settings, table_boxes, lines=None) -> list[Block]:
     def inside_table(r):
         return any(pymupdf.Rect(tb).contains(r) or pymupdf.Rect(tb).intersect(r).get_area() > 0.6 * r.get_area() for tb in table_boxes)
     try:
-        infos = page.get_image_info(hashes=True)
+        infos = page.get_image_info(xrefs=True)
     except Exception:
         infos = []
     page_rect = page.rect
@@ -217,11 +230,12 @@ def extract_figures(page, settings, table_boxes, lines=None) -> list[Block]:
                 or inside_table(r)):
             continue
         figs.append(Block(tag="figure", bbox=tuple(r), kind="figure", cls="raster",
-                          fingerprint=i.get("digest", b"").hex()))
+                          fingerprint=i.get("digest", b"").hex(),
+                          source_reference={"image": {"xref": i.get("xref"), "width": i.get("width"), "height": i.get("height")}}))
     try:
         for r in page.cluster_drawings():
-            r = pymupdf.Rect(r)
-            if ((min(r.width, r.height) < mn * 1.5 and not compact_figure(r)) or r.get_area() > 0.85 * W * H
+            r = pymupdf.Rect(r).intersect(page_rect)
+            if (r.is_empty or (min(r.width, r.height) < mn * 1.5 and not compact_figure(r)) or r.get_area() > 0.85 * W * H
                     or inside_table(r)):
                 continue
             if any(pymupdf.Rect(f.bbox).intersect(r).get_area() > 0.5 * r.get_area() for f in figs):

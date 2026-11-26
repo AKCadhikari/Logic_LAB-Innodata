@@ -10,10 +10,11 @@ from diagnostics.page_diagnostics import analyze_page
 from diagnostics.profile import decorate_document, quality_gate
 from ingestion.discover import describe
 from layout.model import PageIR, DocIR, Line, Block, Span, ir_from_dict
-from layout import native, reconstruct, kinds, figures, ocr_geometry
+from layout import native, reconstruct, kinds, figures, ocr_geometry, equations, pseudocode
 from layout.docling_adapter import DoclingLayout
 from ocr import engine as ocr
 from ocr.router import OCRRouter
+from ocr.recognition import ENGINE_MODES
 from quality.qa import page_confidence, doc_quality
 from utils.cache import Cache, file_key
 from utils.logs import AuditLog
@@ -24,6 +25,8 @@ from reporting import execution as execution_reports
 from utils import execution_audit as model_audit
 from xml_engine.serializer import to_xml
 from xml_engine.validate import validate_xml, verify_unicode
+from xml_engine.completeness import compare_content, numeric_values
+from xml_engine.assets import inspect_assets
 
 def ocr_cache_identity(settings, installed):
     if not settings.use_cache or not installed or not settings.tessdata_dir:
@@ -83,7 +86,7 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
     doc_id = pdf.stem
     res = {"doc_id": doc_id, "file": pdf.name, "ok": False, "pages": 0, "error": "", "page_log": []}
     cache = Cache(work_dir / settings.cache_dir, settings.use_cache)
-    router = OCRRouter(settings, work_dir / "recognition" / doc_id)
+    router = OCRRouter(settings, work_dir / "recognition" / doc_id) if settings.ocr_backend != "tesseract" else None
     layout = DoclingLayout(settings)
     counts = {"required": 0, "glm_ocr": 0, "paddle_ocr": 0, "failed": 0, "review": 0}
     res["processing_counts"] = counts
@@ -146,9 +149,11 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             if fast and decision == "compare":
                 decision = "native"; d["reasons"].append("fast mode: compare skipped")
                 d["ocr"] = {"engine": None, "status": "skipped", "requires_review": True}
-            if decision != "native" and settings.ocr_enabled and settings.ocr_backend == "glm-ocr":
+            if decision != "native" and settings.ocr_enabled and settings.ocr_backend in ENGINE_MODES:
+                model_names = {"glm-ocr": settings.glm_ocr_model, "paddleocr-vl": settings.paddle_vl_model}
                 result, info = router.recognise(page, page_language, dpi, d,
-                                               lambda engine: stage("ocr", page=i + 1, engine=engine))
+                                               lambda engine: stage("ocr", page=i + 1, engine=engine, model=model_names.get(engine)),
+                                               event=lambda attempt: stage("ocr_attempt", page=i + 1, **attempt))
                 d["ocr"] = info
                 if result and decision == "compare":
                     native_text = page.get_text()
@@ -192,7 +197,8 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                 if page_language == "und":
                     page_language = ocr.pick_language(page, settings, installed)
                     audit.event("ocr", "page_language_by_trial", doc=doc_id, page=i + 1, lang=page_language)
-                olines, info, cached = _ocr_cached(page, cache, cache_identity, fkey, page_language, settings,
+                with model_audit.details(selected_ocr_engine="tesseract", ocr_engine="tesseract"):
+                    olines, info, cached = _ocr_cached(page, cache, cache_identity, fkey, page_language, settings,
                                                    installed, deskew, dpi)
                 oconf = sum(l.conf for l in olines) / len(olines) if olines else 0.0
                 otext = _text_of(olines)
@@ -244,9 +250,11 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                 except Exception:
                     pass
         raw.append(rec)
+        d["selected_ocr_engine"] = settings.ocr_backend
         ocr_info = d.get("ocr", {})
-        for engine, key in (("glm-ocr", "glm_ocr"), ("paddleocr", "paddle_ocr")):
-            counts[key] += ocr_info.get("engine") == engine and ocr_info.get("status") == "accepted"
+        for engine, key in (("glm-ocr", "glm_ocr"), ("paddleocr", "paddle_ocr"), ("paddleocr-vl", "paddle_vl")):
+            if ocr_info.get("engine") == engine and ocr_info.get("status") == "accepted":
+                counts[key] = counts.get(key, 0) + 1
         counts["failed"] += bool(d.get("ocr_required") and
                                  (d.get("error") or ocr_info.get("status") == "review_required"))
         counts["review"] += bool(ocr_info.get("requires_review") or d.get("error"))
@@ -257,9 +265,11 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                                 "ocr": ocr_info, "seconds": round(time.time() - tp, 2), "unread_scan": unread_scan})
         if progress:
             progress(i + 1, n)
-        stage("extracted", page=i + 1)
+        stage("extracted", page=i + 1, elapsed_seconds=round(time.time() - tp, 3),
+              ocr_required=bool(d.get("ocr_required")))
     metadata = {key: value for key, value in (doc.metadata or {}).items() if value}
-    router.close()
+    if router:
+        router.close()
     # ---- Layout Reconstruction agent ------------------------------------------------------------------
     ctx = reconstruct.compute_context(raw, settings)
     ctx.lang = lang
@@ -284,6 +294,8 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                                                     kind="body", source=rp["source"])] if rp["lines"] else [])
                 rp["diag"].setdefault("review_reasons", []).append("Layout reconstruction failed.")
             pg.diag = {**rp["diag"], **pg.diag}
+            if pg.source == "native" and pg.diag.get("health") == "healthy":
+                pg.diag["native_numeric_inventory"] = dict(numeric_values(doc[pg.n - 1].get_text()))
             ocr_info = pg.diag.get("ocr", {})
             pg.ocr_engine = (ocr_info.get("engine") or "") if pg.source == "ocr" else ""
             pg.requires_review = bool(ocr_info.get("requires_review") or pg.diag.get("error")
@@ -294,6 +306,9 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             if geometry := ocr_geometry.position_page(doc[pg.n - 1], pg, settings, geometry_packs):
                 pg.diag["layout"]["coordinate_alignment"] = geometry
                 audit.event("layout", "ocr_coordinate_alignment", page=pg.n, **geometry)
+            reconstruct.place_visuals(pg)
+            pseudocode.preserve_pseudocode(pg)
+            equations.recognise_formulas(doc[pg.n - 1], pg, settings)
             pg.layout_engine = pg.diag["layout"]["engine"]
             if regions and settings.audit_private_responses:
                 report = work_dir / "recognition" / doc_id / f"page-{pg.n:04d}-docling.json"
@@ -317,6 +332,7 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
         doc.close()
     dir_ = DocIR(doc_id=doc_id, path=str(pdf), lang=lang, pages=pages,
                  meta={"settings": settings.schema_profile, "pdf_metadata": metadata, "source_sha256": fkey,
+                       "selected_ocr_engine": settings.ocr_backend,
                        "ocr_metadata_version": 2})
     stage("validation")
     return finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0)
@@ -351,6 +367,9 @@ def _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, p
                 page.diag.setdefault("layout", {})["coordinate_alignment"] = geometry
                 result["page_log"][page.n - 1]["layout"] = page.diag["layout"]
                 audit.event("layout", "ocr_coordinate_alignment", page=page.n, **geometry)
+            reconstruct.place_visuals(page)
+            pseudocode.preserve_pseudocode(page)
+            equations.recognise_formulas(source[page.n - 1], page, settings)
             progress(page.n, len(saved_ir.pages))
     processing({"stage": "validation"})
     return finish_extraction(pdf, saved_ir, settings, out_dir, work_dir, audit, result, start)
@@ -376,13 +395,14 @@ def finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0):
     # ---- XML Generation + QA agents -----------------------------------------------------------------------
     assets = {}
     locations = {}
-    data = to_xml(dir_, settings, locations=locations, assets=assets if settings.schema_profile == "sample" else None)
+    data = to_xml(dir_, settings, locations=locations, assets=assets)
     val = validate_xml(data, len(pages), settings)
     if not val["well_formed"] or val["issues"]:
         audit.event("xml", "invalid", doc=doc_id, issues=val["issues"])
         res.update(ok=False, validation=val, error="Generated XML failed validation.")
         gate.update(status="processing_failed", xml={"status": "invalid", "issues": val["issues"]})
         write_report(profile_dir / "multilingual_validation_report.json", gate)
+        write_report(profile_dir / "xml_validation_report.json", val)
         save_execution_reports(work_dir, doc_id, res, dir_)
         return res
     gate["xml"] = verify_unicode(data, dir_, locations)
@@ -396,6 +416,12 @@ def finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0):
                 asset_path.parent.mkdir(parents=True, exist_ok=True)
                 source_pdf[page - 1].get_pixmap(dpi=180, clip=pymupdf.Rect(box), alpha=False).save(asset_path)
     _write_xml(out_dir, pdf, data)
+    complete = compare_content(data, dir_, locations, sample=settings.schema_profile == "sample")
+    write_report(profile_dir / "xml_validation_report.json", {**val, "unicode": gate["xml"]})
+    write_report(profile_dir / "content_completeness_report.json",
+                 {key: value for key, value in complete.items() if key != "formatting"})
+    write_report(profile_dir / "formatting_report.json", complete["formatting"])
+    write_report(profile_dir / "image_asset_report.json", inspect_assets(data, out_dir))
     save_execution_reports(work_dir, doc_id, res, dir_, data, locations)
     ir_dir = work_dir / "ir"; ir_dir.mkdir(parents=True, exist_ok=True)
     (ir_dir / f"{doc_id}.json").write_text(json.dumps(dir_.to_dict(), ensure_ascii=False), encoding="utf-8")
@@ -438,7 +464,7 @@ def _job(args):
 
 
 def run_pdfs(pdfs: list[Path], settings: Settings, out_dir: Path, work_dir: Path, audit: AuditLog, t_start: float) -> list[dict]:
-    workers = settings.workers or (1 if settings.ocr_backend == "glm-ocr" or settings.docling_enabled
+    workers = settings.workers or (1 if settings.ocr_backend != "tesseract" or settings.docling_enabled
                                    else max(1, min((os.cpu_count() or 2) - 1, 6, len(pdfs) or 1)))
     deadline = t_start + 0.75 * settings.time_budget_s            # after this point OCR drops to fast mode
     audit.event("orchestrator", "batch_start", documents=len(pdfs), workers=workers, soft_deadline_s=round(0.75 * settings.time_budget_s))

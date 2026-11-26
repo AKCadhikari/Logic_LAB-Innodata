@@ -134,6 +134,7 @@ def annotate(changes: list[dict], settings: Settings, audit: AuditLog) -> dict:
                                  model_digest=model_status.get("digest"), input_type="comparison_json",
                                  input_sha256=execution.digest(payload), input_reference="deterministic_comparison",
                                  prompt_template="comparison-review/v1") as record:
+            execution.private_prompt(record, payload)
             data = request_json(settings, "/api/chat", payload)
             if isinstance(data.get("model"), str) and ollama.tagged_model(data["model"]) != ollama.tagged_model(model):
                 raise ValueError("Ollama returned a different review model.")

@@ -222,7 +222,8 @@ def xml(doc_id):
     if not p or not p.is_file():
         abort(404)
     if request.args.get("download"):
-        return send_file(p, as_attachment=True, download_name=p.name)
+        from ui.workspace_routes import download_saved_xml
+        return download_saved_xml(p)
     return Response(p.read_text(encoding="utf-8"), mimetype="text/plain; charset=utf-8")
 
 

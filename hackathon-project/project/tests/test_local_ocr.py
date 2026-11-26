@@ -7,11 +7,12 @@ import pytest
 from lxml import etree
 from pydantic import ValidationError
 
+import agents.orchestrator as orchestrator
 from agents.orchestrator import process_pdf
 from layout.docling_adapter import apply_regions
 from layout.model import Block, DocIR, PageIR, ir_from_dict
 from ocr import glm, paddle
-from ocr.recognition import RecognitionError
+from ocr.recognition import Recognition, RecognitionError
 from ocr.router import OCRRouter
 
 
@@ -37,6 +38,52 @@ def test_native_pages_bypass_both_engines(tmp_path, settings, audit, monkeypatch
     fixture_pdf(source, scanned=False)
     report = process_pdf(source, settings, tmp_path / "out", tmp_path / "run", audit)
     assert report["ok"] and not report["page_log"][0]["ocr_required"]
+
+
+@pytest.mark.parametrize(("ocr_value", "review_required"), [("170", True), ("120", False)])
+def test_native_vs_ocr_numeric_comparison_preserves_text_and_review_status(
+    tmp_path, settings, audit, monkeypatch, ocr_value, review_required
+):
+    settings.docling_enabled = False
+    native_text = (
+        "This carefully reviewed laboratory report records 120 samples. Each sample was checked twice, "
+        "and all measurements were independently reviewed before approval by the laboratory team."
+    )
+    ocr_text = native_text.replace("120", ocr_value)
+    source = tmp_path / "numeric-conflict.pdf"
+    with pymupdf.open() as pdf:
+        page = pdf.new_page()
+        page.insert_textbox(pymupdf.Rect(60, 70, 535, 260), native_text, fontsize=11)
+        pdf.save(source)
+
+    def diagnostics(page, settings, metadata_language="und"):
+        return {
+            "page": 1, "width": page.rect.width, "height": page.rect.height, "rotation": 0,
+            "native_chars": len(page.get_text()), "health": "suspicious", "decision": "compare",
+            "ocr_required": True, "native_decoding_risk": False, "mixed_content": False,
+            "image_coverage": 0, "lang_hint": "en", "native_language": {},
+            "reasons": [], "review_reasons": [],
+        }
+
+    def recognize(self, page, language, dpi, diag, status, **kwargs):
+        return Recognition(1, "glm-ocr", blocks=[Block("p", ocr_text, source="ocr")]), {
+            "engine": "glm-ocr", "status": "accepted", "requires_review": False,
+            "attempts": [], "confidence": None,
+        }
+
+    monkeypatch.setattr(orchestrator, "analyze_page", diagnostics)
+    monkeypatch.setattr(OCRRouter, "recognise", recognize)
+    report = process_pdf(source, settings, tmp_path / "out", tmp_path / "run", audit)
+
+    page_result = report["page_log"][0]
+    xml = etree.parse(str(tmp_path / "out" / "numeric-conflict.xml"))
+    extracted = " ".join(xml.getroot().itertext())
+    assert page_result["source"] == "native"
+    assert page_result["ocr"]["requires_review"] is review_required
+    assert page_result["review_required"] is review_required
+    assert "records 120 samples" in extracted
+    if review_required:
+        assert f"records {ocr_value} samples" not in extracted
 
 
 def test_glm_page_flows_through_ir_and_xml(tmp_path, settings, audit, monkeypatch):

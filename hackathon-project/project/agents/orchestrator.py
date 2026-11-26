@@ -157,15 +157,21 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                 d["ocr"] = info
                 if result and decision == "compare":
                     native_text = page.get_text()
-                    similarity = fuzz.token_set_ratio(norm_cmp(native_text), norm_cmp(result.text())) / 100
+                    ocr_text = result.text()
+                    similarity = fuzz.token_set_ratio(norm_cmp(native_text), norm_cmp(ocr_text)) / 100
+                    numeric_disagreement = numeric_values(native_text) != numeric_values(ocr_text)
                     d["compare_similarity"] = round(similarity, 3)
                     if d.get("native_decoding_risk"):
-                        d["compare_order_similarity"] = round(fuzz.ratio(norm_ws(native_text), norm_ws(result.text())) / 100, 3)
+                        d["compare_order_similarity"] = round(fuzz.ratio(norm_ws(native_text), norm_ws(ocr_text)) / 100, 3)
                         d["native_order_corroborated"] = norm_ws(native_text) == norm_ws(result.text()) and not info["requires_review"]
                         info["requires_review"] |= not d["native_order_corroborated"]
                         result = None
                     elif similarity >= settings.native_vs_ocr_min_similarity:
-                        d["reasons"].append("Kept native text after comparing OCR.")
+                        if numeric_disagreement:
+                            d["reasons"].append("OCR and native text disagree on numeric values. Review the source before relying on either.")
+                            info["requires_review"] = True
+                        else:
+                            d["reasons"].append("Kept native text after comparing OCR.")
                         result = None
                     else:
                         d["reasons"].append("OCR and native text disagree. Review before relying on the result.")

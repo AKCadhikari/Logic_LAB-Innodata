@@ -27,6 +27,12 @@ def output_stem(filename: str) -> str:
     return f"_{stem}" if PureWindowsPath(stem).is_reserved() else stem
 
 
+def requires_manual_review(extraction: dict, completeness: dict) -> bool:
+    quality = extraction.get("multilingual_validation", {})
+    unresolved_source = completeness.get("source_review") and not extraction.get("source_review_approved")
+    return bool(quality.get("blocking_pages") or completeness.get("issues") or unresolved_source)
+
+
 def write_report(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     staged = path.with_suffix(".tmp")
@@ -137,6 +143,8 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
     audited_edits = []
     verification_executions = []
     quality = extraction.get("multilingual_validation", {})
+    if extraction.get("source_review_approved"):
+        quality = {**quality, "source_review_approved": True}
     staged = xml_path.with_suffix(".tmp")
     try:
         if not extraction.get("ok"):
@@ -182,10 +190,10 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
     finally:
         staged.unlink(missing_ok=True)
 
-    if outputs["xml"] and (quality.get("blocking_pages") or completeness.get("issues")):
+    if outputs["xml"] and requires_manual_review(extraction, completeness):
         outputs["xml"]["draft"] = True
         result.update(status="manual_review_required",
-                      error="The XML is a draft. Resolve missing or corrupt source text before updating PowerPoint.")
+                      error="The XML is a draft. Resolve source review and content differences before exporting the PowerPoint.")
         validation["pptx"]["status"] = "blocked_by_source_review"
     elif outputs["xml"] and xml_only:
         result["status"] = "xml_only"

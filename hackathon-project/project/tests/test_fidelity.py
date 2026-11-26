@@ -2,6 +2,7 @@ from collections import defaultdict
 from pathlib import Path
 from zipfile import ZipFile
 
+from config.settings import Settings
 from lxml import etree
 import pymupdf
 import pytest
@@ -46,7 +47,8 @@ def test_export_validates_assets_and_preformatted_pseudocode_after_extracting_zi
         Block("p", code, kind="pseudocode"),
     ])])
     folder = tmp_path / "output"
-    report = publish_document(folder, "paper", doc, settings, {"ok": True}, {"document_id": "paper"},
+    report = publish_document(folder, "paper", doc, settings,
+                              {"ok": True, "source_review_approved": True}, {"document_id": "paper"},
                               lambda out: synchronize(pptx, out, []))
     assert report["status"] == "completed"
     archive = folder / "paper.zip"
@@ -65,6 +67,33 @@ def test_export_validates_assets_and_preformatted_pseudocode_after_extracting_zi
     assert truth["text_accuracy"]["exact_native_matches"] == 1
     assert truth["equations"][0]["status"] == "CORRECT"
     assert truth["original_deck_preservation"]["slides"][0]["shapes"][0]["status"] == "CORRECT"
+
+
+def test_ocr_source_review_keeps_xml_draft_until_approved(tmp_path):
+    source_deck = tmp_path / "source.pptx"
+    create_deck(source_deck)
+    doc = DocIR("ocr-review", str(tmp_path / "source.pdf"), pages=[
+        PageIR(1, 595, 842, [Block("p", "The audited report records exactly 240 units.", source="ocr")],
+               source="ocr", requires_review=True)
+    ])
+
+    def unexpected_transform(_):
+        pytest.fail("A deck must not be generated from an unreviewed OCR source.")
+
+    blocked = publish_document(tmp_path / "unreviewed", "ocr-review", doc, Settings(schema_profile="brief"),
+                               {"ok": True}, {"document_id": doc.doc_id}, unexpected_transform)
+    assert blocked["status"] == "manual_review_required"
+    assert blocked["outputs"]["xml"]["draft"] and blocked["outputs"]["pptx"] is None
+    assert blocked["validation"]["pptx"]["status"] == "blocked_by_source_review"
+
+    approved = publish_document(
+        tmp_path / "approved", "ocr-review", doc, Settings(schema_profile="brief"),
+        {"ok": True, "source_review_approved": True}, {"document_id": doc.doc_id},
+        lambda output: synchronize(source_deck, output, []),
+    )
+    assert approved["status"] == "completed" and approved["outputs"]["pptx"]["valid"]
+    assert not approved["outputs"]["xml"].get("draft")
+    assert approved["content_validation"]["source_review_approved"]
 
 
 def test_asset_validator_reports_missing_duplicate_and_unsafe_paths(tmp_path):

@@ -82,6 +82,9 @@ Choose **OCR engine** before upload or reprocessing. **GLM-OCR**, **PaddleOCR-VL
 **PaddleOCR (Python)** are strict choices. **Automatic** defaults to GLM-OCR, then PaddleOCR-VL, then
 PaddleOCR Python. It advances after an unavailable engine, a timeout, rejected output, or a result
 requiring corroboration. A disagreement leaves one result flagged for review.
+Unreviewed source extraction or XML content differences keep the XML marked as a draft and block PowerPoint export.
+In the workspace, review the source and extracted content, then approve the document to allow export; blocking
+validation errors still prevent publication.
 Pages with a usable native layer continue through native extraction. Uncheck **Remember engine** for an override
 that applies only to the next submission. Each attempt retains its own engine and model settings.
 

@@ -10,6 +10,7 @@ import pymupdf
 import pytest
 from lxml import etree
 from pptx import Presentation
+from pptx.util import Inches
 
 from ui.server import CFG, app, configure_workspace
 
@@ -78,6 +79,51 @@ def test_export_xml_defaults_to_zip_when_there_is_a_picture(workspace):
             assert archive.read(src).startswith(b"\x89PNG\r\n\x1a\n")
             assert archive.testzip() is None
         assert client.get(url + f"/xml?download=1&profile={profile}&format=xml").data == data
+
+
+def test_ocr_source_review_blocks_ppt_until_approved(workspace, monkeypatch):
+    client, _ = workspace
+    text = "The audited report records exactly 240 units."
+    url = upload(client, pdf_with_text(text), "source-review.pdf")
+    assert wait_for_attempt(client, url)["jobs"][0]["status"] == "completed"
+
+    ws = app.extensions["workspace"]
+    original_extracted = ws.extracted
+
+    def unreviewed_ocr(document_id):
+        ir, settings, extraction = original_extracted(document_id)
+        for page in ir.pages:
+            page.source = "ocr"
+            page.requires_review = True
+            for block in page.blocks:
+                block.source = "ocr"
+        return ir, settings, extraction
+
+    monkeypatch.setattr(ws, "extracted", unreviewed_ocr)
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    slide.shapes.add_textbox(Inches(1), Inches(1), Inches(8), Inches(1)).text = text
+    deck_stream = io.BytesIO()
+    deck.save(deck_stream)
+    deck_data = deck_stream.getvalue()
+
+    def export_deck():
+        return client.post(url + "/presentations", data={
+            "mode": "source", "pptx": (io.BytesIO(deck_data), "source.pptx")
+        })
+
+    blocked = export_deck()
+    assert blocked.status_code == 422 and blocked.json["status"] == "manual_review_required"
+    assert blocked.json["outputs"]["xml"]["draft"] and blocked.json["outputs"]["pptx"] is None
+
+    reviewed = client.patch(url + "/metadata", json={"title": "Reviewed source", "lang": "en", "approved": True})
+    assert reviewed.status_code == 200 and reviewed.json["approved"]
+    xml = client.get(url + "/xml?download=1&format=xml")
+    assert xml.status_code == 200 and "_draft" not in xml.headers["Content-Disposition"]
+
+    completed = export_deck()
+    assert completed.status_code == 201 and completed.json["status"] == "completed"
+    assert completed.json["source_review_approved"]
 
 
 def test_ocr_preference_and_independent_job_snapshots(workspace):

@@ -4,7 +4,7 @@ import re
 
 from lxml import etree
 
-from utils.textutil import norm_ws
+from utils.textutil import norm_ws, xml_script_digits
 
 
 NUMBER = re.compile(r"[+−-]?\d+(?:[.,٫٬]\d+)*(?:[eE][+−-]?\d+)?(?:\s*[%٪‰])?")
@@ -137,6 +137,8 @@ def compare_content(data, document, locations, *, sample=False):
         page = entries[0][0]
         represented = norm_ws("".join(by_path[path].itertext()))
         expected = norm_ws(" ".join(text for _, text, _ in entries))
+        if sample and next(by_path[path].iter("sup", "sub"), None) is not None:
+            expected = xml_script_digits(expected)
         expected_values, actual_values = numeric_values(expected), numeric_values(represented)
         compared_numbers[page.n].update(actual_values)
         totals["numeric_expected"] += sum(expected_values.values())

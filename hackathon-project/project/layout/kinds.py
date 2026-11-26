@@ -13,6 +13,7 @@ RIGHTS = R(r"(©|\(c\)|copyright|all rights reserved|licen[cs]e|creative commons
 PUBMETA = R(r"(issn|isbn|doi\b|doi\.org|\bvol(ume)?\.?\s*\d|\bissue\b|journal of|received:|accepted:|published:|proceedings)")
 AFFIL = R(r"(universit|institut|department|faculty|college|school of|laborator|hospital|academy|centre|center|@|université|universität|hochschule|جامعة|كلية|大学|研究所|대학)")
 NUMBERED_HEADING = re.compile(r"^(\d+(?:\.\d+){0,4})\s+[A-Z][^\n.:!?]{2,90}$")
+STRUCTURAL_NUMBER = re.compile(r"^\s*(\d{1,3}(?:\.\d{1,3}){0,4})\.?\s+(?=[^\W\d_])")
 CLASSIFICATION = R(r"^\W*(mathematics subject classification|computing classification system)\b")
 ADDRESS = R(r"\b(street|road|avenue|postal code|p\.?\s*o\.?\s+box)\b")
 AUTHOR_SEPARATOR = R(r",|\s+(?:and|und|et)\s+|،")
@@ -28,12 +29,21 @@ def metadata_kind(text):
 def _pick_title(doc: DocIR):
     """Title = the largest text block on the first content page (must clearly stand out from body text)."""
     for page in doc.pages[:2]:
+        if existing := next((block for block in page.blocks if block.kind == "title" and block.text.strip()), None):
+            return existing
         cand = [b for b in page.blocks if b.tag not in ("header", "footer", "table", "figure", "ul", "ol", "hr", "aside") and b.size > 0
                 and 6 <= len((b.text or "").strip()) <= 300 and b.kind != "equation"]
         if not cand:
             continue
         med = median(b.size for b in cand)
-        best = max(cand, key=lambda b: (b.size, -(b.bbox[1] if b.bbox else 0)))
+        detected = [b for b in cand if b.bbox and b.bbox[1] < .40 * page.height
+                    and b.source_reference.get("layout_class") == "title"
+                    and b.source_reference.get("layout_confidence", 0) >= .45
+                    and b.size >= 1.12 * med and not STRUCTURAL_NUMBER.match(b.text)
+                    and not metadata_kind(b.text)]
+        best = max(detected or cand, key=lambda b: (b.size, -(b.bbox[1] if b.bbox else 0)))
+        if detected:
+            return best
         if best.size >= 1.2 * med:
             return best
     return None
@@ -43,7 +53,7 @@ def assign_kinds(doc: DocIR) -> None:
     section = "front"
     title_done = False
     chosen = _pick_title(doc)
-    if chosen is not None:
+    if chosen is not None and chosen.kind != "title":
         chosen.tag, chosen.kind = "h1", "title"
         # a wrapped title continues on the next block with the same size
         for page in doc.pages[:2]:
@@ -113,6 +123,10 @@ def assign_kinds(doc: DocIR) -> None:
                     section = "front"; continue
                 b.kind = "section_heading"
                 head = txt.strip()
+                if numbering := STRUCTURAL_NUMBER.match(head):
+                    b.tag = f"h{min(6, 2 + numbering[1].count('.'))}"
+                elif b.tag == "h1":
+                    b.tag = "h2"
                 if ABSTRACT.match(head): section = "abstract"; b.kind = "abstract"
                 elif REFS.match(head): section = "references"
                 elif ACK.match(head): section = "acknowledgment"; b.kind = "acknowledgment"

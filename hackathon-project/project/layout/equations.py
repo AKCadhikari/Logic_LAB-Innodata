@@ -118,6 +118,57 @@ def tex_tokens(text):
         not depth and xml_safe(text) == text and "\ufffd" not in text) else []
 
 
+def _display_key(text):
+    """Compare common serialization variants of the same display."""
+    text = NUMBER.sub("", text)
+    text = text.replace(r"\overrightarrow", r"\vec")
+    text = re.sub(r"\\(?:begin|end)\{(?:cases|array)\}(?:\{[lcr\s]+\})?", "", text)
+    text = re.sub(r"\\(?:left|right|mathrm|text)(?![A-Za-z])|\\[{}]|\\\\", "", text)
+    return re.sub(r"[\s{}]", "", text).rstrip(".;")
+
+
+def reconcile_displays(page):
+    """Use a unique, corroborated source crop in place of a matching unlocated OCR display."""
+    displays = [block for block in page.blocks if block.kind == "equation" and block.bbox
+                and block.source_reference.get("formula", {}).get("status") in
+                {"two_pass_agreement", "native_text", "source_reviewed"}]
+    if not displays:
+        return
+    original = page.blocks
+    replacements, consumed = {}, set()
+    for index, block in enumerate(original):
+        if block.kind != "equation" or block.bbox or block.source != "ocr" or not block.text.strip():
+            continue
+        before = next((item for item in reversed(original[:index]) if item.bbox
+                       and item.kind != "equation" and item.tag not in {"header", "footer"}), None)
+        after = next((item for item in original[index + 1:] if item.bbox
+                      and item.kind != "equation" and item.tag not in {"header", "footer"}), None)
+        key = _display_key(block.text)
+        matches = [item for item in displays if id(item) not in consumed and _display_key(item.text) == key
+                   and (not before or before.bbox[3] <= item.bbox[1] + 4)
+                   and (not after or after.bbox[1] >= item.bbox[3] - 4)]
+        if len(key) < 6 or len(matches) != 1 or not (before or after):
+            continue
+        accepted = matches[0]
+        accepted.source_reference.setdefault("alternate_transcriptions", []).append(block.text)
+        replacements[id(block)] = accepted
+        consumed.add(id(accepted))
+        if index + 1 < len(original) and accepted.marker:
+            label = original[index + 1]
+            if label.tag == "p" and not label.bbox and label.text.strip() == f"({accepted.marker})":
+                consumed.add(id(label))
+    if replacements:
+        page.blocks = [replacements.get(id(block), block) for block in original if id(block) not in consumed]
+        page.diag["deduplicated_unlocated_displays"] = len(replacements)
+        formula_rows = [block.source_reference["formula"] for block in page.blocks
+                        if block.kind == "equation" and "formula" in block.source_reference]
+        page.diag["formula_validation"] = formula_rows
+        page.diag["equation_review"] = [
+            f"Equation {row['number'] or index} requires text review. {row['reason']}"
+            for index, row in enumerate(formula_rows, 1) if row["status"] == "review_required"
+        ]
+
+
 def recognise_equation_number(source, crop, settings):
     """Read the isolated printed label in two rasterizations."""
     results = []

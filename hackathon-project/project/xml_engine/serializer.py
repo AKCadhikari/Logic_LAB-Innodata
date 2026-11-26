@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from lxml import etree
 from layout.model import DocIR, PageIR, Block, Span
-from utils.textutil import xml_safe, lang_attr
+from utils.textutil import xml_safe, lang_attr, xml_script_digits
 
 BLOCK_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "li", "table", "caption", "thead", "tbody", "tr", "th", "td",
               "figure", "img", "figcaption", "blockquote", "pre", "hr", "header", "footer", "aside"}
@@ -37,6 +37,7 @@ def _runs(spans: list[Span]) -> list[Span]:
 CAPS = re.compile(r"(?<!\w)(?:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+|[A-Z][A-Z0-9]+|[A-Z]\.|"
                   r"[A-Z]*\d[A-Z0-9]*[A-Z][A-Z0-9]*)(?!\w)(?:[ \t]+[A-Z][A-Z0-9]+(?!\w))*")
 SUPERSCRIPTS = re.compile(r"[\u00b9\u00b2\u00b3\u2070\u2074-\u2079]+")
+SUBSCRIPTS = re.compile(r"[\u2080-\u2089]+")
 
 
 def _styled_segments(runs, sample):
@@ -44,9 +45,12 @@ def _styled_segments(runs, sample):
         if not sample:
             yield run, ""
             continue
-        for segment in re.split(f"({SUPERSCRIPTS.pattern})", run.text):
+        for segment in re.split(f"({SUPERSCRIPTS.pattern}|{SUBSCRIPTS.pattern})", run.text):
             if SUPERSCRIPTS.fullmatch(segment):
-                yield replace(run, text=segment, sup=True), ""
+                yield replace(run, text=xml_script_digits(segment), sup=True, sub=False), ""
+                continue
+            if SUBSCRIPTS.fullmatch(segment):
+                yield replace(run, text=xml_script_digits(segment), sup=False, sub=True), ""
                 continue
             if run.small_caps:
                 yield replace(run, text=segment), "small-caps"

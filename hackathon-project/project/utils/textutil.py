@@ -132,6 +132,14 @@ def is_rtl(text: str) -> bool:
     return direction_of(text)[0] == "rtl"
 
 
+SCRIPT_DIGITS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉", "01234567890123456789")
+
+
+def xml_script_digits(text: str) -> str:
+    """Normalize script digits only where XML records their typographic position."""
+    return text.translate(SCRIPT_DIGITS)
+
+
 def xml_safe(s: str) -> str:
     """Keep only characters that are legal in XML 1.0."""
     out = []

@@ -1,11 +1,27 @@
 """Language, reading order and validation evidence from the shared IR."""
 from collections import Counter
+import re
 
-from utils.textutil import language_profile, xml_safe
+from utils.textutil import direction_of, language_profile, xml_safe
 
 
 def block_text(block):
     return block.text or " ".join([*(child.text for child in block.children), *(cell.text for cell in block.cells)])
+
+
+NON_PROSE = {"equation", "pseudocode", "publication_metadata", "rights", "byline", "reference_entry"}
+
+
+def language_text(block):
+    if block.kind in NON_PROSE or block.tag in {"header", "footer"}:
+        return ""
+    if block.children:
+        return " ".join(map(language_text, block.children))
+    if block.spans and "".join(span.text for span in block.spans) == block.text:
+        text = " ".join(span.text for span in block.spans if not span.formula)
+    else:
+        text = block_text(block)
+    return re.sub(r"https?://\S+|www\.\S+|\bdoi:\s*\S+|(?<!\w)[A-Z][A-Z0-9-]+\b", " ", text)
 
 
 def has_text_loss(block) -> bool:
@@ -19,7 +35,7 @@ def decorate_document(ir) -> dict:
     document_types = Counter()
     for page in ir.pages:
         hint = page.diag.get("native_language", {}).get("language", "und")
-        page.language = language_profile("\n".join(map(block_text, page.blocks)), hint)
+        page.language = language_profile("\n".join(map(language_text, page.blocks)), hint)
         languages = set()
         reading_order = 0
         reasons = page.diag.setdefault("review_reasons", [])
@@ -30,7 +46,11 @@ def decorate_document(ir) -> dict:
             block.original_text = raw
             reading_order += 1
             block.reading_order = reading_order
-            block.language = language_profile(block_text(block), page.language["language"])
+            sample = language_text(block)
+            block.language = language_profile(sample, page.language["language"])
+            if not sample.strip():
+                base, direction = direction_of(block_text(block))
+                block.language.update(base_direction=base, direction=direction)
             block.lang = block.language["language"]
             if block.lang != "und" and block.language["confidence"] >= 0.55:
                 languages.add(block.lang)
@@ -80,7 +100,7 @@ def decorate_document(ir) -> dict:
                               "type": page_type, "language": page.language, "diagnostics": page.diag,
                               "counts": dict(Counter(block.kind or block.tag for block in page.blocks)),
                               "requires_review": page.requires_review})
-    ir.language = language_profile("\n".join(block_text(block) for page in ir.pages for block in page.blocks))
+    ir.language = language_profile("\n".join(language_text(block) for page in ir.pages for block in page.blocks), ir.lang)
     ir.language["languages"] = sorted(document_languages)
     if len(document_languages) > 1:
         ir.language.update(language="mul", method="page-and-block-evidence")

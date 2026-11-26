@@ -69,7 +69,7 @@ def materialize_assets(data: bytes, assets: dict, pdf_path: str, folder: Path, *
             if not relative_path(name):
                 raise ValueError("Generated asset path is not portable.")
             source = pdf[page - 1]
-            clip = pymupdf.Rect(box)
+            clip = pymupdf.Rect(box) * source.rotation_matrix
             if clip.is_empty or not source.rect.contains(clip):
                 raise ValueError("An image crop lies outside its source page.")
             pixels = source.get_pixmap(dpi=180, clip=clip, alpha=False).tobytes("png")

@@ -49,5 +49,6 @@ def test_sample_profile_preserves_mixed_case_markup_and_line_boxes(settings):
     node = etree.fromstring(data).find("header/p")
     assert node.get("sub_bboxes") == "50.00,80.00,160.00,89.00|60.00,95.00,90.00,105.00"
     assert [child.tag for child in node] == ["all-caps", "sup", "small-caps"]
-    assert "".join(node.itertext()) == block.text
+    assert node.findtext("sup") == "1"
+    assert "".join(node.itertext()) == block.text.replace("¹", "1")
     assert not validate_xml(data, 1, settings)["issues"]

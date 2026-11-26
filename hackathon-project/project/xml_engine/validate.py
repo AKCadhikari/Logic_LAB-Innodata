@@ -5,7 +5,7 @@ from functools import lru_cache
 from math import isfinite
 from pathlib import Path
 from lxml import etree
-from utils.textutil import norm_ws
+from utils.textutil import norm_ws, xml_script_digits
 from xml_engine.serializer import ALLOWED, PROFILES
 
 
@@ -18,10 +18,11 @@ def profile_schema(profile):
     return etree.XMLSchema(etree.parse(str(source), parser=etree.XMLParser(resolve_entities=False, no_network=True)))
 
 
-def _valid_box(values):
+def _valid_box(values, bounds=None):
     try:
         x0, y0, x1, y1 = map(float, values)
-        return all(map(isfinite, (x0, y0, x1, y1))) and x0 <= x1 and y0 <= y1
+        return (all(map(isfinite, (x0, y0, x1, y1))) and x0 <= x1 and y0 <= y1
+                and (bounds is None or (0 <= x0 <= x1 <= bounds[0] and 0 <= y0 <= y1 <= bounds[1])))
     except (TypeError, ValueError):
         return False
 
@@ -72,25 +73,47 @@ def validate_xml(data: bytes, expected_pages: int, settings) -> dict:
         valid_pages = {str(number) for number in range(1, expected_pages + 1)}
         if any(node.get("page") not in valid_pages for node in root.iter() if node.get("page") is not None):
             issues.append("A sample-format element refers to a page outside the source PDF.")
-        ids = set()
+        ids = {}
+        previous_body = previous_table = None
         for node in root.iter():
             if anchor := node.get("continues_from"):
-                if anchor not in ids:
-                    issues.append("A continuation must refer to an earlier XML element.")
-                    break
+                earlier = ids.get(anchor)
+                targets = earlier is not None and (node.getparent() is earlier.getparent() and node.get("page") in valid_pages
+                           and earlier.get("page") in valid_pages and int(node.get("page")) == int(earlier.get("page")) + 1)
+                if node.tag == "table":
+                    if not targets or earlier is not previous_table:
+                        issues.append("A table continuation must refer to the preceding table in the same section on the previous page.")
+                elif not targets or node.tag != "p" or node.get("kind") != "body" or earlier is not previous_body:
+                    issues.append("A continuation must refer to the preceding body paragraph in the same section on the previous page.")
             if identifier := node.get("id"):
                 if identifier in ids:
                     issues.append("Sample-format element IDs must be unique.")
-                    break
-                ids.add(identifier)
+                ids[identifier] = node
+            if node.tag == "p" and node.get("kind") == "body":
+                previous_body = node
+            elif node.tag == "table":
+                previous_table = node
+        bounds = {}
+        for page in pages:
+            try:
+                bounds[page.get("num")] = (float(page.get("width")), float(page.get("height")))
+            except (TypeError, ValueError):
+                continue
         for node in root.iter():
             box = [node.get(key) for key in ("x0", "y0", "x1", "y1")]
-            if any(value is not None for value in box) and not _valid_box(box):
+            limits = bounds.get(node.get("page"))
+            if any(value is not None for value in box) and not _valid_box(box, limits):
                 issues.append("A sample-format bounding box is incomplete or invalid.")
                 break
             if "sub_bboxes" in node.attrib and not all(
-                    _valid_box(box.split(",")) for box in node.get("sub_bboxes").split("|")):
+                    _valid_box(box.split(","), limits) for box in node.get("sub_bboxes").split("|")):
                 issues.append("A sample-format line bounding box is invalid.")
+                break
+        for node in root.iter("section"):
+            parent = node.getparent()
+            if (parent.tag == "section" and (node.get("level") or "").isdigit()
+                    and (parent.get("level") or "").isdigit() and int(node.get("level")) <= int(parent.get("level"))):
+                issues.append("A nested section must have a deeper level than its parent.")
                 break
     else:
         pages = root.findall("page")
@@ -140,6 +163,8 @@ def verify_unicode(data: bytes, document, locations: dict) -> dict:
         if values:
             value = values[0]
             rendered = norm_ws("".join(value.itertext()))
+            if root.find("body") is not None and next(value.iter("sup", "sub"), None) is not None:
+                expected = xml_script_digits(expected)
             # Sample XML can add list labels and use formula image alternate text.
             if norm_ws(expected) in rendered or any(
                     norm_ws(expected) in norm_ws(img.get("alt", "")) for img in value.iter("img")):

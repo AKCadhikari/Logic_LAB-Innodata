@@ -38,6 +38,24 @@ FENCED_CODE = re.compile(r"^\x60{3}[A-Za-z][\w+-]*[ \t]*\r?\n[\s\S]*?^\x60{3}[ \
 ORDERED = re.compile(r"^\s*(\d+[.)])\s+(.+)$")
 MARKDOWN_TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
 INLINE_FORMULA = re.compile(r"(?<!\\)\$([^$\n]+)\$|\\\((.+?)\\\)")
+INLINE_EMPHASIS = re.compile(
+    r"(?<![\w\\*_])(?P<mark>\*\*|__|\*|_)(?P<value>[^\s*_](?:[^\n*_]*?[^\s*_])?)(?P=mark)(?![\w*_])"
+)
+
+
+def prose_spans(text):
+    start = 0
+    for match in INLINE_EMPHASIS.finditer(text):
+        value = match["value"]
+        if not any(character.isalpha() for character in value):
+            continue
+        if start < match.start():
+            yield Span(text[start:match.start()])
+        bold = len(match["mark"]) == 2
+        yield Span(value, bold=bold, italic=not bold)
+        start = match.end()
+    if start < len(text):
+        yield Span(text[start:])
 
 
 def text_block(tag: str, text: str, kind: str) -> Block:
@@ -47,13 +65,14 @@ def text_block(tag: str, text: str, kind: str) -> Block:
         formula = match[1] or match[2]
         if match[1] and not re.search(r"[=^_\\{}∑∫√]", formula):
             continue
-        spans.append(Span(text[consumed:match.start()]))
+        spans.extend(prose_spans(text[consumed:match.start()]))
         spans.append(Span(formula, formula=True))
         consumed = match.end()
+    spans.extend(prose_spans(text[consumed:]))
     if spans:
-        spans.append(Span(text[consumed:]))
         text = "".join(span.text for span in spans)
-    return Block(tag, text, kind=kind, spans=spans)
+    styled = [span for span in spans if span.bold or span.italic or span.formula]
+    return Block(tag, text, kind=kind, spans=spans if styled else [])
 
 
 def table_block(raw: str) -> Block:

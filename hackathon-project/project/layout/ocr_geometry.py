@@ -10,7 +10,8 @@ from diagnostics.profile import block_text
 from layout.equations import position_numbered_equations
 from layout.kinds import ADDRESS, AFFIL, CLASSIFICATION, KEYW, metadata_kind
 from layout.model import Block
-from layout.region_association import match
+from layout.reconstruct import CAPTION_RE, TABLE_WORDS, caption_target, join_lines
+from layout.region_association import coverage, match
 from ocr import engine
 from utils.textutil import ISO_TO_TESS, language_profile, norm_cmp
 from utils import execution_audit as audit
@@ -156,7 +157,7 @@ def align_blocks(page, lines):
     return {"aligned": aligned, "recovered_headers": recover_masthead(page, lines, starts)}
 
 
-def position_page(source, page, settings, packs):
+def position_page(source, page, settings, packs, *, positioned_lines=None):
     if (page.source != "ocr" or not page.blocks or source.rotation or
             not any(block.bbox is None and block.source == "ocr" for block in page.blocks)):
         return None
@@ -170,6 +171,8 @@ def position_page(source, page, settings, packs):
                                    orient=False, deskew=False)
     except (OSError, RuntimeError, ValueError, engine.subprocess.TimeoutExpired) as error:
         return {"status": "Local coordinate alignment failed.", "reason": str(error)}
+    if positioned_lines is not None:
+        positioned_lines.extend(lines)
     result = align_blocks(page, lines)
     if regions := page.diag.get("layout", {}).get("detections"):
         result["region_fragments"] = align_region_fragments(page, lines, regions)
@@ -185,6 +188,70 @@ def position_page(source, page, settings, packs):
                                      "matched_blocks": result["aligned"] + located,
                                      "matched_fragments": result.get("region_fragments", 0)}])
     return {"status": "checked", **result}
+
+
+def recover_captions(source, page, lines, settings, packs):
+    """Use text inside a supported caption region to fill an otherwise empty caption."""
+    regions = page.diag.get("layout", {}).get("detections", [])
+    for region in regions:
+        label = region["class_name"]
+        if label not in {"image_caption", "table_caption"} or region["confidence"] < .60:
+            continue
+        is_table = label == "table_caption"
+        box = region["bbox"]
+        target = caption_target(box, is_table, page.blocks)
+        if target is None:
+            continue
+        matching = [line for line in lines if line.conf >= 75 and coverage(line.bbox, box) >= .65]
+        values = sorted(matching, key=lambda line: (line.bbox[1], line.bbox[0]))
+        text, _ = join_lines(values)
+        ids = []
+        if not CAPTION_RE.match(text) and settings.ocr_enabled and packs:
+            text, values, ids = _read_caption_crop(source, page, region, settings, packs)
+        if not values or not CAPTION_RE.match(text) or bool(TABLE_WORDS.match(text)) != is_table:
+            continue
+        caption_box = box_of(values)
+        target.caption = text
+        target.source_reference.update(caption_bbox=caption_box, caption_source=values[0].source,
+                                       caption_region_id=region["id"])
+        duplicate = [block for block in page.blocks if block.tag == "p"
+                     and text_key(block.text) == text_key(text)
+                     and (block.bbox is None or coverage(block.bbox, box) >= .6)]
+        if len(duplicate) == 1:
+            page.blocks = [block for block in page.blocks if block is not duplicate[0]]
+        if ids:
+            target.source_reference["caption_execution_ids"] = ids
+            audit.mark(ids, downstream=[{"consumer": "layout_regions", "reference": region["id"]}])
+
+
+def _read_caption_crop(source, page, region, settings, packs):
+    import numpy as np
+    import pymupdf
+
+    language = language_profile(" ".join(map(block_text, page.blocks)))["language"]
+    pack = ISO_TO_TESS.get(language)
+    if source.rotation or pack not in packs:
+        return "", [], []
+    box = pymupdf.Rect(region["bbox"])
+    clip = (box + (-2, -2, 2, 2)) & source.rect
+    if clip.is_empty:
+        return "", [], []
+    dpi = max(1, min(max(225, settings.ocr_dpi), int(4096 * 72 / max(clip.width, clip.height))))
+    start = audit.cursor()
+    try:
+        pix = source.get_pixmap(dpi=dpi, clip=clip, colorspace=pymupdf.csGRAY, alpha=False)
+        image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+        with audit.details(page=page.n, purpose="caption_region"):
+            lines = engine.ocr_image(image, pack, dpi, settings, psm=6,
+                                     input_reference=region["id"])
+    except (OSError, RuntimeError, ValueError, engine.subprocess.TimeoutExpired):
+        return "", [], []
+    x, y = pix.x * 72 / dpi, pix.y * 72 / dpi
+    placed = [replace(line, bbox=(line.bbox[0] + x, line.bbox[1] + y,
+                                 line.bbox[2] + x, line.bbox[3] + y)) for line in lines]
+    if not placed or min(line.conf for line in placed) < 70:
+        return "", [], []
+    return join_lines(placed)[0], placed, audit.ids_since(start)
 
 
 def align_region_fragments(page, lines, regions):

@@ -39,7 +39,8 @@ def size_key(src: str, cls: str) -> str:
 
 
 def band_sig(text: str) -> str:
-    return re.sub(r"\d+", "#", norm_cmp(text))[:80]
+    key = norm_cmp(text)
+    return (re.sub(r"\d+", "#", key) if PAGENUM_RE.fullmatch(text.strip()) else key)[:160]
 
 
 def compute_context(raw_pages: list[dict], settings) -> DocContext:
@@ -76,46 +77,42 @@ def _bb(it):
     return it.bbox
 
 
+def column_groups(items, med_h, page_w):
+    """Find persistent gutters with text on both sides over the same vertical band."""
+    thr = max(5.0, 0.012 * page_w)
+    groups, right = [], 0
+    for item in sorted(items, key=lambda item: _bb(item)[0]):
+        box = _bb(item)
+        if not groups or box[0] - right > thr:
+            groups.append([])
+            right = box[2]
+        groups[-1].append(item)
+        right = max(right, box[2])
+    if len(groups) < 2:
+        return []
+    ranges = [(min(_bb(item)[1] for item in group), max(_bb(item)[3] for item in group)) for group in groups]
+    if any(min(last, end) - max(first, start) < med_h
+           for (first, last), (start, end) in zip(ranges, ranges[1:])):
+        return []
+    if any(len(group) == 1 and _bb(group[0])[3] - _bb(group[0])[1] < med_h * 2 for group in groups):
+        return []
+    return groups
+
+
 def xy_cut(items: list, med_h: float, page_w: float, rtl: bool, depth: int = 0) -> list[list]:
     if len(items) <= 1 or depth > 12:
         return [items]
-    its = sorted(items, key=lambda i: (_bb(i)[1], _bb(i)[0]))
-    # horizontal cut (top -> bottom)
-    cuts, cur_max = [], _bb(its[0])[3]
-    for k in range(1, len(its)):
-        if _bb(its[k])[1] - cur_max > 0.9 * med_h:
-            cuts.append(k)
-        cur_max = max(cur_max, _bb(its[k])[3])
-    if cuts:
-        out, prev = [], 0
-        for k in cuts + [len(its)]:
-            out += xy_cut(its[prev:k], med_h, page_w, rtl, depth + 1); prev = k
-        return out
-    # vertical cut (columns)
-    its = sorted(items, key=lambda i: _bb(i)[0])
-    thr = max(5.0, 0.012 * page_w)
-    cuts, cur_max = [], _bb(its[0])[2]
-    for k in range(1, len(its)):
-        if _bb(its[k])[0] - cur_max > thr:
-            cuts.append(k)
-        cur_max = max(cur_max, _bb(its[k])[2])
-    if cuts:
-        groups, prev = [], 0
-        for k in cuts + [len(its)]:
-            groups.append(its[prev:k]); prev = k
-        if len(groups) > 1 and all(len(g) >= 1 for g in groups):
-            if rtl:
-                groups = groups[::-1]
-            out = []
-            for g in groups:
-                out += xy_cut(g, med_h, page_w, rtl, depth + 1)
-            return out
+    if columns := column_groups(items, med_h, page_w):
+        if rtl:
+            columns.reverse()
+        return [part for group in columns for part in xy_cut(group, med_h, page_w, rtl, depth + 1)]
     # wide-item aware cut: a few full-width items (rules, spanning lines) must not hide a real column gutter
     rx0 = min(_bb(i)[0] for i in items); rx1 = max(_bb(i)[2] for i in items)
     wide = [i for i in items if (_bb(i)[2] - _bb(i)[0]) > 0.62 * (rx1 - rx0)]
-    if wide and len(items) - len(wide) >= 4 and len(wide) < len(items):
+    wide_ids = {id(item) for item in wide}
+    narrowed = [item for item in items if id(item) not in wide_ids]
+    if wide and len(narrowed) >= 4 and column_groups(narrowed, med_h, page_w):
         segs, cur = [], []
-        wide_ids = {id(w) for w in wide}
         for it in sorted(items, key=lambda i: (_bb(i)[1], _bb(i)[0])):
             if id(it) in wide_ids:
                 if cur: segs.append(cur); cur = []
@@ -128,7 +125,17 @@ def xy_cut(items: list, med_h: float, page_w: float, rtl: bool, depth: int = 0) 
             for sgm in segs:
                 out += xy_cut(sgm, med_h, page_w, rtl, depth + 1) if len(sgm) > 1 else [sgm]
             return out
-    return [items]
+    # Horizontal gaps remain useful for isolated headings, paragraphs and figures.
+    ordered = sorted(items, key=lambda item: (_bb(item)[1], _bb(item)[0]))
+    cuts, cur_max = [], _bb(ordered[0])[3]
+    for index, item in enumerate(ordered[1:], 1):
+        if _bb(item)[1] - cur_max > .9 * med_h:
+            cuts.append(index)
+        cur_max = max(cur_max, _bb(item)[3])
+    if not cuts:
+        return [ordered]
+    return [part for start, end in zip([0, *cuts], [*cuts, len(ordered)])
+            for part in xy_cut(ordered[start:end], med_h, page_w, rtl, depth + 1)]
 
 
 # ---------------------------------------------------------------- paragraph building
@@ -360,10 +367,10 @@ def _lines_to_blocks(lines: list[Line], ctx, settings, body: float, hsizes: list
         elif CAPTION_RE.match(text) and nwords < 80:
             blk.kind = "figure_caption"; blk.cls = "caption"
         elif hsizes and size >= hsizes[-1] * 0.97 and nwords <= 40 and len(para) <= 4 and size >= body * settings.heading_ratio:
-            lvl = 1 + min(range(len(hsizes)), key=lambda i: abs(hsizes[i] - size))
-            blk.tag = f"h{min(lvl, 5)}"; blk.kind = "section_heading"
+            lvl = 2 + min(range(len(hsizes)), key=lambda i: abs(hsizes[i] - size))
+            blk.tag = f"h{min(lvl, 6)}"; blk.kind = "section_heading"
         elif (bold or (caps and bold)) and len(para) == 1 and nwords <= 12 and size >= body * 0.98 and (text[:1].isupper() or text[:1].isdigit() or ord(text[:1]) > 0x250) and not text.rstrip().endswith((".", ",", ";", ":")) and not mk:
-            blk.tag = f"h{min(len(hsizes) + 1, 6)}"; blk.kind = "section_heading"
+            blk.tag = f"h{min(len(hsizes) + 2, 6)}"; blk.kind = "section_heading"
         elif mk:
             blk.tag = "li"; blk.kind = mk
             blk.marker = text[:mlen].strip()
@@ -410,33 +417,58 @@ def place_visuals(page):
     page.blocks = _attach_captions(blocks)
 
 
+def order_positioned_blocks(page, rtl):
+    """Prefer a verified column geometry when every flow block can be placed."""
+    running = {"header", "footer", "aside"}
+    flow = [block for block in page.blocks if block.tag not in running]
+    if len(flow) < 4 or any(not block.bbox for block in flow):
+        return
+    prose = [block for block in flow if block.tag == "p" and block.kind in {"", "body"}
+             and block.bbox[2] - block.bbox[0] < .60 * page.width]
+    if len(prose) < 4:
+        return
+    line_height = statistics.median([
+        (block.bbox[3] - block.bbox[1]) / max(1, len(block.line_boxes)) for block in prose])
+    if not column_groups(prose, line_height, page.width):
+        return
+    ordered = [block for group in xy_cut(flow, line_height, page.width, rtl) for block in group]
+    page.blocks = ([block for block in page.blocks if block.tag == "header"] + ordered
+                   + [block for block in page.blocks if block.tag in {"aside", "footer"}])
+    page.diag["reading_order_method"] = "positioned-column-gutters"
+
+
 def _attach_captions(blocks: list[Block]) -> list[Block]:
     used = set()
-    objs = [i for i, b in enumerate(blocks) if b.tag in ("table", "figure") and b.bbox]
-    for i, b in enumerate(blocks):
-        if not (b.tag == "p" and b.bbox and (b.kind == "figure_caption" or CAPTION_RE.match(b.text))):
+    for caption in blocks:
+        if not (caption.tag == "p" and caption.bbox
+                and (caption.kind == "figure_caption" or CAPTION_RE.match(caption.text))):
             continue
-        is_tab = bool(TABLE_WORDS.match(b.text))
-        best, bd = None, 1e9
-        for j in objs:
-            o = blocks[j]
-            if j in used or o.caption:
-                continue
-            if is_tab != (o.tag == "table") and not (o.tag == "figure" and not is_tab):
-                continue
-            ox0, oy0, ox1, oy1 = o.bbox
-            bx0, by0, bx1, by1 = b.bbox
-            ov = min(ox1, bx1) - max(ox0, bx0)
-            if ov < 0.3 * min(ox1 - ox0, bx1 - bx0):
-                continue
-            gaps = [gap for gap in (by0 - oy1, oy0 - by1) if gap >= -2]
-            if not gaps:
-                continue
-            d = min(abs(gap) for gap in gaps)
-            if d < bd and d < 70:
-                best, bd = j, d
-        if best is not None:
-            blocks[best].caption = b.text
-            blocks[best].source_reference.update(caption_bbox=b.bbox, caption_size=b.size)
-            used.add(best); b.cls = "__consumed__"
-    return [b for b in blocks if b.cls != "__consumed__"]
+        target = caption_target(caption.bbox, bool(TABLE_WORDS.match(caption.text)), blocks)
+        if target is not None:
+            target.caption = caption.text
+            target.source_reference.update(caption_bbox=caption.bbox, caption_size=caption.size,
+                                           caption_source=caption.source)
+            used.add(id(caption))
+    return [block for block in blocks if id(block) not in used]
+
+
+def caption_target(box, is_table, blocks):
+    """Use overlap and separation to resolve local captions and reject near-ties."""
+    x0, y0, x1, y1 = box
+    choices = []
+    for visual in blocks:
+        if (visual.tag != ("table" if is_table else "figure") or not visual.bbox
+                or visual.caption or visual.kind == "equation"):
+            continue
+        left, top, right, bottom = visual.bbox
+        smaller = min(right - left, x1 - x0)
+        overlap = min(x1, right) - max(x0, left)
+        distance = max(y0 - bottom, top - y1)
+        if smaller <= 0 or overlap < .35 * smaller or not -3 <= distance <= 70:
+            continue
+        mismatch = abs((x0 + x1) - (left + right)) / max(right - left, x1 - x0)
+        choices.append((max(distance, 0) + 12 * (1 - overlap / smaller) + 6 * mismatch, visual))
+    choices.sort(key=lambda item: item[0])
+    if choices and (len(choices) == 1 or choices[1][0] - choices[0][0] > 4):
+        return choices[0][1]
+    return None

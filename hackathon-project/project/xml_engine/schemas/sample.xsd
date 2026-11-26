@@ -42,6 +42,8 @@
       <xs:choice minOccurs="0" maxOccurs="unbounded">
         <xs:element name="p" type="Text"/>
         <xs:element name="h1" type="Text"/>
+        <xs:element name="page_header" type="Text"/>
+        <xs:element name="page_footer" type="Text"/>
         <xs:element name="page" type="Milestone"/>
         <xs:element name="figure_wrap" type="Figure"/>
         <xs:element name="table" type="Table"/>

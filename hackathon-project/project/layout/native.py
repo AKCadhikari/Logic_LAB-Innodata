@@ -62,7 +62,7 @@ def extract_lines(page) -> list[Line]:
                 n = len(t.strip()) or 0
                 bold, ital = _is_bold(s["font"], s["flags"]), _is_italic(s["font"], s["flags"])
                 small = s["size"] < 0.85 * maxsize and len(t.strip()) <= 6 and len(ln["spans"]) > 1
-                sup = small and s["origin"][1] < baseline - 0.2 * maxsize
+                sup = bool(s["flags"] & 1) or (small and s["origin"][1] < baseline - 0.2 * maxsize)
                 sub = small and (not sup) and s["origin"][1] > baseline + 0.1 * maxsize
                 sb = pymupdf.Rect(s["bbox"])
                 strike = False
@@ -131,22 +131,34 @@ def recover_running_text(page, recognized: list[Line], band: float) -> list[Line
     return merged
 
 
-def extract_tables(page, settings) -> list[Block]:
+def extract_tables(page, settings, regions=()) -> list[Block]:
     """Real tables with row/col spans derived from the cell grid. Conservative to avoid false positives."""
-    if len(page.get_drawings()) < 4:
-        return []
-    try:
+    from layout.region_association import coverage
+
+    found_tables = []
+    if len(page.get_drawings()) >= 4:
         try:
-            found = page.find_tables(use_layout=False)
-            if not found.tables:
+            try:
+                found = page.find_tables(use_layout=False)
+                if not found.tables:
+                    found = page.find_tables()
+            except TypeError:
                 found = page.find_tables()
-        except TypeError:
-            found = page.find_tables()
-    except Exception:
-        return []
+            found_tables.extend((table, False) for table in found.tables)
+        except (RuntimeError, ValueError):
+            pass
+    for region in regions:
+        if (region["class_name"] != "table" or region["confidence"] < .65 or page.rotation
+                or any(coverage(table.bbox, region["bbox"]) > .7 for table, _ in found_tables)):
+            continue
+        try:
+            found = page.find_tables(clip=region["bbox"], strategy="text")
+            found_tables.extend((table, True) for table in found.tables)
+        except (RuntimeError, TypeError, ValueError):
+            continue
     W, H = page.rect.width, page.rect.height
     res = []
-    for t in found.tables:
+    for t, inferred in found_tables:
         cells = [c for c in (t.cells or []) if c]
         if len(cells) < 4:
             continue
@@ -175,6 +187,10 @@ def extract_tables(page, settings) -> list[Block]:
             txt = " ".join(raw.split())
             grid_cells.append(Cell(text=xml_safe(txt), row=r0, col=c0, rowspan=max(1, r1 - r0),
                                    colspan=max(1, c1 - c0), original_text=raw, bbox=tuple(c)))
+        if inferred:
+            grid_cells = _remove_table_spacers(grid_cells)
+        if not grid_cells:
+            continue
         nonempty = sum(1 for c in grid_cells if c.text) / len(grid_cells)
         nrows = max(c.row + c.rowspan for c in grid_cells)
         if nonempty < 0.3 or nrows < 2:
@@ -185,6 +201,19 @@ def extract_tables(page, settings) -> list[Block]:
         grid_cells.sort(key=lambda c: (c.row, c.col))
         res.append(Block(tag="table", bbox=tuple(t.bbox), cells=grid_cells, kind="table"))
     return res
+
+
+def _remove_table_spacers(cells):
+    """Whitespace-only rows from the text finder have no physical row border."""
+    occupied = sorted({row for cell in cells if cell.text for row in range(cell.row, cell.row + cell.rowspan)})
+    indices = {row: index for index, row in enumerate(occupied)}
+    kept = []
+    for cell in cells:
+        rows = [indices[row] for row in range(cell.row, cell.row + cell.rowspan) if row in indices]
+        if rows:
+            cell.row, cell.rowspan = rows[0], len(rows)
+            kept.append(cell)
+    return kept
 
 
 def extract_figures(page, settings, table_boxes, lines=None) -> list[Block]:

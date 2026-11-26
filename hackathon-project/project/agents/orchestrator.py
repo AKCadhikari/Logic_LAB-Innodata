@@ -10,9 +10,10 @@ from typing import Callable
 from config.settings import Settings
 from diagnostics.page_diagnostics import analyze_page
 from diagnostics.profile import decorate_document, quality_gate
+from quality.layout_fidelity import layout_fidelity
 from ingestion.discover import describe
 from layout.model import PageIR, DocIR, Line, Block, Span, ir_from_dict
-from layout import native, reconstruct, kinds, figures, ocr_geometry, equations, pseudocode, doclayout, region_association
+from layout import native, reconstruct, kinds, figures, ocr_geometry, equations, pseudocode, doclayout, region_association, running
 from layout.docling_adapter import DoclingLayout
 from ocr import engine as ocr
 from ocr.router import OCRRouter
@@ -256,7 +257,7 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                     d["reasons"].append(reason)
                     d["ocr"] = {"engine": None, "status": "review_required", "requires_review": True}
             if rec["source"] == "native" and rec["lines"] and d["health"] in ("healthy", "suspicious"):
-                rec["tables"] = native.extract_tables(page, settings)
+                rec["tables"] = native.extract_tables(page, settings, layout_pages[i]["detections"])
                 rec["figs"] = native.extract_figures(page, settings, [t.bbox for t in rec["tables"]], rec["lines"])
             audit.event("extraction", "page", doc=doc_id, page=i + 1, source=rec["source"], health=d["health"], lines=len(rec["lines"]),
                         tables=len(rec["tables"]), figures=len(rec["figs"]), seconds=round(time.time() - tp, 2))
@@ -301,14 +302,22 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
     ctx = reconstruct.compute_context(raw, settings)
     ctx.lang = lang
     pages: list[PageIR] = []
-    geometry_packs = ocr.available_langs(settings) if any(item["blocks"] for item in raw) else set()
+    running_lines = []
+    geometry_packs = ocr.available_langs(settings) if settings.ocr_enabled and (
+        any(item["blocks"] for item in raw) or any(
+            region["class_name"] in {"image_caption", "table_caption"}
+            for evidence in layout_pages for region in evidence["detections"])) else set()
     try:
         for rp in raw:
             stage("layout", page=rp["n"])
+            source_page = doc[rp["n"] - 1]
+            source_width, source_height = source_page.cropbox.width, source_page.cropbox.height
+            rtl = False
             try:
                 ls = rp["lines"]
                 rtl = language_profile(_text_of(ls))["base_direction"] == "rtl"
-                pg = reconstruct.build_page(rp["n"], rp["w"], rp["h"], ls, rp["tables"], rp["figs"], ctx, settings, rp["source"], doc_rtl=rtl)
+                pg = reconstruct.build_page(rp["n"], source_width, source_height, ls, rp["tables"], rp["figs"],
+                                            ctx, settings, rp["source"], doc_rtl=rtl)
                 if rp["blocks"] is not None:
                     pg.blocks = rp["blocks"] + pg.blocks
                 for b in pg.blocks:
@@ -320,7 +329,8 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                 pg.blocks = rp["blocks"] or ([Block(tag="p", text=" ".join(l.text for l in rp["lines"]),
                                                     kind="body", source=rp["source"])] if rp["lines"] else [])
                 rp["diag"].setdefault("review_reasons", []).append("Layout reconstruction failed.")
-            pg.diag = {**rp["diag"], **pg.diag}
+            pg.width, pg.height = rp["w"], rp["h"]
+            pg.diag = {**rp["diag"], **pg.diag, "source_width": source_width, "source_height": source_height}
             if pg.source == "native" and pg.diag.get("health") == "healthy":
                 pg.diag["native_numeric_inventory"] = dict(numeric_values(doc[pg.n - 1].get_text()))
             ocr_info = pg.diag.get("ocr", {})
@@ -335,20 +345,36 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                 "status": detection["status"], "docling_status": layout_status,
                 "regions": len(detection["detections"]), **detection,
             }
-            if geometry := ocr_geometry.position_page(doc[pg.n - 1], pg, settings, geometry_packs):
+            positioned = []
+            if geometry := ocr_geometry.position_page(source_page, pg, settings, geometry_packs, positioned_lines=positioned):
                 pg.diag["layout"]["coordinate_alignment"] = geometry
                 audit.event("layout", "ocr_coordinate_alignment", page=pg.n, **geometry)
             detections = detection["detections"]
-            can_associate = not pg.diag.get("rotation") and not (ocr_info.get("rotate") or ocr_info.get("skew"))
+            can_associate = pg.source == "native" or (
+                not source_page.rotation and not (ocr_info.get("rotate") or ocr_info.get("skew")))
+            try:
+                native_lines = ls if rp["source"] == "native" else native.extract_lines(source_page)
+                margin_lines = running.native_candidates(source_page, native_lines)
+            except (RuntimeError, ValueError):
+                margin_lines = []
+            ocr_lines = [line for line in ls if line.source == "ocr"] + positioned if can_associate else []
+            running_lines.append(margin_lines + ocr_lines)
             if can_associate and detections:
                 region_association.add_visuals(pg, detections)
+                region_association.merge_figure_panels(pg, detections)
                 region_association.associate(pg, detections, classify=True)
             if detection["status"] == "failed":
                 pg.requires_review = True
                 pg.diag.setdefault("review_reasons", []).append(detection["error"])
             reconstruct.place_visuals(pg)
+            if can_associate and detections:
+                ocr_geometry.recover_captions(source_page, pg, margin_lines or ocr_lines, settings, geometry_packs)
+                region_association.retain_figure_text(pg, detections)
+                if rp["blocks"] is not None:
+                    reconstruct.order_positioned_blocks(pg, rtl)
             pseudocode.preserve_pseudocode(pg)
             equations.recognise_formulas(doc[pg.n - 1], pg, settings)
+            equations.reconcile_displays(pg)
             if can_associate and detections:
                 matched = region_association.associate(pg, detections)
                 if execution_ids := detection.get("execution_ids"):
@@ -373,6 +399,7 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                                review_required=pg.requires_review,
                                confidence=pg.diag["confidence"])
             pages.append(pg)
+        running.apply(pages, running_lines, settings.header_band)
         counts["review"] = sum(page.requires_review for page in pages)
     finally:
         layout.close()
@@ -433,16 +460,18 @@ def detect_layout(doc, settings, work_dir, stage, audit):
     return pages
 
 
-def refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, progress, processing):
+def refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, progress, processing, *,
+                   force_detection=False):
     previous = result.get("execution_evidence", {})
     private = work_dir / "private-model-responses" if settings.audit_private_responses else None
     with model_audit.scope(previous.get("document_id", saved_ir.doc_id),
                            saved_ir.meta.get("source_sha256"), private) as trace:
         trace["executions"].extend({**row, "historical": True} for row in previous.get("executions", []))
-        return _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, progress, processing)
+        return _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, progress, processing,
+                               force_detection)
 
 
-def _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, progress, processing):
+def _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, progress, processing, force_detection):
     """Reconcile only the saved OCR attempt for the same source file."""
     import pymupdf
 
@@ -456,14 +485,16 @@ def _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, p
     with pymupdf.open(pdf) as source:
         if len(source) != len(saved_ir.pages):
             raise ValueError("The PDF and the saved extraction have different page counts.")
-        refresh = settings.doclayout_enabled and any(
-            p.diag.get("layout", {}).get("status") != "completed" for p in saved_ir.pages
-        )
+        refresh = settings.doclayout_enabled and (force_detection or any(
+            page.diag.get("layout", {}).get("status") != "completed" for page in saved_ir.pages))
         detections = detect_layout(source, settings, work_dir, lambda name, **detail: processing(
             {"stage": name, **detail}), audit) if refresh else None
         processing({"stage": "layout", "state": "running"})
+        running_lines = []
         for page in saved_ir.pages:
             processing({"stage": "layout", "page": page.n})
+            original = source[page.n - 1]
+            page.diag.update(source_width=original.cropbox.width, source_height=original.cropbox.height)
             current = page.diag.setdefault("layout", {})
             if detections:
                 evidence = detections[page.n - 1]
@@ -473,18 +504,36 @@ def _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, p
                 elif evidence.get("error"):
                     page.requires_review = True
                     page.diag.setdefault("review_reasons", []).append(evidence["error"])
-            if geometry := ocr_geometry.position_page(source[page.n - 1], page, settings, packs):
+            positioned = []
+            if geometry := ocr_geometry.position_page(original, page, settings, packs, positioned_lines=positioned):
                 current["coordinate_alignment"] = geometry
                 audit.event("layout", "ocr_coordinate_alignment", page=page.n, **geometry)
             reconstruct.place_visuals(page)
             pseudocode.preserve_pseudocode(page)
-            equations.recognise_formulas(source[page.n - 1], page, settings)
             ocr_info = page.diag.get("ocr", {})
-            if current.get("detections") and not page.diag.get("rotation") and not (ocr_info.get("rotate") or ocr_info.get("skew")):
+            aligned = page.source == "native" or (
+                not original.rotation and not (ocr_info.get("rotate") or ocr_info.get("skew")))
+            try:
+                native_lines = running.native_candidates(original, native.extract_lines(original))
+            except (RuntimeError, ValueError):
+                native_lines = []
+            lines = native_lines + (positioned if aligned else [])
+            running_lines.append(lines)
+            if current.get("detections") and aligned:
+                region_association.merge_figure_panels(page, current["detections"])
+                region_association.associate(page, current["detections"], classify=True)
+                ocr_geometry.recover_captions(original, page, native_lines or positioned, settings, packs)
+                region_association.retain_figure_text(page, current["detections"])
+                rtl = language_profile(" ".join(block.text for block in page.blocks))["base_direction"] == "rtl"
+                reconstruct.order_positioned_blocks(page, rtl)
+            equations.recognise_formulas(original, page, settings)
+            equations.reconcile_displays(page)
+            if current.get("detections") and aligned:
                 region_association.associate(page, current["detections"])
             result["page_log"][page.n - 1]["layout"] = {key: value for key, value in current.items()
                                                          if key != "detections"}
             progress(page.n, len(saved_ir.pages))
+        running.apply(saved_ir.pages, running_lines, settings.header_band)
     processing({"stage": "layout", "state": "completed"})
     processing({"stage": "validation", "state": "running"})
     result = finish_extraction(pdf, saved_ir, settings, out_dir, work_dir, audit, result, start)
@@ -508,6 +557,7 @@ def finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0):
     profile_dir = work_dir / "profiles" / doc_id
     profile_dir.mkdir(parents=True, exist_ok=True)
     write_report(profile_dir / "document_profile.json", profile)
+    write_report(profile_dir / "layout_fidelity_report.json", layout_fidelity(dir_))
     dir_ = ir_from_dict(dir_.to_dict())
     # ---- XML Generation + QA agents -----------------------------------------------------------------------
     assets = {}
@@ -531,7 +581,9 @@ def finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0):
             for name, (page, box) in assets.items():
                 asset_path = out_dir / name
                 asset_path.parent.mkdir(parents=True, exist_ok=True)
-                source_pdf[page - 1].get_pixmap(dpi=180, clip=pymupdf.Rect(box), alpha=False).save(asset_path)
+                original = source_pdf[page - 1]
+                clip = pymupdf.Rect(box) * original.rotation_matrix
+                original.get_pixmap(dpi=180, clip=clip, alpha=False).save(asset_path)
     _write_xml(out_dir, pdf, data)
     complete = compare_content(data, dir_, locations, sample=settings.schema_profile == "sample")
     write_report(profile_dir / "xml_validation_report.json", {**val, "unicode": gate["xml"]})

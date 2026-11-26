@@ -57,7 +57,7 @@ def publish_batch_document(pdf: Path, extraction: dict, decks: list[Path], out: 
         nonlocal amendment
         if len(decks) != 1:
             raise ValueError("Exactly one associated PowerPoint is required.")
-        amendment = amend_deck(pdf, decks[0], target, work, export_settings, audit)
+        amendment = amend_deck(pdf, decks[0], target, work, export_settings, audit, ir=ir)
         return amendment
 
     report = publish_document(out / stem / export_id.hex, stem, ir, export_settings, extraction,

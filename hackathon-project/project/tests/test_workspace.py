@@ -55,6 +55,31 @@ def wait_for_attempt(client, url):
     pytest.fail("The processing attempt did not finish.")
 
 
+def test_export_xml_defaults_to_zip_when_there_is_a_picture(workspace):
+    client, _ = workspace
+    with pymupdf.open() as art:
+        sample = art.new_page(width=180, height=120)
+        sample.draw_circle((90, 60), 47, fill=(0.15, 0.30, 0.75))
+        picture = sample.get_pixmap().tobytes("png")
+    with pymupdf.open(stream=pdf_with_text("The source document contains a diagram.")) as source:
+        source[0].insert_image(pymupdf.Rect(72, 200, 252, 320), stream=picture)
+        url = upload(client, source.tobytes(), "picture report.pdf")
+    assert wait_for_attempt(client, url)["jobs"][0]["status"] == "completed"
+    assert client.patch(url + "/metadata", json={
+        "title": "Picture report", "lang": "en", "approved": True
+    }).status_code == 200
+    for profile in ("sample", "brief"):
+        result = client.get(url + f"/xml?download=1&profile={profile}")
+        assert result.mimetype == "application/zip"
+        with ZipFile(io.BytesIO(result.data)) as archive:
+            data = archive.read("picture report.xml")
+            src, = etree.fromstring(data).xpath("//img/@src")
+            assert src.startswith("output_images/picture report/")
+            assert archive.read(src).startswith(b"\x89PNG\r\n\x1a\n")
+            assert archive.testzip() is None
+        assert client.get(url + f"/xml?download=1&profile={profile}&format=xml").data == data
+
+
 def test_ocr_preference_and_independent_job_snapshots(workspace):
     client, _ = workspace
     profile = "/api/ocr-settings"
@@ -122,9 +147,16 @@ def test_upload_review_export_compare_and_sync(workspace):
     response = client.get(new + "/xml?download=1")
     assert response.status_code == 200
     document_xml = etree.fromstring(response.data)
-    assert document_xml.get("lang") == "de"
-    assert document_xml.findtext("page/h1") == "Reviewed title"
-    assert document_xml.find("page").get("n") == "1"
+    assert document_xml.get("lang") == "german"
+    assert document_xml.findtext("header/title") == "Reviewed title"
+    assert document_xml.find("header/page").get("num") == "1"
+    legacy = etree.fromstring(client.get(new + "/xml?profile=brief").data)
+    assert legacy.get("lang") == "de" and legacy.findtext("page/h1") == "Reviewed title"
+    packed = client.get(new + "/xml?download=1&format=zip")
+    assert packed.status_code == 200
+    with ZipFile(io.BytesIO(packed.data)) as archive:
+        assert archive.testzip() is None
+        assert archive.read(archive.namelist()[0]) == response.data
 
     delta = client.get(new + "/compare", query_string={"previous_id": old_doc["id"], "include_analysis": 1})
     assert delta.status_code == 200

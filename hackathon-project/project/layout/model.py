@@ -29,6 +29,10 @@ class Span:
     link: str = ""
     font: str = ""
     formula: bool = False
+    serif: bool = False
+    small_caps: bool = False
+    underline: bool = False
+    color: str | None = None
 
 
 @dataclass
@@ -86,6 +90,7 @@ class Block:
     source_reference: dict = field(default_factory=dict)
     validation_status: str = "unverified"
     writing_mode: str = "horizontal"
+    line_boxes: list[BBox] = field(default_factory=list)
 
 
 @dataclass

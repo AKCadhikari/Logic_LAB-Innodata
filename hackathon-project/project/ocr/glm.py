@@ -176,14 +176,15 @@ RecognitionMode = Literal["text", "table", "formula"]
 PROMPTS = {"text": "Text Recognition:", "table": "Table Recognition:", "formula": "Formula Recognition:"}
 
 
-def recognise_image(image: bytes, page: int, settings: Settings, mode: RecognitionMode = "text") -> Recognition:
+def recognise_image(image: bytes, page: int, settings: Settings, mode: RecognitionMode = "text", *,
+                    input_reference: str | None = None) -> Recognition:
     payload = {"model": settings.glm_ocr_model, "prompt": PROMPTS[mode], "stream": False,
                "images": [base64.b64encode(image).decode("ascii")], "keep_alive": settings.glm_ocr_keep_alive,
                "options": {"temperature": 0, "num_gpu": 0,
                            "num_ctx": max(8192, settings.glm_ocr_tokens + 4096),
                            "num_predict": settings.glm_ocr_tokens}}
     with audit.execution("page_ocr", "ollama", settings.glm_ocr_model, page=page, input_type="rendered_png",
-                         input_sha256=audit.digest(image), input_reference=f"pdf/page/{page}/render",
+                         input_sha256=audit.digest(image), input_reference=input_reference or f"pdf/page/{page}/render",
                          prompt_template=f"glm-ocr/{mode}/v1") as event:
         data = request_json(settings, "/api/generate", payload)
         result = parse(page, data)

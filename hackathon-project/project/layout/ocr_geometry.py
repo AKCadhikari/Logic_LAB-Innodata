@@ -1,12 +1,14 @@
 """Match OCR paragraphs to positioned text from an independent local render."""
 
 import re
+from dataclasses import replace
 from statistics import median
 
 from rapidfuzz import fuzz
 
 from diagnostics.profile import block_text
-from layout.kinds import PUBMETA, RIGHTS
+from layout.equations import position_numbered_equations
+from layout.kinds import ADDRESS, AFFIL, CLASSIFICATION, KEYW, metadata_kind
 from layout.model import Block
 from ocr import engine
 from utils.textutil import ISO_TO_TESS, language_profile, norm_cmp
@@ -24,8 +26,86 @@ def box_of(lines):
             max(line.bbox[2] for line in lines), max(line.bbox[3] for line in lines))
 
 
+KEYWORD_BOUNDARY = re.compile(r"\s+(?=(?:Mathematics Subject Classification|Computing Classification System)\b)", re.I)
+
+
+def split_classifications(page):
+    for index, block in reversed(list(enumerate(page.blocks))):
+        if not block.spans and block.source == "ocr" and (KEYW.match(block.text) or CLASSIFICATION.match(block.text)):
+            parts = KEYWORD_BOUNDARY.split(block.text)
+            if len(parts) > 1:
+                page.blocks[index:index + 1] = [
+                    replace(block, text=text, original_text=text, kind="keywords", bbox=None,
+                            line_boxes=[], source_reference=dict(block.source_reference))
+                    for text in parts
+                ]
+
+
+def split_affiliations(page, lines, anchors):
+    """Break a multiline affiliation at a source-backed change from organization to address."""
+    if page.n != 1:
+        return
+    for index, (start, end) in sorted(anchors.items(), reverse=True):
+        block = page.blocks[index]
+        text_lines = block.text.splitlines()
+        matched = lines[start:end]
+        if (len(text_lines) != len(matched) or len(text_lines) < 2 or block.spans
+                or not AFFIL.search(text_lines[0]) or block.source != "ocr"
+                or any(fuzz.ratio(text_key(text), text_key(line.text)) < 85 for text, line in zip(text_lines, matched))):
+            continue
+        cuts = [i for i in range(1, len(text_lines)) if ADDRESS.search(text_lines[i])]
+        if not cuts:
+            continue
+        address = cuts[0]
+        for i in range(address + 1, len(text_lines)):
+            if "@" in text_lines[i] and abs(matched[i].bbox[0] - matched[address].bbox[0]) > page.width * .025:
+                cuts.append(i)
+        bounds = [0, *cuts, len(text_lines)]
+        page.blocks[index:index + 1] = [
+            replace(block, text=" ".join(text_lines[first:last]), original_text="\n".join(text_lines[first:last]),
+                    kind="affiliation", bbox=box_of(matched[first:last]), size=median(line.size for line in matched[first:last]),
+                    line_boxes=[line.bbox for line in matched[first:last]], source_reference=dict(block.source_reference))
+            for first, last in zip(bounds, bounds[1:])
+        ]
+
+
+def recover_masthead(page, lines, anchors):
+    """Use independently read lines when they form an identified masthead above anchored content."""
+    if page.n != 1:
+        return 0
+    leading = []
+    for line in lines:
+        if line.bbox[3] > page.height * .20 or line.conf < 78 or not metadata_kind(line.text):
+            break
+        leading.append(line)
+    if not 2 <= len(leading) <= 8:
+        return 0
+    keys = [text_key(line.text) for line in leading]
+    combined = "".join(keys)
+    before_title = []
+    for index, block in enumerate(page.blocks):
+        text = text_key(block_text(block))
+        if text and (text in keys or (metadata_kind(block.text) and fuzz.ratio(text, combined) >= 93)):
+            before_title.append(index)
+        else:
+            break
+    first = len(before_title)
+    anchor = anchors.get(first, -1)
+    if anchor < len(leading) or max(line.bbox[3] for line in leading) >= lines[anchor].bbox[1]:
+        return 0
+    page.blocks[:first] = [
+        Block(tag="header", kind=metadata_kind(line.text), text=line.text.strip(), bbox=line.bbox,
+              source="ocr", ocr_engine="tesseract", recognition_confidence=line.conf,
+              conf=line.conf, size=line.size, line_boxes=[line.bbox],
+              source_reference={"geometry_method": "tesseract-render", "recovery": "leading-publication-metadata"})
+        for line in leading
+    ]
+    return len(leading)
+
+
 def align_blocks(page, lines):
     """Attach only unique text matches and retain the primary recognizer's order and words."""
+    split_classifications(page)
     keys = [text_key(line.text) for line in lines]
     candidates = []
     paragraphs = {index: text_key(block_text(block)) for index, block in enumerate(page.blocks)
@@ -59,36 +139,20 @@ def align_blocks(page, lines):
         if used.intersection(range(start, end)):
             continue
         used.update(range(start, end))
-        anchors[index] = start
+        anchors[index] = (start, end)
         block = page.blocks[index]
         if block.bbox is None:
-            block.bbox = box_of(lines[start:end])
-            block.size = median(line.size for line in lines[start:end])
+            matched = lines[start:end]
+            block.bbox = box_of(matched)
+            block.line_boxes = [line.bbox for line in matched]
+            block.size = max(line.size for line in matched) if block.tag == "h1" else median(line.size for line in matched)
             block.source_reference.update(geometry_method="tesseract-text-alignment", geometry_score=round(score, 2))
 
-    recovered = 0
-    if anchors and 0 in anchors:
-        leading = lines[:anchors[0]]
-        # Treat the crop as a masthead only when its identifiers or rights copy
-        # corroborate the role and the complete region precedes the first body block.
-        if (2 <= len(leading) <= 8 and max(line.bbox[3] for line in leading) <= min(
-                page.height * .24, lines[anchors[0]].bbox[1] - 2)
-                and min(line.conf for line in leading) >= 78):
-            text = "\n".join(line.text.strip() for line in leading)
-            leading_keys = [text_key(line.text) for line in leading]
-            novel = sum(len(key) >= 12 and not any(key in target for target in paragraphs.values())
-                        for key in leading_keys)
-            if (sum(bool(PUBMETA.search(line.text) or RIGHTS.search(line.text)) for line in leading) >= 2
-                    and novel >= 2 and novel > len(leading) / 2):
-                confidence = min(line.conf for line in leading)
-                page.blocks.insert(0, Block(tag="header", kind="publication_metadata", text=text, bbox=box_of(leading),
-                                           source="ocr", ocr_engine="tesseract", recognition_confidence=confidence,
-                                           conf=confidence, size=median(line.size for line in leading),
-                                           source_reference={"geometry_method": "tesseract-render",
-                                                             "recovery": "leading-publication-metadata"}))
-                recovered = 1
-    return {"aligned": sum(page.blocks[index + recovered].source_reference.get("geometry_method") ==
-                           "tesseract-text-alignment" for index in anchors), "recovered_headers": recovered}
+    aligned = sum(page.blocks[index].source_reference.get("geometry_method") ==
+                  "tesseract-text-alignment" for index in anchors)
+    starts = {index: start for index, (start, _) in anchors.items()}
+    split_affiliations(page, lines, anchors)
+    return {"aligned": aligned, "recovered_headers": recover_masthead(page, lines, starts)}
 
 
 def position_page(source, page, settings, packs):
@@ -107,9 +171,13 @@ def position_page(source, page, settings, packs):
         return {"status": "Local coordinate alignment failed.", "reason": str(error)}
     result = align_blocks(page, lines)
     ids = detail.get("selected_execution_ids", [])
-    if result["recovered_headers"] and ids:
-        page.blocks[0].source_reference["execution_ids"] = ids
-    if result["aligned"]:
+    located = position_numbered_equations(page, lines, ids)
+    if located:
+        result["positioned_equations"] = located
+    if ids:
+        for block in page.blocks[:result["recovered_headers"]]:
+            block.source_reference["execution_ids"] = ids
+    if result["aligned"] or located:
         audit.mark(ids, downstream=[{"consumer": "pydantic_layout", "reference": f"pdf/page/{page.n}",
-                                     "matched_blocks": result["aligned"]}])
+                                     "matched_blocks": result["aligned"] + located}])
     return {"status": "checked", **result}

@@ -1,5 +1,9 @@
 """XML serializer (lxml). Configurable schema profiles; always escapes/filters illegal characters."""
 from __future__ import annotations
+import re
+from collections import Counter
+from dataclasses import replace
+from pathlib import Path
 from lxml import etree
 from layout.model import DocIR, PageIR, Block, Span
 from utils.textutil import xml_safe, lang_attr
@@ -17,30 +21,61 @@ PROFILES = {
 
 
 def _style_key(s: Span):
-    return (s.bold, s.italic, s.sup, s.sub, s.strike, s.link, s.formula)
+    return (s.bold, s.italic, s.sup, s.sub, s.strike, s.link, s.formula, s.small_caps, s.underline)
 
 
 def _runs(spans: list[Span]) -> list[Span]:
     out: list[Span] = []
     for s in spans:
         if out and _style_key(out[-1]) == _style_key(s):
-            out[-1] = Span(text=out[-1].text + s.text, size=s.size, bold=s.bold, italic=s.italic,
-                           sup=s.sup, sub=s.sub, strike=s.strike, link=s.link, formula=s.formula)
+            out[-1] = replace(s, text=out[-1].text + s.text)
         else:
             out.append(Span(**{**s.__dict__}))
     return out
 
 
-def _inline(el: etree._Element, text: str, spans: list[Span]):
+CAPS = re.compile(r"(?<!\w)(?:[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+|[A-Z][A-Z0-9]+|[A-Z]\.|"
+                  r"[A-Z]*\d[A-Z0-9]*[A-Z][A-Z0-9]*)(?!\w)(?:[ \t]+[A-Z][A-Z0-9]+(?!\w))*")
+SUPERSCRIPTS = re.compile(r"[\u00b9\u00b2\u00b3\u2070\u2074-\u2079]+")
+
+
+def _styled_segments(runs, sample):
+    for run in runs:
+        if not sample:
+            yield run, ""
+            continue
+        for segment in re.split(f"({SUPERSCRIPTS.pattern})", run.text):
+            if SUPERSCRIPTS.fullmatch(segment):
+                yield replace(run, text=segment, sup=True), ""
+                continue
+            if run.small_caps:
+                yield replace(run, text=segment), "small-caps"
+                continue
+            offset = 0
+            for match in CAPS.finditer(segment):
+                if match.start() > offset:
+                    yield replace(run, text=segment[offset:match.start()]), ""
+                yield replace(run, text=match[0]), "all-caps"
+                offset = match.end()
+            if offset < len(segment):
+                yield replace(run, text=segment[offset:]), ""
+
+
+def _inline(el: etree._Element, text: str, spans: list[Span], *, sample: bool = False):
     text = xml_safe(text)
     if not spans or "".join(s.text for s in spans) != text:
-        el.text = text; return
+        if not sample:
+            el.text = text
+            return
+        spans = [Span(text=text)]
+    if sample:
+        el.text = ""
     runs = _runs(spans)
     tot = sum(len(r.text.strip()) for r in runs) or 1
     base_bold = sum(len(r.text.strip()) for r in runs if r.bold) / tot > 0.85
     base_ital = sum(len(r.text.strip()) for r in runs if r.italic) / tot > 0.85
     last = None
-    for r in runs:
+    for r, caps in _styled_segments(runs, sample):
         t = xml_safe(r.text)
         if not t:
             continue
@@ -49,9 +84,11 @@ def _inline(el: etree._Element, text: str, spans: list[Span]):
         if r.link: wrappers.append(("a", {"href": xml_safe(r.link)}))
         if r.bold and not base_bold and t.strip(): wrappers.append(("strong", {}))
         if r.italic and not base_ital and t.strip(): wrappers.append(("em", {}))
+        if r.underline and t.strip(): wrappers.append(("u", {}))
         if r.sup: wrappers.append(("sup", {}))
         if r.sub: wrappers.append(("sub", {}))
         if r.strike: wrappers.append(("del", {}))
+        if caps: wrappers.append((caps, {}))
         if not wrappers:
             if last is None: el.text = (el.text or "") + t
             else: last.tail = (last.tail or "") + t
@@ -74,7 +111,19 @@ def _attrs(b: Block, cfg, doc_lang: str, settings) -> dict:
         a["kind"] = b.kind
     if settings.emit_bbox and b.bbox:
         a["data-bbox"] = ",".join(f"{v:.1f}" for v in b.bbox)
+    if b.kind == "equation":
+        a.update(formula_attributes(b))
     return a
+
+
+def formula_attributes(block):
+    evidence = block.source_reference.get("formula", {})
+    attributes = {"formula_status": evidence.get("status", "review_required")}
+    if evidence.get("encoding"):
+        attributes["formula_encoding"] = evidence["encoding"]
+    if block.marker:
+        attributes["equation_number"] = block.marker
+    return attributes
 
 
 def direction_attributes(language: dict) -> dict:
@@ -82,7 +131,7 @@ def direction_attributes(language: dict) -> dict:
     return {"dir": base} if base in {"rtl", "ltr"} else {}
 
 
-def _emit(parent, b: Block, cfg, doc_lang, settings, nodes):
+def _emit(parent, b: Block, cfg, doc_lang, settings, nodes, image_source=None):
     t = b.tag
     if t in ("ul", "ol"):
         el = etree.SubElement(parent, t, **_attrs(b, cfg, doc_lang, settings))
@@ -118,7 +167,9 @@ def _emit(parent, b: Block, cfg, doc_lang, settings, nodes):
                     nodes[id(c)] = cell
     elif t == "figure":
         el = etree.SubElement(parent, "figure", **_attrs(b, cfg, doc_lang, settings))
-        etree.SubElement(el, "img", alt=xml_safe(b.alt or "Figure"))
+        image = etree.SubElement(el, "img", alt=xml_safe(b.alt or "Figure"))
+        if image_source:
+            image.set("src", image_source)
         if b.caption:
             fc = etree.SubElement(el, "figcaption")
             if settings.emit_kind: fc.set("kind", "figure_caption")
@@ -141,6 +192,7 @@ def to_xml(doc: DocIR, settings, locations: dict | None = None, assets: dict | N
     cfg = PROFILES.get(settings.schema_profile, PROFILES["brief"])
     root = etree.Element("document", lang=lang_attr(doc.lang, settings.lang_format), **direction_attributes(doc.language))
     nodes = {} if locations is not None else None
+    name = doc.meta.get("asset_stem") or Path(doc.path).stem or doc.doc_id
     for p in doc.pages:
         at = {cfg["page_attr"]: str(p.n), **direction_attributes(p.language)}
         if p.language.get("language") not in {None, "und", doc.lang}:
@@ -148,8 +200,23 @@ def to_xml(doc: DocIR, settings, locations: dict | None = None, assets: dict | N
         if cfg["page_dims"]:
             at.update(height=f"{p.height:.2f}", width=f"{p.width:.2f}")
         pe = etree.SubElement(root, "page", **at)
+        image_number = 0
+        identifiers = Counter()
         for b in p.blocks:
-            _emit(pe, b, cfg, doc.lang, settings, nodes)
+            image_source = None
+            if b.tag == "figure" and b.bbox:
+                image_number += 1
+                image_source = f"output_images/{name}/{name}_P{p.n}_IMG{image_number}.png"
+                if assets is not None:
+                    assets[image_source] = (p.n, b.bbox)
+            before = len(pe)
+            _emit(pe, b, cfg, doc.lang, settings, nodes, image_source)
+            if len(pe) > before:
+                element = pe[-1]
+                identifiers[element.tag] += 1
+                element.set("id", f"P{p.n}_{element.tag}_{identifiers[element.tag]}")
+                if image_source:
+                    element.find("img").set("id", f"P{p.n}_IMG{image_number}")
     if locations is not None:
         tree = root.getroottree()
         locations.update((key, tree.getpath(node)) for key, node in nodes.items())

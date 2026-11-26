@@ -18,8 +18,6 @@ from config.settings import Settings
 from ocr.recognition import ENGINE_MODES
 from layout.model import Block, DocIR, ir_from_dict
 from utils.logs import AuditLog
-from xml_engine.serializer import to_xml
-from xml_engine.validate import validate_xml
 
 
 def now() -> str:
@@ -320,11 +318,3 @@ class Workspace:
             if name is not None:
                 db.execute("UPDATE local_profile SET name=? WHERE id=1", (name,))
             return db.execute("SELECT name FROM local_profile WHERE id=1").fetchone()[0]
-
-    def xml(self, document_id: str) -> tuple[bytes, dict] | None:
-        extracted = self.extracted(document_id)
-        if extracted is None:
-            return None
-        ir, settings, _ = extracted
-        data = to_xml(ir, settings)
-        return data, validate_xml(data, len(ir.pages), settings)

@@ -259,7 +259,7 @@ async function selectWorkspace(id, reset = true) {
     $("#reproc").disabled = active;
     $("#reproc").textContent = job.status === "failed" ? "Retry" : "Reprocess";
     $("#dlxml").disabled = !data.approved;
-    $("#dlxml").title = data.approved ? "Export XML" : "Approve metadata review before exporting";
+    $("#dlxml").title = data.approved ? "Downloads a ZIP when the XML has images" : "Approve metadata review before exporting";
     workspaceViewer();
     await reviewPanel();
     if (active && !W.batch && W.selection === selection) {
@@ -495,7 +495,7 @@ function exportCard(report, links) {
 
 function presentationLinks(base, id) {
     const url = base + "/" + encodeURIComponent(id);
-    return {xml: url + "/xml", pptx: url, zip: url + "/zip"};
+    return {xml: url + "/xml?format=auto", pptx: url, zip: url + "/zip"};
 }
 
 function changesPanel(data) {

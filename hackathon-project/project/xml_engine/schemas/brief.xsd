@@ -1,0 +1,36 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:include schemaLocation="common.xsd"/>
+  <xs:complexType name="WrappedPage">
+    <xs:choice minOccurs="0" maxOccurs="unbounded">
+      <xs:element name="h1" type="Text"/>
+      <xs:element name="h2" type="Text"/>
+      <xs:element name="h3" type="Text"/>
+      <xs:element name="h4" type="Text"/>
+      <xs:element name="h5" type="Text"/>
+      <xs:element name="h6" type="Text"/>
+      <xs:element name="p" type="Text"/>
+      <xs:element name="ul" type="List"/>
+      <xs:element name="ol" type="List"/>
+      <xs:element name="table" type="Table"/>
+      <xs:element name="figure" type="Figure"/>
+      <xs:element name="blockquote" type="Text"/>
+      <xs:element name="pre" type="Text"/>
+      <xs:element name="hr" type="EmptyBlock"/>
+      <xs:element name="header" type="Text"/>
+      <xs:element name="footer" type="Text"/>
+      <xs:element name="aside" type="Text"/>
+    </xs:choice>
+    <xs:attribute name="n" type="xs:positiveInteger" use="required"/>
+    <xs:attribute name="lang" type="xs:string"/>
+    <xs:attribute name="dir" type="Direction"/>
+  </xs:complexType>
+  <xs:complexType name="Document">
+    <xs:sequence>
+      <xs:element name="page" type="WrappedPage" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="lang" type="xs:string" use="required"/>
+    <xs:attribute name="dir" type="Direction"/>
+  </xs:complexType>
+  <xs:element name="document" type="Document"/>
+</xs:schema>

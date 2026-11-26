@@ -10,7 +10,7 @@ from diagnostics.page_diagnostics import analyze_page
 from diagnostics.profile import decorate_document, quality_gate
 from ingestion.discover import describe
 from layout.model import PageIR, DocIR, Line, Block, Span, ir_from_dict
-from layout import native, reconstruct, kinds, figures, ocr_geometry
+from layout import native, reconstruct, kinds, figures, ocr_geometry, equations
 from layout.docling_adapter import DoclingLayout
 from ocr import engine as ocr
 from ocr.router import OCRRouter
@@ -25,6 +25,8 @@ from reporting import execution as execution_reports
 from utils import execution_audit as model_audit
 from xml_engine.serializer import to_xml
 from xml_engine.validate import validate_xml, verify_unicode
+from xml_engine.completeness import compare_content, numeric_values
+from xml_engine.assets import inspect_assets
 
 def ocr_cache_identity(settings, installed):
     if not settings.use_cache or not installed or not settings.tessdata_dir:
@@ -292,6 +294,8 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                                                     kind="body", source=rp["source"])] if rp["lines"] else [])
                 rp["diag"].setdefault("review_reasons", []).append("Layout reconstruction failed.")
             pg.diag = {**rp["diag"], **pg.diag}
+            if pg.source == "native" and pg.diag.get("health") == "healthy":
+                pg.diag["native_numeric_inventory"] = dict(numeric_values(doc[pg.n - 1].get_text()))
             ocr_info = pg.diag.get("ocr", {})
             pg.ocr_engine = (ocr_info.get("engine") or "") if pg.source == "ocr" else ""
             pg.requires_review = bool(ocr_info.get("requires_review") or pg.diag.get("error")
@@ -302,6 +306,7 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             if geometry := ocr_geometry.position_page(doc[pg.n - 1], pg, settings, geometry_packs):
                 pg.diag["layout"]["coordinate_alignment"] = geometry
                 audit.event("layout", "ocr_coordinate_alignment", page=pg.n, **geometry)
+            equations.recognise_formulas(doc[pg.n - 1], pg, settings)
             pg.layout_engine = pg.diag["layout"]["engine"]
             if regions and settings.audit_private_responses:
                 report = work_dir / "recognition" / doc_id / f"page-{pg.n:04d}-docling.json"
@@ -360,6 +365,7 @@ def _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, p
                 page.diag.setdefault("layout", {})["coordinate_alignment"] = geometry
                 result["page_log"][page.n - 1]["layout"] = page.diag["layout"]
                 audit.event("layout", "ocr_coordinate_alignment", page=page.n, **geometry)
+            equations.recognise_formulas(source[page.n - 1], page, settings)
             progress(page.n, len(saved_ir.pages))
     processing({"stage": "validation"})
     return finish_extraction(pdf, saved_ir, settings, out_dir, work_dir, audit, result, start)
@@ -385,13 +391,14 @@ def finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0):
     # ---- XML Generation + QA agents -----------------------------------------------------------------------
     assets = {}
     locations = {}
-    data = to_xml(dir_, settings, locations=locations, assets=assets if settings.schema_profile == "sample" else None)
+    data = to_xml(dir_, settings, locations=locations, assets=assets)
     val = validate_xml(data, len(pages), settings)
     if not val["well_formed"] or val["issues"]:
         audit.event("xml", "invalid", doc=doc_id, issues=val["issues"])
         res.update(ok=False, validation=val, error="Generated XML failed validation.")
         gate.update(status="processing_failed", xml={"status": "invalid", "issues": val["issues"]})
         write_report(profile_dir / "multilingual_validation_report.json", gate)
+        write_report(profile_dir / "xml_validation_report.json", val)
         save_execution_reports(work_dir, doc_id, res, dir_)
         return res
     gate["xml"] = verify_unicode(data, dir_, locations)
@@ -405,6 +412,12 @@ def finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0):
                 asset_path.parent.mkdir(parents=True, exist_ok=True)
                 source_pdf[page - 1].get_pixmap(dpi=180, clip=pymupdf.Rect(box), alpha=False).save(asset_path)
     _write_xml(out_dir, pdf, data)
+    complete = compare_content(data, dir_, locations, sample=settings.schema_profile == "sample")
+    write_report(profile_dir / "xml_validation_report.json", {**val, "unicode": gate["xml"]})
+    write_report(profile_dir / "content_completeness_report.json",
+                 {key: value for key, value in complete.items() if key != "formatting"})
+    write_report(profile_dir / "formatting_report.json", complete["formatting"])
+    write_report(profile_dir / "image_asset_report.json", inspect_assets(data, out_dir))
     save_execution_reports(work_dir, doc_id, res, dir_, data, locations)
     ir_dir = work_dir / "ir"; ir_dir.mkdir(parents=True, exist_ok=True)
     (ir_dir / f"{doc_id}.json").write_text(json.dumps(dir_.to_dict(), ensure_ascii=False), encoding="utf-8")

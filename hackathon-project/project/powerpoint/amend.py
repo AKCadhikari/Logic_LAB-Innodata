@@ -403,9 +403,10 @@ def change_record(ir: DocIR, slide: int, shape, paragraph: int, old: str, new: s
             "source": unit.reference() if unit else None}
 
 
-def amend_deck(pdf: Path, pptx: Path, target: Path, work: Path, settings: Settings, audit: AuditLog) -> dict:
+def amend_deck(pdf: Path, pptx: Path, target: Path, work: Path, settings: Settings, audit: AuditLog, *,
+               ir: DocIR | None = None) -> dict:
     started = time.monotonic()
-    ir = load_ir(pdf, work, settings, audit)
+    ir = ir if ir is not None else load_ir(pdf, work, settings, audit)
     report = repair_presentation(ir, pptx, target, settings)
     changes_dir = work / "changes"
     changes_dir.mkdir(parents=True, exist_ok=True)

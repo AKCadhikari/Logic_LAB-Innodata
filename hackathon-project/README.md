@@ -160,6 +160,22 @@ The [official sample validation](../docs/OFFICIAL_SAMPLE_VALIDATION.md) records 
 the remaining differences, and the command for reproducing the reports. The [repository audit](../docs/REPOSITORY_AUDIT.md)
 and [implementation roadmap](../docs/IMPLEMENTATION_ROADMAP.md) record the earlier Windows verification.
 For a saved bundle, use `project/sample_check.py --export-dir <folder>` with the reference inputs described there.
+In an individual workspace document, **XML preview** and **Export XML** use the organizer's sample hierarchy.
+Approve the metadata review, then choose **Export XML**. If the XML links to figures or equation crops, the download
+is a ZIP with the XML and its `output_images/<document>/` folder. Extract the ZIP and keep the folder beside the XML.
+For command-line extraction in the same format, use
+`--profile sample --skip-pptx`. Integrations that need the written-brief format can request
+`?profile=brief` on the individual document XML endpoint.
+For OCR-derived equations, Automatic and GLM-OCR run formula recognition on independently rendered crops.
+The XML keeps the source image. When the readings agree, the formula image also carries a
+`formula_encoding="latex"` attribute and searchable LaTeX in `alt`. The validation report counts formulas
+with text and flags unresolved readings for review.
+
+All XML profiles are checked against local XSDs in \`project/xml_engine/schemas/\`. The sample XSD is derived
+from the organizer's reference XML. The supplied archive has no organizer XSD. The export package includes
+\`manifest.json\` and reports for schema validation, source-linked completeness, formatting, and image assets.
+The completeness report compares XML with the intermediate representation and records source uncertainty by page.
+The formatting report distinguishes measured PDF font and geometry data from heuristics.
 All documents use the same page-level profiling, OCR, layout, and presentation-matching pipeline. The earlier
 source-region map remains available to the offline sample comparison command as historical ground truth.
 

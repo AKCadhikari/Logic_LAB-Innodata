@@ -19,11 +19,14 @@ def test_ocr_geometry_restores_masthead_even_with_issn_repeated_in_footer():
         line("ISSN 4242-7516", 200),
     ]
     result = align_blocks(page, lines)
-    assert result == {"aligned": 2, "recovered_headers": 1}
-    header, heading, paragraph = page.blocks
-    assert header.tag == "header" and header.text == "\n".join(masthead)
-    assert header.ocr_engine == "tesseract" and header.bbox == (45, 30, 360, 76)
+    assert result == {"aligned": 2, "recovered_headers": 4}
+    *headers, heading, paragraph = page.blocks
+    assert [header.text for header in headers] == masthead
+    assert [header.kind for header in headers] == ["publication_metadata"] * 3 + ["rights"]
+    assert all(header.tag == "header" and header.ocr_engine == "tesseract" for header in headers)
+    assert headers[0].bbox == (45, 30, 360, 40)
     assert heading.text == title and heading.bbox == (45, 105, 360, 130)
+    assert heading.line_boxes == [(45, 105, 360, 115), (45, 120, 360, 130)]
     assert paragraph.text == body
 
 

@@ -25,6 +25,7 @@ class Settings:
     glm_ocr_retries: int = 0
     glm_ocr_max_edge: int = 1800
     glm_ocr_tokens: int = 4096
+    formula_glm_on_other_engines: bool = False
     paddle_vl_url: str = "http://localhost:11434"
     paddle_vl_model: str = "MedAIBase/PaddleOCR-VL:0.9b"
     paddle_vl_timeout_s: int = 300

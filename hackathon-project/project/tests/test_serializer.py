@@ -37,3 +37,17 @@ def test_profile_and_lang_format(settings):
     settings.schema_profile = "example"; settings.lang_format = "name"
     r = _xml([Block(tag="p", text="x")], settings)
     assert r.get("lang") == "english" and r.find("page").get("num") == "1" and r.find("page").get("width")
+def test_sample_profile_preserves_mixed_case_markup_and_line_boxes(settings):
+    from xml_engine.validate import validate_xml
+
+    settings.schema_profile = "sample"
+    block = Block("p", "ALEX PATEL¹ and Ada Lee", bbox=(50, 80, 160, 105), kind="byline",
+                  size=9, line_boxes=[(50, 80, 160, 89), (60, 95, 90, 105)],
+                  spans=[Span("ALEX PATEL"), Span("¹"), Span(" and "), Span("Ada Lee", small_caps=True)])
+    doc = DocIR("paper", "paper.pdf", "en", [PageIR(1, 500, 700, [block])])
+    data = to_xml(doc, settings)
+    node = etree.fromstring(data).find("header/p")
+    assert node.get("sub_bboxes") == "50.00,80.00,160.00,89.00|60.00,95.00,90.00,105.00"
+    assert [child.tag for child in node] == ["all-caps", "sup", "small-caps"]
+    assert "".join(node.itertext()) == block.text
+    assert not validate_xml(data, 1, settings)["issues"]

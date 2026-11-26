@@ -3,6 +3,7 @@ from __future__ import annotations
 import math, re, statistics
 from dataclasses import dataclass, field
 from layout.model import Line, Block, PageIR, Span, Cell
+from layout.kinds import ABSTRACT, CLASSIFICATION, KEYW, metadata_kind
 from utils.textutil import norm_cmp, norm_ws, is_rtl, xml_safe
 
 CAPTION_RE = re.compile(r"^\s*(figure|fig\.?|table|tab\.?|chart|diagram|plate|abbildung|abb\.?|tabelle|obr\.?|obrázok|obrázek|tabulka|tabuľka|figura|tabella|tableau|figuur|tabel|afbeelding|schéma|图|図|表|그림|표|الشكل|شكل|جدول|الجدول)\s*[\dIVXivx]+", re.I)
@@ -163,7 +164,7 @@ def _is_marker(text: str):
     return None, 0
 
 
-def _group_paragraphs(lines: list[Line], settings) -> list[list[Line]]:
+def _group_paragraphs(lines: list[Line], first_page: bool, page_height: float) -> list[list[Line]]:
     paras: list[list[Line]] = []
     left = min((l.bbox[0] for l in lines), default=0)
     right = max((l.bbox[2] for l in lines), default=0)
@@ -176,7 +177,11 @@ def _group_paragraphs(lines: list[Line], settings) -> list[list[Line]]:
         new = False
         ocr_src = ln.source == "ocr" or prev.source == "ocr"
         size_tol = 0.30 if ocr_src else 0.14           # OCR line heights are noisy (ascender/descender dependent)
-        if ln.grp != -1 and prev.grp != -1 and ln.grp != prev.grp and gap > 0.40 * ph:
+        running_metadata = (first_page and ln.bbox[1] < 0.20 * page_height
+                            and (metadata_kind(ln.text) or metadata_kind(prev.text)))
+        if running_metadata or KEYW.match(ln.text) or CLASSIFICATION.match(ln.text) or ABSTRACT.fullmatch(ln.text.strip()):
+            new = True
+        elif ln.grp != -1 and prev.grp != -1 and ln.grp != prev.grp and gap > 0.40 * ph:
             new = True
         elif gap > (0.62 if ocr_src else 0.55) * ph:
             new = True
@@ -296,7 +301,7 @@ def build_page(n: int, w: float, h: float, lines: list[Line], tables: list[Block
         def flush():
             nonlocal run
             if run:
-                blocks.extend(_lines_to_blocks(_merge_same_row(run), ctx, settings, body, hsizes, w, h, source))
+                blocks.extend(_lines_to_blocks(_merge_same_row(run), ctx, settings, body, hsizes, w, h, source, n == 1))
                 run = []
         for kind, it in seq:
             if kind == "L":
@@ -310,10 +315,10 @@ def build_page(n: int, w: float, h: float, lines: list[Line], tables: list[Block
     return page
 
 
-def _lines_to_blocks(lines: list[Line], ctx, settings, body: float, hsizes: list[float], w: float, h: float, source: str) -> list[Block]:
+def _lines_to_blocks(lines: list[Line], ctx, settings, body: float, hsizes: list[float], w: float, h: float, source: str, first_page: bool) -> list[Block]:
     out: list[Block] = []
     body_default, hsizes_default = body, hsizes
-    for para in _group_paragraphs(lines, settings):
+    for para in _group_paragraphs(lines, first_page, h):
         text, spans = join_lines(para)
         if not text.strip():
             continue
@@ -327,14 +332,14 @@ def _lines_to_blocks(lines: list[Line], ctx, settings, body: float, hsizes: list
         conf = min(l.conf for l in para)
         bold = all(l.bold for l in para)
         nwords = len(text.split())
-        if sum(c.isalnum() for c in text) < 2 and len(text.strip()) >= 3:
+        if re.fullmatch(r"[\s._*=─—-]{3,}", text) and len(text.strip()) >= 3:
             out.append(Block(tag="hr", bbox=bbox, kind="decoration", source=source)); continue
         mk, mlen = _is_marker(text)
         alpha = [c for c in text if c.isalpha()]
         caps = bool(alpha) and sum(c.isupper() for c in alpha) / len(alpha) > 0.85 and len(alpha) >= 3
         blk = Block(tag="p", text=text, bbox=bbox, spans=spans, conf=conf, source=source, size=size,
                     original_text="\n".join(line.original_text or line.text for line in para),
-                    writing_mode=first.writing_mode)
+                    writing_mode=first.writing_mode, line_boxes=[line.bbox for line in para])
         sym = sum(1 for c in text if not (c.isalpha() or c.isspace()))
         numbered_formula = EQ_TAIL.search(text) or re.search(r"\(\d+\.\d+\)", text)
         if not numbered_formula and x0 > 0.26 * w and "=" in text:

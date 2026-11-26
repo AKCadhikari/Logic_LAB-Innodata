@@ -16,7 +16,6 @@ NUMBERED_ITEM = re.compile(r"^\d+\.\s+")
 LABELED_SCALAR = re.compile(r"^(?:[+•\-]\s*)?[^:]{4,65}:\s*[+-]?\d+(?:[.,]\d+)*\s*[%\w°]*$")
 REFERENCE = re.compile(r"^\s*(?:\[(\d+)\]|(\d+)\.)\s*")
 YEAR = re.compile(r"\b(?:18|19|20)\d{2}[a-z]?\b", re.I)
-CAPS = re.compile(r"\b[A-Z][A-Z0-9-]{1,}\b(?:[ \t]+[A-Z][A-Z0-9-]{1,}\b)*")
 
 
 def sample_blocks(blocks: list[Block]):
@@ -41,10 +40,13 @@ def sample_blocks(blocks: list[Block]):
 
 
 def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None) -> bytes:
-    from xml_engine.serializer import _emit, _inline, direction_attributes
+    from xml_engine.serializer import _emit, _inline, direction_attributes, formula_attributes
 
     root = etree.Element("document", lang=lang_attr(doc.lang, "name"), reading_order_layout_source="corrected",
                          **direction_attributes(doc.language))
+    columns = [str(page.n) for page in doc.pages if has_columns(page)]
+    if columns:
+        root.set("reading_order_multicolumn_pages", ",".join(columns))
     header = etree.SubElement(root, "header")
     title = next((block.text for page in doc.pages for block in page.blocks if block.kind == "title"),
                  doc.meta.get("pdf_metadata", {}).get("title", ""))
@@ -57,13 +59,14 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
     front = True
     top_number = 0
     last_reference = None
+    last_paragraph = None
     name = doc.meta.get("asset_stem") or Path(doc.path).stem or doc.doc_id
 
     def section(depth, kind, level):
         while sections and sections[-1][0] >= depth:
             sections.pop()
         parent = sections[-1][1] if sections else body
-        element = etree.SubElement(parent, "section", level=str(level), kind=kind)
+        element = etree.SubElement(parent, "section", level=str(level), kind=kind, id=identifier("S"))
         sections.append((depth, element))
         return element
 
@@ -94,21 +97,17 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                 attributes["align"] = "right" if block.language.get("base_direction") == "rtl" else "left"
         if block.size > 0:
             attributes["font_size"] = f"{block.size:.1f}"
+        measured = [span for span in block.spans if span.font and span.text.strip()]
+        if measured and all(span.serif for span in measured):
+            attributes["serif"] = "true"
+        if len(block.line_boxes) > 1:
+            attributes["sub_bboxes"] = "|".join(
+                ",".join(f"{value:.2f}" for value in box) for box in block.line_boxes
+            )
         return attributes
 
     def text_node(element, text, spans):
-        _inline(element, text, spans)
-        if len(element) or not element.text:
-            return
-        value = element.text
-        matches = list(CAPS.finditer(value))
-        if not matches:
-            return
-        element.text = value[:matches[0].start()]
-        for index, match in enumerate(matches):
-            cap = etree.SubElement(element, "all-caps")
-            cap.text = match[0]
-            cap.tail = value[match.end():matches[index + 1].start() if index + 1 < len(matches) else len(value)]
+        _inline(element, text, spans, sample=True)
 
     for page in doc.pages:
         if page.n > 1:
@@ -121,6 +120,8 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
         for block in sample_blocks(page.blocks):
             text, kind, tag = block.text, block.kind, block.tag
             heading = tag in {"h2", "h3", "h4", "h5", "h6"}
+            if kind != "reference_entry" or heading:
+                last_reference = None
             numbered = NUMERIC_HEADING.match(text) if heading else None
             abstract = kind == "abstract" and len(text.split()) <= 4 and ABSTRACT.fullmatch(text.strip())
             numbered_item = bool(numbered and NUMBERED_ITEM.match(text)
@@ -143,7 +144,8 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                         if "." not in number and major == top_number + 1:
                             top_number = major
                 section(depth, category, level)
-            elif front and (page.n > 1 or kind in ("abstract", "keywords")):
+            elif front and (page.n > 1 or (tag not in {"header", "footer", "h1"}
+                    and kind not in {"title", "publication_metadata", "rights", "byline", "affiliation"})):
                 front = False
             target = parent()
             if tag in ("header", "footer"):
@@ -151,7 +153,7 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
             if tag == "figure" or (kind == "equation" and block.bbox):
                 formula = kind == "equation"
                 figure_kind = "equation" if formula else "figure_caption"
-                figure = etree.SubElement(target, "figure_wrap", kind=figure_kind)
+                figure = etree.SubElement(target, "figure_wrap", kind=figure_kind, id=identifier("F"))
                 image_id = identifier(f"P{page.n}_{'FORMULA' if formula else 'IMG'}")
                 source = f"output_images/{name}/{name}_{image_id}.png"
                 attributes = {"id": image_id, "page": str(page.n), "kind": figure_kind, **geometry(block.bbox)}
@@ -159,10 +161,11 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                     attributes["src"] = source
                 if formula:
                     attributes["type"] = "formula"
-                if block.text or block.alt:
-                    label = f"({block.marker}) " if formula and block.marker else ""
-                    description = "Equation from source PDF" if block.source == "pdf_crop" else block.text or block.alt
-                    attributes["alt"] = xml_safe(label + description)
+                    attributes.update(formula_attributes(block))
+                    description = block.text if attributes.get("formula_encoding") else "Equation from source PDF"
+                    attributes["alt"] = xml_safe(description)
+                elif block.text or block.alt:
+                    attributes["alt"] = xml_safe(block.text or block.alt)
                 etree.SubElement(figure, "img", **attributes)
                 if assets is not None and block.bbox:
                     assets[source] = (page.n, tuple(float(value) for value in geometry(block.bbox).values()))
@@ -172,17 +175,23 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                     nodes[(id(block), "caption")] = caption
                 nodes[id(block)] = figure
             elif kind == "reference_entry" and not heading:
-                text = text or " ".join(child.text for child in block.children)
+                spans = block.spans
+                if not text and block.children:
+                    text = " ".join(f"{child.marker} {child.text}" if child.marker else child.text
+                                    for child in block.children)
                 previous = last_reference
                 continued = (previous and previous[0] == page.n and block.bbox and previous[1].bbox
                              and (block.bbox[0] - previous[1].bbox[0] > max(8, block.size)
                                   or not YEAR.search(text) and block.bbox[1] - previous[3] < max(5, block.size)))
                 if continued:
                     element = previous[2]
-                    value = "".join(element.itertext()).rstrip()
-                    for child in list(element):
-                        element.remove(child)
-                    text_node(element, value + " " + text, [])
+                    fragment = etree.Element("fragment")
+                    text_node(fragment, text, spans)
+                    if len(element):
+                        element[-1].tail = (element[-1].tail or "") + " " + (fragment.text or "")
+                    else:
+                        element.text = (element.text or "") + " " + (fragment.text or "")
+                    element.extend(list(fragment))
                     box = (min(float(element.get("x0")), block.bbox[0]), float(element.get("y0")),
                            max(float(element.get("x1")), block.bbox[2]), max(float(element.get("y1")), block.bbox[3]))
                     element.attrib.update(geometry(box))
@@ -194,9 +203,11 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                     number = REFERENCE.match(text)
                     attrs["num"] = (number[1] or number[2]) if number else str(counters["R"])
                     element = etree.SubElement(target, "reference", **attrs)
-                    text_node(element, text, block.spans)
+                    text_node(element, text, spans)
                     last_reference = (page.n, block, element, block.bbox[3] if block.bbox else 0)
                 nodes[id(block)] = element
+                for child in block.children:
+                    nodes[id(child)] = element
             elif numbered_item:
                 listing = etree.SubElement(target, "ol", id=identifier("OL"), kind=kind or "body")
                 item = etree.SubElement(listing, "li", **text_attributes(block, page, "LI", kind))
@@ -215,13 +226,19 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                 nodes[id(block)] = listing
             elif tag == "table":
                 _emit(target, block, {}, doc.lang, settings, nodes)
-                nodes[id(block)].set("page", str(page.n))
+                nodes[id(block)].attrib.update({"page": str(page.n), "id": identifier("T")})
             else:
                 prefixes = {"p": "P", "page_header": "PH", "page_footer": "PF", "reference": "R"}
                 attrs = text_attributes(block, page, prefixes.get(tag, "H" if tag[0] == "h" else tag.upper()), kind)
+                if kind == "equation":
+                    attrs.update(formula_attributes(block))
                 if tag in {"h2", "h3", "h4", "h5", "h6"}:
                     attrs["level"] = tag[1]
                 element = etree.SubElement(target, tag, **attrs)
+                if tag == "p" and kind == "body" and block.bbox and text.strip() and target is not header:
+                    if continues_paragraph(last_paragraph, page, block, target):
+                        element.set("continues_from", last_paragraph[1].get("id"))
+                    last_paragraph = (page, element, block, target)
                 if kind == "pseudocode":
                     element.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
                     element.text = xml_safe(text)
@@ -232,3 +249,21 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
         tree = root.getroottree()
         locations.update((key, tree.getpath(node)) for key, node in nodes.items())
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", pretty_print=True)
+
+
+def has_columns(page):
+    middle = page.width / 2
+    boxes = [block.bbox for block in page.blocks if block.kind in {"body", "reference_entry"} and block.bbox]
+    left = [box for box in boxes if middle - box[2] >= page.width * .01]
+    right = [box for box in boxes if box[0] - middle >= page.width * .01]
+    return any(min(a[3], b[3]) - max(a[1], b[1]) >= 0.04 * page.height for a in left for b in right)
+
+
+def continues_paragraph(previous, page, block, section):
+    if previous is None:
+        return False
+    earlier, _, paragraph, parent = previous
+    return (earlier.n + 1 == page.n and section is parent
+            and paragraph.bbox[3] >= earlier.height * .76 and block.bbox[1] <= page.height * .22
+            and bool(re.search(r"[\w,;–—-]$", paragraph.text.rstrip()))
+            and block.text.lstrip()[:1].islower())

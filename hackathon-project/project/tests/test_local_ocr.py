@@ -10,7 +10,7 @@ from pydantic import ValidationError
 import agents.orchestrator as orchestrator
 from agents.orchestrator import process_pdf
 from layout.docling_adapter import apply_regions
-from layout.model import Block, DocIR, PageIR, ir_from_dict
+from layout.model import Block, DocIR, Line, PageIR, ir_from_dict
 from ocr import glm, paddle
 from ocr.recognition import Recognition, RecognitionError
 from ocr.router import OCRRouter
@@ -41,10 +41,12 @@ def test_native_pages_bypass_both_engines(tmp_path, settings, audit, monkeypatch
 
 
 @pytest.mark.parametrize(("ocr_value", "review_required"), [("170", True), ("120", False)])
+@pytest.mark.parametrize("backend", ["glm-ocr", "tesseract"])
 def test_native_vs_ocr_numeric_comparison_preserves_text_and_review_status(
-    tmp_path, settings, audit, monkeypatch, ocr_value, review_required
+    tmp_path, settings, audit, monkeypatch, ocr_value, review_required, backend
 ):
     settings.docling_enabled = False
+    settings.ocr_backend = backend
     native_text = (
         "This carefully reviewed laboratory report records 120 samples. Each sample was checked twice, "
         "and all measurements were independently reviewed before approval by the laboratory team."
@@ -72,7 +74,17 @@ def test_native_vs_ocr_numeric_comparison_preserves_text_and_review_status(
         }
 
     monkeypatch.setattr(orchestrator, "analyze_page", diagnostics)
-    monkeypatch.setattr(OCRRouter, "recognise", recognize)
+    if backend == "tesseract":
+        settings.use_cache = False
+        monkeypatch.setattr(orchestrator.ocr, "available_langs", lambda _settings: {"eng"})
+        monkeypatch.setattr(
+            orchestrator, "_ocr_cached",
+            lambda page, *args, **kwargs: (
+                [Line(ocr_text, (60, 70, 535, 260), conf=95, source="ocr")], {"langs": ["eng"]}, False
+            ),
+        )
+    else:
+        monkeypatch.setattr(OCRRouter, "recognise", recognize)
     report = process_pdf(source, settings, tmp_path / "out", tmp_path / "run", audit)
 
     page_result = report["page_log"][0]

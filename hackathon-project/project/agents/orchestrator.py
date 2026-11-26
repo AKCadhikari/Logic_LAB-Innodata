@@ -218,8 +218,12 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                         use_ocr = False; d["reasons"].append("OCR found no text; kept native layer")
                 else:   # compare
                     nlines = native.extract_lines(page)
-                    sim = fuzz.token_set_ratio(norm_cmp(_text_of(nlines)), norm_cmp(otext)) / 100.0 if olines else 1.0
+                    native_text = _text_of(nlines)
+                    sim = fuzz.token_set_ratio(norm_cmp(native_text), norm_cmp(otext)) / 100.0 if olines else 1.0
                     d["compare_similarity"] = round(sim, 3)
+                    if sim >= settings.native_vs_ocr_min_similarity and numeric_values(native_text) != numeric_values(otext):
+                        d["reasons"].append("OCR and native text disagree on numeric values. Review the source before relying on either.")
+                        d["ocr"]["requires_review"] = True
                     use_ocr = (not d.get("native_decoding_risk") and bool(olines)
                                and oconf >= 45 and sim < settings.native_vs_ocr_min_similarity)
                     rec["lines"] = nlines

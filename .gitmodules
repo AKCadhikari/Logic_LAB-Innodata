@@ -1,0 +1,3 @@
+[submodule "hackathon-project/third_party/DocLayout-YOLO-release-v2"]
+	path = hackathon-project/third_party/DocLayout-YOLO-release-v2
+	url = https://github.com/opendatalab/DocLayout-YOLO.git

@@ -8,7 +8,6 @@ Logs, per-document IR, aggregate reports and caches go to --work-dir (default: <
 from __future__ import annotations
 import argparse, json, multiprocessing, sys, time
 from collections import Counter
-from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -25,13 +24,14 @@ from comparison.pairing import match_presentations
 
 def build_parser():
     ap = argparse.ArgumentParser(description="DocuSync AI: PDF -> XML and presentation proof-reading")
-    ap.add_argument("--input", default=str(HERE.parent / "phase-1" / "input"), help="folder with PDFs (+ PPTX)")
-    ap.add_argument("--output", default=str(HERE.parent / "phase-1" / "output"), help="folder for XML + corrected PPTX")
+    ap.add_argument("--phase", choices=["1", "2"], default="1", help="submission phase (default: 1)")
+    ap.add_argument("--input", default=None, help="folder with PDFs (+ PPTX); defaults to the selected phase")
+    ap.add_argument("--output", default=None, help="folder for XML + corrected PPTX; defaults to the selected phase")
     ap.add_argument("--work-dir", default=None, help="logs, IR, reports, cache (default: <output>/../docsync_run)")
     ap.add_argument("--config", default=None, help="JSON file overriding config.settings.Settings")
     ap.add_argument("--workers", type=int, default=None, help="parallel documents (0 = auto)")
     ap.add_argument("--profile", choices=["brief", "example", "sample"], default=None,
-                    help="XML profile for extraction and explicit XML-only exports")
+                    help="XML profile for extraction and exports (default: sample)")
     ap.add_argument("--no-ocr", action="store_true", help="disable OCR fallback (diagnostics only)")
     ap.add_argument("--ocr-backend", choices=["automatic", "glm-ocr", "paddleocr-vl", "paddleocr", "tesseract"],
                     help="select the OCR pipeline")
@@ -46,7 +46,7 @@ def publish_batch_document(pdf: Path, extraction: dict, decks: list[Path], out: 
     from powerpoint.amend import amend_deck
     from reporting.exports import output_stem, publish_document
 
-    export_settings = settings if xml_only else replace(settings, schema_profile="sample")
+    export_settings = settings
     ir = (ir_from_dict(json.loads((work / "ir" / f"{pdf.stem}.json").read_text(encoding="utf-8")))
           if extraction.get("ok") else None)
     stem = output_stem(pdf.name)
@@ -74,9 +74,12 @@ def publish_batch_document(pdf: Path, extraction: dict, decks: list[Path], out: 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    settings = Settings.load(args.config, workers=args.workers, schema_profile=args.profile, time_budget_s=args.time_budget,
+    settings = Settings.load(args.config, default_schema_profile="sample", workers=args.workers,
+                             schema_profile=args.profile, time_budget_s=args.time_budget,
                              ocr_enabled=False if args.no_ocr else None, ocr_backend=args.ocr_backend)
-    inp, out = Path(args.input).resolve(), Path(args.output).resolve()
+    phase_dir = HERE.parent / f"phase-{args.phase}"
+    inp = Path(args.input or phase_dir / "input").resolve()
+    out = Path(args.output or phase_dir / "output").resolve()
     work = Path(args.work_dir).resolve() if args.work_dir else out.parent / "docsync_run"
     log = get_logger()
     if not inp.is_dir():

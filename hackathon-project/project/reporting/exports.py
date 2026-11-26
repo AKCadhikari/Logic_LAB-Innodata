@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path, PureWindowsPath
+from time import monotonic
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pymupdf
@@ -128,7 +130,7 @@ def save_original_images(data, ir, locations, folder, asset_report):
 
 
 def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, report: dict,
-                     transform, *, xml_only: bool = False) -> dict:
+                     transform, *, xml_only: bool = False, progress=None) -> dict:
     """Write validated XML first, then publish the deck and the final status."""
     folder.mkdir(parents=True, exist_ok=False)
     xml_path = folder / f"{stem}.xml"
@@ -137,6 +139,15 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
     outputs = {"xml": None, "pptx": None}
     result = {**report, "output_folder": str(folder), "outputs": outputs, "applied": [], "review": [],
               "status": "failed", "xml_profile": settings.schema_profile}
+    phases = result["export_phases"] = {}
+
+    def stage(name, status, started):
+        phases[name] = {"status": status, "seconds": round(monotonic() - started, 2)}
+        if status == "running":
+            phases[name]["at"] = datetime.now(timezone.utc).isoformat()
+        if progress:
+            progress(phases.copy())
+
     assets = {}
     completeness = {"status": "unavailable"}
     corrections = []
@@ -146,6 +157,8 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
     if extraction.get("source_review_approved"):
         quality = {**quality, "source_review_approved": True}
     staged = xml_path.with_suffix(".tmp")
+    xml_started = monotonic()
+    stage("validation", "running", xml_started)
     try:
         if not extraction.get("ok"):
             raise ValueError("The source PDF extraction did not pass validation.")
@@ -189,6 +202,7 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         validation["xml"]["error"] = result["error"]
     finally:
         staged.unlink(missing_ok=True)
+        stage("validation", "completed" if outputs["xml"] else "failed", xml_started)
 
     if outputs["xml"] and requires_manual_review(extraction, completeness):
         outputs["xml"]["draft"] = True
@@ -199,6 +213,8 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         result["status"] = "xml_only"
         validation["pptx"]["status"] = "skipped"
     elif outputs["xml"]:
+        pptx_started = monotonic()
+        stage("pptx", "running", pptx_started)
         try:
             presentation = transform(deck_path)
             slide_count = validate_deck(deck_path, presentation["slides"])
@@ -222,6 +238,8 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
             result.update(status="partial", error="PowerPoint generation or validation failed. The XML is available.")
             validation["pptx"]["error"] = result["error"]
             deck_path.unlink(missing_ok=True)
+        finally:
+            stage("pptx", "completed" if outputs["pptx"] else "failed", pptx_started)
 
     result["validation"] = validation
     result["content_validation"] = quality

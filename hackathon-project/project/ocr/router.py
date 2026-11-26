@@ -67,15 +67,20 @@ class OCRRouter:
                             if not state["ready"] and not (probe and engine == paddle_vl.ENGINE and state.get("installed")):
                                 raise RecognitionError(state["reason"], unavailable=True)
                             inference_attempted = True
+                            if event:
+                                event({"engine": engine, "model": model, "status": "requesting",
+                                       "fallback_reason": fallback_reason})
                             with audit.details(model_digest=state.get("digest")):
                                 result = adapter.recognise(page, dpi, self.settings)
                         else:
                             input_language = self.paddle_language(language, observed, diag)
                             if event:
                                 model = paddle.models(self.settings, input_language)[1].name
-                                event({"engine": engine, "model": model, "status": "requesting",
-                                       "fallback_reason": fallback_reason})
-                            result = self.paddle.recognise(page, input_language, dpi)
+                                result = self.paddle.recognise(page, input_language, dpi, lambda status: event(
+                                    {"engine": engine, "model": model, "status": status,
+                                     "fallback_reason": fallback_reason}))
+                            else:
+                                result = self.paddle.recognise(page, input_language, dpi)
                     issues = validate_recognition(result, page_number, diag, self.settings)
                     observed = result.text()
                     expected = diag.get("native_language", {})

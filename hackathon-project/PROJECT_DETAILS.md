@@ -1,33 +1,57 @@
-# DocuSync AI - project details
+# DocuSync AI — project details
 
-**Competition**: Innodata AI Catalyst 2026, Internal Employee Track - *Evolving Document Synthesis*.
-**Language / runtime**: Python 3.11, CPU only, offline. **Entry point**: `project/main.py`.
+- **Competition:** Innodata AI Catalyst 2026, Internal Track
+- **Entry point:** `project/main.py`
+- **Runtime:** Python 3.11, CPU-first local processing.
 
-## What it does
-1. **Ingest** a folder of PDFs/PPTX: validate headers, hash, detect duplicates, write a manifest.
-2. **Diagnose every PDF page**: native text health (control characters, private-use glyphs, mojibake, word plausibility),
-   image coverage, rotation, scripts. Decision per page: `native`, `compare` (OCR and keep the more reliable text) or `ocr`.
-3. **OCR** where needed (Tesseract, 10 languages): orientation (OSD), deskew for real scans, language-pack selection by trial
-   when the document language is unknown, sparse-text retry, page-level cache.
-4. **Reconstruct layout**: XY-cut reading order (multi-column, RTL aware), header/footer by repetition, headings (size, bold,
-   numbering), lists, footnotes, captions, real tables with row/col spans, figures, inline `strong/em/sup/sub/del/a`,
-   equations, `kind` attribute.
-5. **Serialize + validate XML** with `lxml` (vocabulary, page numbering, language, well-formedness; never emits invalid XML).
-6. **Proof-read the decks** against the PDF: evidence alignment, run-level edits, footer/breadcrumb/slide-number consistency,
-   restoration of missing body boxes, change report with confidence + recommended action.
-7. **Report**: audit log, per-document quality (heuristic confidence, not accuracy), HTML/JSON run reports, review dashboard.
+## Problem
 
-## Results (measured; see docs/BENCHMARKS.md)
-| Check | Result |
-|---|---|
-| All 12 sample PDFs + example (125 pages) | 13/13 well-formed XML, 40 pages OCR'd |
-| Cold run, 1 CPU core, 591 MB peak | 187 s for PDFs + 13 decks |
-| Example PDF (text layer is garbage) vs golden XML | text similarity 0.951 (text-layer baseline: 0.135) |
-| Example deck vs reference deck | exact paragraphs 210 -> 213 of 334, no regressions; 4 missing boxes restored |
+Convert PDFs with native, degraded or scanned text into structured XML, then proofread supplied PowerPoint presentations against source PDF evidence. Keep uncertain content visible for review rather than silently inventing corrections.
 
-## Known limitations (honest list)
-Scanned pages: no table structure, handwriting, stamps or strike-through detection. Figure `alt` text is heuristic (no
-vision model shipped). Deck repair is evidence-based and precision-first: it cannot recover content the PDF does not
-contain, restored body boxes are approximate (flagged for review), non-Latin deck text is review-only by default.
-Arabic OCR is weaker than Latin. Only one reference XML/deck exists, so quality on other documents is unmeasured.
-Validated on Linux only; Windows 11 steps above are untested by the author of this file.
+## Objectives
+
+- Process variable PDF names and page layouts without document-specific output templates.
+- Detect page regions with DocLayout-YOLO, recognize text with a separately selected OCR engine when needed, and preserve page geometry, language and reading order in a shared document representation.
+- Emit XML that is structurally checked before it is reported as successful.
+- Correct supported PPTX text defects using source evidence while preserving slide structure and formatting where possible.
+- Keep confidential files and model inference local; retain audit and validation reports.
+
+## Main features
+
+1. **PDF processing:** validate input, inspect each page, keep healthy native text or route image pages to OCR, run DocLayout-YOLO, associate regions with text, reconstruct structure and validate XML.
+2. **OCR choices:** Automatic, GLM-OCR, PaddleOCR-VL through the local Ollama adapter, and PaddleOCR Python. The layout detector is separate from OCR. A configured OCR backend is not treated as available unless its runtime responds.
+3. **XML:** page hierarchy, semantic block kinds, reading order, source geometry, language/direction metadata, and linked image assets where available. The workspace uses the engineering sample profile; CLI supports `brief`, `sample`, and `example` profiles.
+4. **PPTX proofreading:** upload a deck against a processed source PDF, match slide text to PDF evidence, apply supported corrections, report uncertain items, validate the resulting PPTX and save it beside the phase output.
+5. **Document review:** PDF preview, extracted text, reading order, detected regions, metadata, validation and export history.
+6. **Local workflow:** select Phase 1 or Phase 2 in the workspace. PDF uploads and proofreading decks are copied to that phase's input folder. Successful PDF jobs publish versioned XML; PPTX repair publishes a versioned corrected deck. Existing exports are retained.
+7. **Batch workflow:** `project/main.py` discovers PDFs and presentations in the selected phase input folder and writes export bundles to the matching output folder.
+
+## User workflow
+
+1. Start the local workspace with `Start_DocuSync_AI.bat` or `project/ui/server.py`.
+2. Select a submission phase, choose a PDF and select the OCR mode. Processing stages and model results come from actual worker events.
+3. Review the extraction and submit metadata when appropriate. XML is validated and written to the selected phase output directory automatically.
+4. In **PowerPoint & changes**, upload the supplied deck and choose source repair, or compare two processed PDF versions to synchronize an existing deck. The corrected PPTX and change report are saved in a new output folder.
+5. Inspect output validation and use the download links or the phase output folders.
+
+## Expected results
+
+- One validated XML per successfully processed PDF.
+- A corrected PPTX and evidence/change report for each supported proofreading run.
+- Versioned output folders so repeated attempts do not overwrite earlier results.
+- Per-page diagnostics, OCR/layout usage, confidence and review warnings.
+
+These are expected product behaviors, not a claim that the full competition data set has been processed. At this audit, the local engineering sample consists of one 12-page PDF and one paired error PPTX; full Phase 1 coverage requires the remaining supplied files.
+
+Measured current-run results and comparisons with the local engineering XML/PPTX are in [local sample verification](docs/LOCAL_SAMPLE_VERIFICATION.md).
+
+## Recorded historical benchmark
+
+`docs/BENCHMARKS.md` and `docs/OFFICIAL_SAMPLE_VALIDATION.md` contain previously recorded project measurements and sample comparisons. They were not rerun as part of this compliance pass and should not be presented as current coverage or as results from the currently available single PDF/deck pair.
+
+## Limitations
+
+- OCR quality and table/equation recovery vary with scan quality and the selected recognizer.
+- Layout geometry may need review on skewed or rotated scans.
+- PPTX edits are evidence-based and conservative; ambiguous changes are flagged for human review.
+- Full accuracy, CPU performance and memory use on the target machine need measurement across the complete competition set.

@@ -2,7 +2,9 @@
 from __future__ import annotations
 import json, os, time, traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import ExitStack
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Callable
 
 from config.settings import Settings
@@ -10,7 +12,7 @@ from diagnostics.page_diagnostics import analyze_page
 from diagnostics.profile import decorate_document, quality_gate
 from ingestion.discover import describe
 from layout.model import PageIR, DocIR, Line, Block, Span, ir_from_dict
-from layout import native, reconstruct, kinds, figures, ocr_geometry, equations, pseudocode
+from layout import native, reconstruct, kinds, figures, ocr_geometry, equations, pseudocode, doclayout, region_association
 from layout.docling_adapter import DoclingLayout
 from ocr import engine as ocr
 from ocr.router import OCRRouter
@@ -80,6 +82,11 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
 
 
 def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing):
+    with ExitStack() as resources:
+        return _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing, resources)
+
+
+def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing, resources):
     import pymupdf
     from rapidfuzz import fuzz
     t0 = time.time()
@@ -88,6 +95,9 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
     cache = Cache(work_dir / settings.cache_dir, settings.use_cache)
     router = OCRRouter(settings, work_dir / "recognition" / doc_id) if settings.ocr_backend != "tesseract" else None
     layout = DoclingLayout(settings)
+    resources.callback(layout.close)
+    if router:
+        resources.callback(router.close)
     counts = {"required": 0, "glm_ocr": 0, "paddle_ocr": 0, "failed": 0, "review": 0}
     res["processing_counts"] = counts
 
@@ -96,26 +106,27 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             processing({"stage": name, "counts": dict(counts), **values})
 
     fkey = model_audit.current()["document_sha256"]
+    stage("diagnostics", state="running")
     try:
-        doc = pymupdf.open(str(pdf))
+        doc = resources.enter_context(pymupdf.open(str(pdf)))
     except Exception as e:
         audit.event("ingestion", "unreadable", doc=doc_id, error=str(e))
         res["error"] = f"cannot open: {e}"
         _write_xml(out_dir, pdf, b'<?xml version="1.0" encoding="UTF-8"?>\n<document lang="und"/>\n')
         return res
+    if not doc.is_pdf:
+        res["error"] = "The uploaded file is not a PDF."
+        return res
     if doc.needs_pass:
-        doc.close()
         res["error"] = "PDF is encrypted and requires a password."
         return res
     n = doc.page_count
     if not n:
-        doc.close()
         res["error"] = "PDF contains no pages."
         return res
     if progress:
         progress(0, n)
     res["pages"] = n
-    stage("diagnostics")
     installed = ocr.available_langs(settings) if settings.ocr_enabled and settings.ocr_backend == "tesseract" else set()
     cache_identity = ocr_cache_identity(settings, installed)
     _, metadata_language = doc.xref_get_key(doc.pdf_catalog(), "Lang")
@@ -134,7 +145,10 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
     lang = detect_lang(usable)
     audit.event("analysis", "doc_language", doc=doc_id, lang=lang, healthy_pages=sum(d["health"] == "healthy" for d in diags),
                 decisions={k: sum(d["decision"] == k for d in diags) for k in ("native", "compare", "ocr")})
+    stage("diagnostics", state="failed" if any(d["health"] == "error" for d in diags) else "completed")
+    layout_pages = detect_layout(doc, settings, work_dir, stage, audit)
     # ---- OCR & Extraction agent ---------------------------------------------------------------
+    stage("ocr", state="running")
     raw = []
     for i in range(n):
         d = diags[i]; tp = time.time()
@@ -276,7 +290,14 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
     metadata = {key: value for key, value in (doc.metadata or {}).items() if value}
     if router:
         router.close()
+    stage("ocr", state="failed" if counts["failed"] else "completed")
+    stage("association", state="running")
+    for record, detection in zip(raw, layout_pages):
+        if not record["diag"].get("rotation") and not any(record["diag"].get("ocr", {}).get(k) for k in ("rotate", "skew")):
+            region_association.prepare(record, detection["detections"])
+    stage("association", state="completed" if settings.doclayout_enabled else "skipped")
     # ---- Layout Reconstruction agent ------------------------------------------------------------------
+    stage("layout", state="running")
     ctx = reconstruct.compute_context(raw, settings)
     ctx.lang = lang
     pages: list[PageIR] = []
@@ -306,15 +327,34 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             pg.ocr_engine = (ocr_info.get("engine") or "") if pg.source == "ocr" else ""
             pg.requires_review = bool(ocr_info.get("requires_review") or pg.diag.get("error")
                                       or pg.diag.get("review_reasons"))
+            detection = layout_pages[pg.n - 1]
             layout_status, regions = layout.enrich(pdf, pg)
-            pg.diag["layout"] = {"engine": "Docling" if layout_status == "applied" else "reconstruction",
-                                 "status": layout_status, "regions": len(regions)}
+            pg.diag["layout"] = {
+                "engine": doclayout.MODEL if detection["status"] == "completed" else
+                          ("Docling" if layout_status == "applied" else "reconstruction"),
+                "status": detection["status"], "docling_status": layout_status,
+                "regions": len(detection["detections"]), **detection,
+            }
             if geometry := ocr_geometry.position_page(doc[pg.n - 1], pg, settings, geometry_packs):
                 pg.diag["layout"]["coordinate_alignment"] = geometry
                 audit.event("layout", "ocr_coordinate_alignment", page=pg.n, **geometry)
+            detections = detection["detections"]
+            can_associate = not pg.diag.get("rotation") and not (ocr_info.get("rotate") or ocr_info.get("skew"))
+            if can_associate and detections:
+                region_association.add_visuals(pg, detections)
+                region_association.associate(pg, detections, classify=True)
+            if detection["status"] == "failed":
+                pg.requires_review = True
+                pg.diag.setdefault("review_reasons", []).append(detection["error"])
             reconstruct.place_visuals(pg)
             pseudocode.preserve_pseudocode(pg)
             equations.recognise_formulas(doc[pg.n - 1], pg, settings)
+            if can_associate and detections:
+                matched = region_association.associate(pg, detections)
+                if execution_ids := detection.get("execution_ids"):
+                    model_audit.mark(execution_ids, validation="passed", downstream=[
+                        {"consumer": "layout_regions", "reference": f"pdf/page/{pg.n}", "matched_regions": matched}
+                    ])
             pg.layout_engine = pg.diag["layout"]["engine"]
             if regions and settings.audit_private_responses:
                 report = work_dir / "recognition" / doc_id / f"page-{pg.n:04d}-docling.json"
@@ -329,19 +369,68 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                         item.source_reference.setdefault("execution_ids", ocr_info["selected_execution_ids"])
             pg.diag["confidence"] = page_confidence(pg)
             page_result = res["page_log"][pg.n - 1]
-            page_result.update(layout=pg.diag["layout"], review_required=pg.requires_review,
+            page_result.update(layout={key: value for key, value in pg.diag["layout"].items() if key != "detections"},
+                               review_required=pg.requires_review,
                                confidence=pg.diag["confidence"])
             pages.append(pg)
         counts["review"] = sum(page.requires_review for page in pages)
     finally:
         layout.close()
-        doc.close()
+    layout_failed = any("Layout reconstruction failed." in page.diag.get("review_reasons", [])
+                        or page.diag["layout"]["docling_status"] not in {"applied", "no safe matches", "disabled"}
+                        for page in pages)
+    stage("layout", state="failed" if layout_failed else "completed")
     dir_ = DocIR(doc_id=doc_id, path=str(pdf), lang=lang, pages=pages,
                  meta={"settings": settings.schema_profile, "pdf_metadata": metadata, "source_sha256": fkey,
                        "selected_ocr_engine": settings.ocr_backend,
                        "ocr_metadata_version": 2})
-    stage("validation")
-    return finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0)
+    stage("validation", state="running")
+    result = finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0)
+    stage("validation", state="completed" if result["ok"] else "failed")
+    return result
+
+
+def detect_layout(doc, settings, work_dir, stage, audit):
+    pages = [{"status": "disabled", "detections": []} for _ in doc]
+    if not settings.doclayout_enabled:
+        stage("rendering", state="skipped")
+        stage("detection", state="skipped")
+        return pages
+    stage("rendering", state="running")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="doclayout-", dir=work_dir) as scratch:
+        folder = Path(scratch)
+        rendered = []
+        for i in range(len(pages)):
+            try:
+                rendered.append(doclayout.render(doc[i], folder, settings.doclayout_image_size))
+            except (OSError, RuntimeError, ValueError) as error:
+                pages[i].update(status="failed", error=f"Page {i + 1} could not be rendered for layout detection: {error}")
+        stage("rendering", state="completed" if len(rendered) == len(pages) else "failed")
+        stage("detection", state="running", runtime_status="loading")
+        with doclayout.Detector(settings, folder) as detector:
+            initialization_error = None
+            for rendered_page in rendered:
+                number = rendered_page["page"]
+                result = pages[number - 1]
+                if not initialization_error and detector.process is None:
+                    try:
+                        detector.start()
+                    except doclayout.LayoutError as error:
+                        initialization_error = str(error)
+                stage("detection", page=number, runtime_status="error" if initialization_error else "processing")
+                try:
+                    if initialization_error:
+                        raise doclayout.LayoutError(initialization_error)
+                    start = model_audit.cursor()
+                    result.update(status="completed", detections=detector.detect(rendered_page),
+                                  execution_ids=model_audit.ids_since(start))
+                except doclayout.LayoutError as error:
+                    result.update(status="failed", error=str(error))
+                    audit.event("layout", "doclayout_error", page=number, error=str(error))
+                rendered_page["path"].unlink(missing_ok=True)
+    stage("detection", state="failed" if any(p["status"] == "failed" for p in pages) else "completed")
+    return pages
 
 
 def refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, progress, processing):
@@ -361,24 +450,46 @@ def _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, p
     if saved_ir.meta.get("source_sha256") != file_key(pdf):
         raise ValueError("The source PDF changed. Run a new extraction.")
     packs = ocr.available_langs(settings)
-    if not packs:
+    if not packs and not settings.doclayout_enabled:
         raise RuntimeError("Tesseract is unavailable for layout refresh.")
     result["layout_refresh"] = True
     with pymupdf.open(pdf) as source:
         if len(source) != len(saved_ir.pages):
             raise ValueError("The PDF and the saved extraction have different page counts.")
+        refresh = settings.doclayout_enabled and any(
+            p.diag.get("layout", {}).get("status") != "completed" for p in saved_ir.pages
+        )
+        detections = detect_layout(source, settings, work_dir, lambda name, **detail: processing(
+            {"stage": name, **detail}), audit) if refresh else None
+        processing({"stage": "layout", "state": "running"})
         for page in saved_ir.pages:
             processing({"stage": "layout", "page": page.n})
+            current = page.diag.setdefault("layout", {})
+            if detections:
+                evidence = detections[page.n - 1]
+                current.update(evidence, regions=len(evidence["detections"]))
+                if evidence["status"] == "completed":
+                    page.layout_engine = current["engine"] = doclayout.MODEL
+                elif evidence.get("error"):
+                    page.requires_review = True
+                    page.diag.setdefault("review_reasons", []).append(evidence["error"])
             if geometry := ocr_geometry.position_page(source[page.n - 1], page, settings, packs):
-                page.diag.setdefault("layout", {})["coordinate_alignment"] = geometry
-                result["page_log"][page.n - 1]["layout"] = page.diag["layout"]
+                current["coordinate_alignment"] = geometry
                 audit.event("layout", "ocr_coordinate_alignment", page=page.n, **geometry)
             reconstruct.place_visuals(page)
             pseudocode.preserve_pseudocode(page)
             equations.recognise_formulas(source[page.n - 1], page, settings)
+            ocr_info = page.diag.get("ocr", {})
+            if current.get("detections") and not page.diag.get("rotation") and not (ocr_info.get("rotate") or ocr_info.get("skew")):
+                region_association.associate(page, current["detections"])
+            result["page_log"][page.n - 1]["layout"] = {key: value for key, value in current.items()
+                                                         if key != "detections"}
             progress(page.n, len(saved_ir.pages))
-    processing({"stage": "validation"})
-    return finish_extraction(pdf, saved_ir, settings, out_dir, work_dir, audit, result, start)
+    processing({"stage": "layout", "state": "completed"})
+    processing({"stage": "validation", "state": "running"})
+    result = finish_extraction(pdf, saved_ir, settings, out_dir, work_dir, audit, result, start)
+    processing({"stage": "validation", "state": "completed" if result["ok"] else "failed"})
+    return result
 
 
 def finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0):
@@ -470,7 +581,7 @@ def _job(args):
 
 
 def run_pdfs(pdfs: list[Path], settings: Settings, out_dir: Path, work_dir: Path, audit: AuditLog, t_start: float) -> list[dict]:
-    workers = settings.workers or (1 if settings.ocr_backend != "tesseract" or settings.docling_enabled
+    workers = settings.workers or (1 if settings.ocr_backend != "tesseract" or settings.docling_enabled or settings.doclayout_enabled
                                    else max(1, min((os.cpu_count() or 2) - 1, 6, len(pdfs) or 1)))
     deadline = t_start + 0.75 * settings.time_budget_s            # after this point OCR drops to fast mode
     audit.event("orchestrator", "batch_start", documents=len(pdfs), workers=workers, soft_deadline_s=round(0.75 * settings.time_budget_s))

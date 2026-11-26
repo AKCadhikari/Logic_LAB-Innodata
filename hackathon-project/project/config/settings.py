@@ -8,7 +8,7 @@ from pathlib import Path
 @dataclass
 class Settings:
     # --- schema -------------------------------------------------------------
-    schema_profile: str = "brief"          # brief | example (page attribute only) | sample (legacy hierarchy)
+    schema_profile: str = "brief"          # brief | example | sample (engineering-style hierarchy)
     lang_format: str = "iso"               # "iso" (en, de ...) | "name" (english, german ...)
     emit_kind: bool = True                 # kind= attribute (bonus marks in the brief)
     emit_bbox: bool = False                # debug: data-bbox on blocks
@@ -60,6 +60,13 @@ class Settings:
     header_band: float = 0.075             # top/bottom fraction of page considered header/footer band
     heading_ratio: float = 1.12
     figure_min_pt: float = 48.0
+    doclayout_enabled: bool = True
+    doclayout_python: str = ".venv-doclayout/Scripts/python.exe" if os.name == "nt" else ".venv-doclayout/bin/python"
+    doclayout_repo: str = "third_party/DocLayout-YOLO-release-v2"
+    doclayout_checkpoint: str = "models/layout/universal/DocLayout-YOLO-universal.pt"
+    doclayout_timeout_s: int = 120
+    doclayout_image_size: int = 1024
+    doclayout_confidence: float = 0.25
     docling_enabled: bool = True
     docling_artifacts: str = ""
     docling_python: str = ""
@@ -94,12 +101,15 @@ class Settings:
     pptx_suffix_rule: str = "auto"         # auto | amendment_out | transformed_QA
 
     @classmethod
-    def load(cls, path: str | None = None, *, env_file: Path | None = None, **overrides) -> "Settings":
+    def load(cls, path: str | None = None, *, env_file: Path | None = None,
+             default_schema_profile: str | None = None, **overrides) -> "Settings":
         s = cls()
+        configured_schema_profile = False
         if path:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("The DocuSync JSON configuration must be an object.")
+            configured_schema_profile = "schema_profile" in data
             for k, v in data.items():
                 if hasattr(s, k):
                     setattr(s, k, v)
@@ -128,6 +138,7 @@ class Settings:
             ("OLLAMA_EXECUTABLE", ("ollama_executable",), str),
         )
         for source in (env_values, os.environ):
+            configured_schema_profile |= "DOCUSYNC_SCHEMA_PROFILE" in source
             for f in fields(s):
                 env = source.get("DOCUSYNC_" + f.name.upper())
                 if env is not None:
@@ -139,6 +150,8 @@ class Settings:
                         setattr(s, target, convert(source[name]))
             if "OLLAMA_KEEP_ALIVE" in source:
                 s.ollama_startup_keep_alive = source["OLLAMA_KEEP_ALIVE"]
+        if default_schema_profile and not configured_schema_profile:
+            s.schema_profile = default_schema_profile
         for k, v in overrides.items():
             if v is not None and hasattr(s, k):
                 setattr(s, k, v)

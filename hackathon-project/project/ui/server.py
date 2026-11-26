@@ -339,7 +339,7 @@ def configure_workspace(storage: Path, config: str | None = None, output: Path |
 
     app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
-    app.extensions["workspace"] = Workspace(storage, Settings.load(config), output)
+    app.extensions["workspace"] = Workspace(storage, Settings.load(config, default_schema_profile="sample"), output)
     if api.name not in app.blueprints:
         app.register_blueprint(api)
 

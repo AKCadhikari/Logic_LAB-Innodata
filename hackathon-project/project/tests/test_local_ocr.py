@@ -88,6 +88,7 @@ def test_native_vs_ocr_numeric_comparison_preserves_text_and_review_status(
 
 def test_glm_page_flows_through_ir_and_xml(tmp_path, settings, audit, monkeypatch):
     settings.docling_enabled = False
+    settings.doclayout_enabled = False
     settings.audit_private_responses = True
     monkeypatch.setattr(glm, "model_info", lambda settings: {"ready": True})
     def recognise(page, dpi, settings):
@@ -103,8 +104,14 @@ def test_glm_page_flows_through_ir_and_xml(tmp_path, settings, audit, monkeypatc
     stages = []
     result = process_pdf(source, settings, tmp_path / "out", tmp_path / "run", audit, processing=stages.append)
     assert result["ok"] and result["page_log"][0]["ocr"]["engine"] == "glm-ocr"
-    assert [step["stage"] for step in stages] == ["diagnostics", "ocr", "ocr_attempt", "extracted", "layout", "validation"]
-    assert stages[3]["counts"] == {"required": 1, "glm_ocr": 1, "paddle_ocr": 0, "failed": 0, "review": 0}
+    assert [(step["stage"], step["state"]) for step in stages if "state" in step] == [
+        ("diagnostics", "running"), ("diagnostics", "completed"), ("rendering", "skipped"),
+        ("detection", "skipped"), ("ocr", "running"), ("ocr", "completed"), ("association", "running"),
+        ("association", "skipped"), ("layout", "running"), ("layout", "completed"),
+        ("validation", "running"), ("validation", "completed"),
+    ]
+    extracted = next(step for step in stages if step["stage"] == "extracted")
+    assert extracted["counts"] == {"required": 1, "glm_ocr": 1, "paddle_ocr": 0, "failed": 0, "review": 0}
     xml = etree.parse(str(tmp_path / "out" / "scan.xml"))
     assert xml.findtext(".//table/tbody/tr/td") == "μ"
     assert xml.findtext(".//p[@kind='equation']") == "E = mc^2"

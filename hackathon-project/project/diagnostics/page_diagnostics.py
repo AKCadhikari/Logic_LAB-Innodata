@@ -82,7 +82,7 @@ def analyze_page(page, settings, metadata_language: str = "und") -> dict:
         decision = "ocr"
         reasons.append("A large image accompanies a sparse native text layer.")
     return {
-        "page": page.number + 1, "width": round(page.rect.width, 1), "height": round(page.rect.height, 1),
+        "page": page.number + 1, "width": page.rect.width, "height": page.rect.height,
         "rotation": page.rotation, "native_chars": h["chars"], "text_density": round(h["chars"] / area * 1e4, 2),
         "has_native_text": bool(stripped), "short_native_text": len(stripped) < settings.native_min_chars,
         "has_images": bool(imgs), "appears_scanned": (not stripped and cov >= 0.4) or mixed,

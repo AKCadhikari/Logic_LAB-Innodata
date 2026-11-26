@@ -511,7 +511,7 @@ def main():
             manager = StartupManager(Settings(), args.storage.resolve(), args.logs.resolve(), args.port)
             try:
                 if args.action != "stop":
-                    manager.settings = Settings.load(args.config)
+                    manager.settings = Settings.load(args.config, default_schema_profile="sample")
                     manager.validate()
                 if args.action in {"stop", "restart"}:
                     manager.stop()

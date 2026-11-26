@@ -11,8 +11,9 @@ from pathlib import Path, PureWindowsPath
 from secrets import token_hex
 from tempfile import SpooledTemporaryFile, TemporaryDirectory
 from uuid import UUID, uuid4
+from zipfile import BadZipFile, ZipFile
 
-from flask import Blueprint, Response, current_app, g, jsonify, request, send_file
+from flask import Blueprint, Response, current_app, jsonify, request, send_file
 from werkzeug.exceptions import HTTPException
 
 from comparison.differ import compare_ir
@@ -41,11 +42,18 @@ def fail(message: str, status: int):
 
 
 def browser_owner(*, create: bool = False) -> str | None:
-    token = g.get("workspace_token") or request.cookies.get(SESS_COOKIE, "")
+    token = request.cookies.get(SESS_COOKIE, "")
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
+        # Keep a newly issued token in this request's WSGI environ, not g:
+        # preserved Flask test contexts can otherwise carry it into another
+        # client that does not have the matching cookie.
+        token = request.environ.get("docusync.workspace_token", "")
     if not re.fullmatch(r"[0-9a-f]{64}", token):
         if not create:
             return None
-        token = g.workspace_token = token_hex(32)
+        token = token_hex(32)
+    if not request.cookies.get(SESS_COOKIE):
+        request.environ["docusync.workspace_token"] = token
     return sha256(token.encode()).hexdigest()
 
 
@@ -58,7 +66,7 @@ def authorize_document():
 
 @api.after_request
 def set_browser_cookie(response):
-    if token := g.get("workspace_token"):
+    if token := request.environ.get("docusync.workspace_token"):
         response.set_cookie(SESS_COOKIE, token, httponly=True, samesite="Strict", max_age=365 * 24 * 3600)
     response.cache_control.no_store = True
     return response
@@ -157,6 +165,11 @@ def documents():
     return jsonify(workspace().documents(browser_owner(create=True)))
 
 
+@api.route("/layout-health", methods=["GET", "POST"])
+def layout_health():
+    return jsonify(workspace().layout_health(retry=request.method == "POST"))
+
+
 @api.route("/ocr-settings", methods=["GET", "PATCH"])
 def ocr_settings():
     from ocr.recognition import ENGINE_MODES
@@ -237,6 +250,9 @@ def create_document():
         engine, language = requested_ocr(request.form.get("ocr_engine"), request.form.get("ocr_language"))
     except ValueError as error:
         return fail(str(error), 400)
+    phase = request.form.get("phase", "1")
+    if phase not in {"1", "2"}:
+        return fail("Choose Phase 1 or Phase 2.", 400)
     uploaded, error = upload_file("pdf", ".pdf", b"%PDF-")
     if error:
         return fail(error, 400)
@@ -245,8 +261,71 @@ def create_document():
     if previous and not ws.owns(previous, browser_owner()):
         return fail("The previous document version does not exist.", 400)
     filename, stream = uploaded
-    document_id = ws.upload(filename, stream, previous, browser_owner(create=True), engine=engine, language=language)
+    document_id = ws.upload(filename, stream, previous, browser_owner(create=True), phase=phase,
+                            engine=engine, language=language)
     return jsonify(ws.get(document_id)), 202
+
+
+@api.get("/history")
+def processing_history():
+    owner = browser_owner(create=True)
+    ws = workspace()
+    return jsonify(pdfs=ws.documents(owner), presentations=ws.presentations(owner))
+
+
+@api.post("/presentations")
+def create_standalone_presentation():
+    phase = request.form.get("phase", "1")
+    if phase not in {"1", "2"}:
+        return fail("Choose Phase 1 or Phase 2.", 400)
+    uploaded, error = upload_file("pptx", ".pptx", b"PK")
+    if error:
+        return fail(error, 400)
+    filename, stream = uploaded
+    try:
+        with ZipFile(stream) as archive:
+            names = set(archive.namelist())
+            if ("ppt/presentation.xml" not in names or "[Content_Types].xml" not in names
+                    or not any(name.startswith("ppt/slides/slide") and name.endswith(".xml") for name in names)
+                    or archive.testzip() is not None):
+                return fail("This file is not a valid PowerPoint presentation. Choose a .pptx file.", 400)
+        stream.seek(0)
+        from pptx import Presentation
+
+        if not Presentation(stream).slides:
+            return fail("The PowerPoint presentation must contain at least one slide.", 400)
+        stream.seek(0)
+    except (BadZipFile, KeyError, OSError, ValueError):
+        return fail("This file is not a valid PowerPoint presentation. Choose a .pptx file.", 400)
+    owner = browser_owner(create=True)
+    ws = workspace()
+    try:
+        job_id = ws.enqueue_presentation(filename, stream, owner, phase)
+    except OSError:
+        current_app.logger.exception("Could not archive the standalone PowerPoint input")
+        return fail("The presentation could not be saved in the selected phase folder.", 500)
+    return jsonify(ws.get_presentation(job_id, owner)), 202
+
+
+@api.get("/presentations/<job_id>")
+def standalone_presentation_status(job_id: str):
+    item = workspace().get_presentation(job_id, browser_owner())
+    return (jsonify(item), 200) if item else fail("Presentation job not found.", 404)
+
+
+@api.get("/presentations/<job_id>/download")
+def download_standalone_presentation(job_id: str):
+    ws, owner = workspace(), browser_owner()
+    item = ws.get_presentation(job_id, owner)
+    if not item:
+        return fail("Presentation job not found.", 404)
+    if item["status"] != "completed":
+        return fail("The corrected presentation is not ready yet.", 409)
+    target = ws.presentation_download(job_id, owner)
+    if not target:
+        return fail("The validated PowerPoint output is missing.", 404)
+    return send_file(target, as_attachment=True, download_name=target.name,
+                     mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation")
 
 
 def view(ir: DocIR) -> dict:
@@ -259,7 +338,7 @@ def view(ir: DocIR) -> dict:
         ocr = page.diag.get("ocr", {})
         aligned = not page.diag.get("rotation") and not (page.source == "ocr" and (ocr.get("rotate") or ocr.get("skew")))
         if not aligned:
-            warnings.append(f"Page {page.n}: source overlays are unavailable for this rotation or skew.")
+            warnings.append(f"Page {page.n}: reconstructed text coordinates require review for rotation or skew.")
         if page.requires_review or page.diag.get("error") or (page.diag.get("decision") == "ocr" and not page.blocks):
             warnings.append(f"Page {page.n}: review the source. " + " ".join(page.diag.get("review_reasons", []) or
                                                                          page.diag.get("reasons", [])))
@@ -282,8 +361,37 @@ def view(ir: DocIR) -> dict:
                                               "appears_scanned", "has_images", "ocr_required", "review_reasons",
                                               "selected_ocr_engine")
                 if key in page.diag}
+        layout = page.diag.get("layout", {})
+        detections = []
+        for region in layout.get("detections", []):
+            linked = [block for block in blocks if block["source_reference"].get("layout_region_id") == region["id"]]
+            caption = [block for block in blocks if block["source_reference"].get("caption_region_id") == region["id"]]
+            text = [block["text"] or "\n".join(cell["text"] for cell in block["cells"]) for block in linked]
+            ocr_text = [(block["text"] or "\n".join(cell["text"] for cell in block["cells"])) for block in linked
+                        if block["ocr_engine"]]
+            text.extend(block["caption"] for block in caption)
+            ocr_text.extend(block["caption"] for block in caption if block["ocr_engine"])
+            engines = set(block["ocr_engine"] for block in linked + caption if block["ocr_engine"])
+            fragment_blocks = []
+            for block in blocks:
+                fragments = block["source_reference"].get("layout_fragments", {}).get(region["id"], [])
+                if fragments:
+                    fragment_blocks.append(block)
+                    text.extend(fragments)
+                    ocr_text.extend(fragments)
+                    if block["ocr_engine"]:
+                        engines.add(block["ocr_engine"])
+            if region.get("ocr_lines") and page.ocr_engine:
+                engines.add(page.ocr_engine)
+            detections.append({**region, "text": "\n".join(filter(None, text)),
+                               "ocr_text": "\n".join(filter(None, ocr_text or region.get("ocr_lines", []))),
+                               "ocr_engines": sorted(engines),
+                               "block_ids": sorted({block["i"] for block in linked + caption + fragment_blocks})})
+        if "layout" in diag:
+            diag["layout"] = {key: value for key, value in layout.items() if key != "detections"}
         pages.append({"n": page.n, "w": page.width, "h": page.height, "source": page.source,
                       "diag": diag, "blocks": blocks, "ocr_engine": page.ocr_engine,
+                      "layout_regions": detections,
                       "requires_review": page.requires_review, "language": page.language})
     return {"pages": pages, "title": title, "lang": ir.lang, "language": ir.language, "warnings": warnings}
 
@@ -299,6 +407,7 @@ def document(document_id: str):
         ir, _, result = extracted
         content = view(ir)
         info.update(content, validation=result["validation"], quality=result["quality"], seconds=result["seconds"],
+                    submission_export=result.get("submission_export"),
                     processing_counts=result.get("processing_counts"),
                     content_validation=result.get("multilingual_validation", {}))
     return jsonify(info)
@@ -353,7 +462,35 @@ def metadata(document_id: str):
         return fail("Use a title up to 1000 characters and a language code such as en, ar or und.", 400)
     if not ws.review(document_id, title.strip(), lang, approved):
         return fail("Wait until processing finishes before reviewing.", 409)
-    return document(document_id)
+    response = document(document_id).get_json()
+    if approved:
+        info = ws.get(document_id)
+        snapshot = ws.extracted(document_id)
+        if snapshot:
+            ir, settings, extraction = snapshot
+            extraction = {**extraction, "source_review_approved": info["approved"]}
+            settings = replace(settings, schema_profile=WORKSPACE_XML_PROFILE)
+            stem = output_stem(info["filename"])
+            export_id = uuid4()
+            try:
+                export = publish_document(
+                    ws.phase_output_dir(info["phase"]) / stem / export_id.hex,
+                    stem, ir, settings, extraction,
+                    {"id": str(export_id), "document_id": document_id, "filename": info["filename"],
+                     "phase": info["phase"], "mode": "approved_xml", "created": now(),
+                     "job_id": info["jobs"][0]["id"], "source_review_approved": info["approved"]},
+                    None, xml_only=True,
+                )
+                response["phase_export"] = {
+                    "phase": info["phase"], "output_folder": export["output_folder"],
+                    "outputs": export["outputs"], "status": export["status"],
+                    "error": export.get("error", ""),
+                }
+            except (OSError, ValueError, RuntimeError):
+                current_app.logger.exception("Could not save the approved XML to its phase output folder")
+                response["phase_export"] = {"phase": info["phase"], "status": "failed",
+                                             "error": "The review was saved, but the XML could not be written to the phase output folder."}
+    return jsonify(response)
 
 
 @api.get("/documents/<document_id>/xml")
@@ -533,19 +670,21 @@ def run_assessment(changes, settings, audit_path, document_id=None, source_hash=
 
 def export_root(document_id: str) -> Path:
     ws = workspace()
-    return ws.output / output_stem(ws.get(document_id)["filename"])
+    info = ws.get(document_id)
+    return ws.phase_output_dir(info["phase"]) / output_stem(info["filename"])
 
 
 @api.post("/documents/<document_id>/presentations")
 def sync_deck(document_id: str):
     from powerpoint.amend import repair_presentation
+    from powerpoint.from_pdf import render_presentation
     from powerpoint.sync import synchronize
 
     ws = workspace()
     previous_id = request.form.get("previous_id") or None
     mode = request.form.get("mode", "version")
-    if mode not in {"source", "version"}:
-        return fail("Choose source repair or version synchronization.", 400)
+    if mode not in {"source", "version", "generate"}:
+        return fail("Choose PDF slides, source repair or version synchronization.", 400)
     info = ws.get(document_id)
     extracted = ws.extracted(document_id)
     if not extracted or info["jobs"][0]["status"] != "completed":
@@ -563,14 +702,26 @@ def sync_deck(document_id: str):
             return fail("Choose two different processed documents.", 409)
         if previous[0].meta.get("ocr_metadata_version") != 2:
             return fail("Retry extraction for the previous PDF before applying version changes.", 409)
-    uploaded, error = upload_file("pptx", ".pptx")
-    if error:
-        return fail(error, 400)
-    filename, stream = uploaded
+    if mode == "generate":
+        if not info["approved"]:
+            return fail("Submit the metadata review before generating PowerPoint.", 409)
+        filename = info["filename"]
+    else:
+        uploaded, error = upload_file("pptx", ".pptx")
+        if error:
+            return fail(error, 400)
+        filename, stream = uploaded
+        try:
+            ws.save_phase_input(filename, stream, info["phase"])
+        except OSError:
+            current_app.logger.exception("Could not archive the uploaded PowerPoint input")
+            return fail("The PowerPoint input could not be saved in the selected phase folder.", 500)
     export_id = uuid4()
     stem = output_stem(info["filename"])
 
     def transform(output: Path) -> dict:
+        if mode == "generate":
+            return ws.worker.submit(render_presentation, ir, output).result()
         with TemporaryDirectory(prefix="presentation-", dir=ws.source(document_id).parent) as temp:
             source = Path(temp) / "source.pptx"
             with source.open("xb") as file:
@@ -582,15 +733,30 @@ def sync_deck(document_id: str):
             reviewed, analysis = assess_changes(document_id, changes)
             return {**synchronize(source, output, reviewed), "analysis": analysis}
 
+    with ws.export_lock:
+        if document_id in ws.export_progress:
+            return fail("An export for this PDF is already running.", 409)
+        ws.export_progress[document_id] = {}
     try:
-        summary = publish_document(ws.output / stem / export_id.hex, stem, ir, settings, extraction,
+        summary = publish_document(ws.phase_output_dir(info["phase"]) / stem / export_id.hex,
+                                   stem, ir, settings, extraction,
                                    {"id": str(export_id), "document_id": document_id, "filename": filename,
                                     "previous_id": previous_id, "mode": mode, "created": now(),
-                                    "source_review_approved": info["approved"]}, transform)
+                                    "job_id": info["jobs"][0]["id"],
+                                    "source_review_approved": info["approved"]}, transform,
+                                   progress=lambda phases: ws.export_progress.update({document_id: phases}))
     except OSError:
         current_app.logger.exception("Could not finalize the export report")
         return fail("The output folder could not be written. Check its location and available space.", 500)
+    finally:
+        with ws.export_lock:
+            ws.export_progress.pop(document_id, None)
     return jsonify(summary), 201 if summary["status"] == "completed" else 422
+
+
+@api.get("/documents/<document_id>/export-progress")
+def export_progress(document_id: str):
+    return jsonify(workspace().export_progress.get(document_id, {}))
 
 
 @api.get("/documents/<document_id>/presentations")

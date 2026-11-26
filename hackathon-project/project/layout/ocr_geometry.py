@@ -10,6 +10,7 @@ from diagnostics.profile import block_text
 from layout.equations import position_numbered_equations
 from layout.kinds import ADDRESS, AFFIL, CLASSIFICATION, KEYW, metadata_kind
 from layout.model import Block
+from layout.region_association import match
 from ocr import engine
 from utils.textutil import ISO_TO_TESS, language_profile, norm_cmp
 from utils import execution_audit as audit
@@ -170,6 +171,8 @@ def position_page(source, page, settings, packs):
     except (OSError, RuntimeError, ValueError, engine.subprocess.TimeoutExpired) as error:
         return {"status": "Local coordinate alignment failed.", "reason": str(error)}
     result = align_blocks(page, lines)
+    if regions := page.diag.get("layout", {}).get("detections"):
+        result["region_fragments"] = align_region_fragments(page, lines, regions)
     ids = detail.get("selected_execution_ids", [])
     located = position_numbered_equations(page, lines, ids)
     if located:
@@ -177,7 +180,33 @@ def position_page(source, page, settings, packs):
     if ids:
         for block in page.blocks[:result["recovered_headers"]]:
             block.source_reference["execution_ids"] = ids
-    if result["aligned"] or located:
+    if result["aligned"] or located or result.get("region_fragments"):
         audit.mark(ids, downstream=[{"consumer": "pydantic_layout", "reference": f"pdf/page/{page.n}",
-                                     "matched_blocks": result["aligned"] + located}])
+                                     "matched_blocks": result["aligned"] + located,
+                                     "matched_fragments": result.get("region_fragments", 0)}])
     return {"status": "checked", **result}
+
+
+def align_region_fragments(page, lines, regions):
+    """Locate exact fragments of accepted OCR when a block spans more than one region."""
+    anchors = {}
+    for line in lines:
+        if line.conf >= 80 and (region := match(line.bbox, regions)):
+            anchors.setdefault(region["id"], []).append(line.text)
+    keys = {region_id: text_key(" ".join(texts)) for region_id, texts in anchors.items()}
+    linked = 0
+    for block in page.blocks:
+        if block.source != "ocr" or block.bbox:
+            continue
+        fragments = {}
+        for fragment in block.text.splitlines():
+            key = text_key(fragment)
+            if len(key) < 8:
+                continue
+            matches = [region_id for region_id, anchor in keys.items() if key in anchor]
+            if len(matches) == 1:
+                fragments.setdefault(matches[0], []).append(fragment)
+                linked += 1
+        if fragments:
+            block.source_reference["layout_fragments"] = fragments
+    return linked

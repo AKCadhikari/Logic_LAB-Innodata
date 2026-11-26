@@ -1,21 +1,65 @@
 const W = {batch: false, documents: [], page: 1, zoom: 100, highlight: null,
-           selection: 0, timer: null, previous: "", changes: null};
+           selection: 0, timer: null, previous: "", changes: null, region: null, block: null,
+           showBoxes: true, exportPhases: new Map()};
 const docUrl = () => "/api/documents/" + encodeURIComponent(S.id);
 const statusText = message => $("#runchip").textContent = message;
 const engineName = engine => ({"glm-ocr": "GLM-OCR", "paddleocr-vl": "PaddleOCR-VL (Ollama)",
-    paddleocr: "PaddleOCR (Python)", tesseract: "Tesseract"}[engine] || "");
+    paddleocr: "PaddleOCR", tesseract: "Tesseract"}[engine] || "");
 const ocrModeName = mode => engineName(mode) || (mode === "automatic" ? "Automatic" : "");
 const ocrJobOptions = () => ({ocr_engine: $("#ocr-engine").value, ocr_language: $("#ocr-language").value});
 let ocrHealth;
 let ocrPreferenceChanged = false;
 let ocrPreferenceWrite = Promise.resolve();
 let ocrProbeInProgress = false;
+let layoutHealth;
+let layoutTimer;
+
+async function loadLayoutHealth(retry = false) {
+    clearTimeout(layoutTimer);
+    try {
+        layoutHealth = await workspaceFetch("/api/layout-health", retry ? {method: "POST"} : undefined);
+        showLayoutHealth();
+        if (layoutHealth.status === "loading") layoutTimer = setTimeout(loadLayoutHealth, 850);
+    } catch (error) {
+        $("#layout-model-status").textContent = error.message;
+        $("#layout-check").hidden = false;
+        $("#layout-home-status").textContent = "Layout Detection: Unavailable";
+        $("#pdf-advanced-status").textContent = "The layout model status could not be checked.";
+    }
+}
+
+function showLayoutHealth() {
+    if (!layoutHealth) return;
+    const readiness = {ready: "Ready", loading: "Checking"};
+    $("#layout-home-status").textContent = "Layout Detection: " + (readiness[layoutHealth.status] || "Unavailable");
+    $("#pdf-advanced-status").textContent = [layoutHealth.model, layoutHealth.device?.toUpperCase(),
+        layoutHealth.checkpoint_available ? "model available" : "model missing"].filter(Boolean).join(" · ");
+    const step = S.data?.jobs?.[0]?.processing;
+    const runtime = step?.stage === "detection" && step.runtime_status;
+    const state = runtime || layoutHealth.status;
+    const labels = {loading: "Loading", ready: "Ready", processing: "Processing", error: "Error", disabled: "Disabled"};
+    $("#layout-model-status").textContent = [labels[state], layoutHealth.device?.toUpperCase(),
+        layoutHealth.checkpoint_available ? "Checkpoint found" : "Checkpoint missing",
+        layoutHealth.error].filter(Boolean).join(" · ");
+    $("#layout-model-status").dataset.state = state;
+    $("#layout-check").hidden = state !== "error";
+}
+$("#layout-check").onclick = () => loadLayoutHealth(true);
 
 function showOcrChoice() {
     const mode = $("#ocr-engine").value, models = ocrHealth?.engines;
     $("#ocr-paddle-row").hidden = mode !== "automatic" && mode !== "paddleocr";
     const description = mode === "automatic" ? "Primary " + ocrModeName(ocrHealth?.automatic_primary || "glm-ocr") :
         (models?.[mode]?.model || ocrModeName(mode));
+    const job = S.data?.jobs?.[0], attempt = job?.processing;
+    const activeOcr = job?.status === "running" && ["ocr", "ocr_attempt"].includes(attempt?.stage) && attempt.engine;
+    if (activeOcr && (mode === "automatic" || mode === attempt.engine)) {
+        const state = attempt.stage === "ocr" ? "Checking / loading" : attempt.status === "requesting" ? "Processing" :
+            ({loading: "Loading", unavailable: "Unavailable", timeout: "Timed out", rejected: "Error", failed: "Error", accepted: "Recognized"}
+                [attempt.status] || attempt.status);
+        $("#ocr-choice-status").textContent = engineName(attempt.engine) + " · " + state;
+        return;
+    }
     if (mode === "automatic" && models) {
         const primary = ocrHealth.automatic_primary;
         const secondary = ocrHealth.automatic_secondary;
@@ -29,7 +73,7 @@ function showOcrChoice() {
     const state = models?.[mode]?.status;
     $("#ocr-choice-status").textContent = description + (state === "unavailable" ? " · " + models[mode].reason :
         state === "verified_execution" ? " · Previous inference verified" :
-        state === "available_unverified" ? " · Available, inference unverified" : "");
+        state === "available_unverified" ? " · Available, inference unverified" : !models ? " · Checking availability" : "");
 }
 
 async function loadOcrSettings() {
@@ -129,39 +173,37 @@ $("#ocr-engine").onchange = () => {
 const processingStatus = step => {
     if (!step) return "";
     if (step.stage === "diagnostics") return "Inspecting PDF pages";
-    if (step.stage === "ocr" || step.stage === "ocr_attempt") return engineName(step.engine) + " · page " + step.page;
+    if (step.stage === "rendering") return "Rendering PDF pages";
+    if (step.stage === "detection") return step.page ? "Detecting layout · page " + step.page : "Initializing layout detection";
+    if (step.stage === "ocr" || step.stage === "ocr_attempt") return step.engine ?
+        engineName(step.engine) + " · page " + step.page : "Extracting document text";
     if (step.stage === "extracted") return "Extracted page " + step.page;
-    if (step.stage === "layout") return "Reconstructing layout · page " + step.page;
+    if (step.stage === "association") return "Associating layout and OCR";
+    if (step.stage === "layout") return "Reconstructing document" + (step.page ? " · page " + step.page : "");
     if (step.stage === "validation") return "Validating document and XML";
     return "";
 };
 
 function showOcrTimeline(job, active) {
     const pane = $("#ocr-timeline"), step = job?.processing;
-    pane.hidden = !active || !step;
-    if (pane.hidden) return;
-    const group = step.stage;
-    const remaining = Math.max(0, job.total - job.done);
-    const samples = step.page_seconds || [];
-    const ocr = samples.filter(sample => sample.ocr), native = samples.filter(sample => !sample.ocr);
-    const ocrLeft = Math.max(0, Math.min(remaining, (step.counts?.required || 0) - ocr.length));
-    const nativeLeft = remaining - ocrLeft;
-    const groupEstimate = (left, seen) => !left ? 0 : seen.length >= 2 ?
-        left * seen.reduce((sum, sample) => sum + sample.seconds, 0) / seen.length : null;
-    const parts = [groupEstimate(ocrLeft, ocr), groupEstimate(nativeLeft, native)];
-    const estimate = !remaining ? "" : parts.some(time => time === null) ? "ETA is being calculated" :
-        "Estimated page extraction time left " + Math.round(parts[0] + parts[1]) + " s";
-    const attempt = step.last_ocr_attempt;
-    const fallback = [...(step.history || [])].reverse().find(item => item.fallback_reason);
-    const stages = [group !== "diagnostics" && "Diagnostics", ["layout", "validation"].includes(group) && "Extraction",
-        group === "validation" && "Layout"].filter(Boolean);
-    pane.textContent = [processingStatus(step), step.model || (group.startsWith("ocr") ? attempt?.model : ""),
-        job.total ? job.done + " complete · " + remaining + " remaining" : "",
-        job.started ? Math.max(0, Math.floor((Date.now() - new Date(job.started).getTime()) / 1000)) + " s elapsed" : "",
-        estimate, attempt?.inference_ms != null ? "Last measured request " + (attempt.inference_ms / 1000).toFixed(2) + " s" : "",
-        step.counts?.failed ? step.counts.failed + " failed OCR pages" : "",
-        fallback ? "Fallback " + engineName(fallback.engine) + " · " + fallback.fallback_reason : "",
-        stages.length ? "Completed " + stages.join(", ") : ""].filter(Boolean).join(" · ");
+    pane.hidden = !job;
+    const seconds = job?.started ? (new Date(job.finished || Date.now()) - new Date(job.started)) / 1000 : null;
+    pane.textContent = [active ? processingStatus(step) || "Waiting to process" : "Processing " + job?.status,
+        active && step?.model, seconds == null ? "" : Math.max(0, seconds).toFixed(1) + " s elapsed",
+        active && step?.last_ocr_attempt?.fallback_reason].filter(Boolean).join(" · ");
+    const stages = $("#processing-stages");
+    stages.hidden = !job;
+    const names = {diagnostics: "PDF diagnostics", rendering: "Page rendering", detection: "DocLayout-YOLO detection",
+        ocr: "OCR processing", association: "Layout / OCR association", layout: "Docling reconstruction",
+        validation: "XML generation", pptx: "PPTX generation"};
+    const phases = {...step?.phases, ...W.exportPhases.get(S.id)};
+    stages.innerHTML = Object.entries(names).map(([key, label]) => {
+        const phase = phases[key], state = phase?.status || "pending";
+        const duration = state === "running" && phase.at ? (Date.now() - new Date(phase.at)) / 1000 : phase?.seconds;
+        return '<li data-state="' + esc(state) + '"><strong>' + label + '</strong><span>' +
+            state[0].toUpperCase() + state.slice(1) + (duration == null ? "" : " · " + Math.max(0, duration).toFixed(1) + " s") +
+            '</span></li>';
+    }).join("");
 }
 const processingCounts = counts => counts ? '<div class="card" aria-live="polite">' +
     '<div>OCR required on ' + counts.required + ' pages</div>' +
@@ -200,7 +242,8 @@ function setView(tab) {
     S.vtab = tab;
     document.querySelectorAll("#vtabs .tab").forEach(button =>
         setActive(button, button.dataset.t === tab));
-    if (W.batch) viewer(); else workspaceViewer();
+    if (W.batch) viewer();
+    else { workspaceViewer(); updateInspector(); }
 }
 
 async function loadWorkspace(preferred) {
@@ -223,6 +266,8 @@ async function loadWorkspace(preferred) {
         $("#page-tools").hidden = true;
         $("#rot").disabled = true;
         $("#dlxml").disabled = true;
+        $("#dlpptx").disabled = true;
+        showOcrTimeline(null, false);
         $("#reproc").disabled = true;
         statusText("Local workspace");
     }
@@ -234,6 +279,7 @@ async function selectWorkspace(id, reset = true) {
     if (reset) {
         W.page = 1;
         W.highlight = null;
+        W.region = W.block = null;
         W.previous = "";
         W.changes = null;
         S.rot = 0;
@@ -247,7 +293,10 @@ async function selectWorkspace(id, reset = true) {
     const listed = W.documents.find(document => document.id === id);
     if (listed) listed.status = job.status;
     const active = job.status === "queued" || job.status === "running";
+    if (active) W.exportPhases.delete(id);
     showOcrTimeline(job, active);
+    showLayoutHealth();
+    showOcrChoice();
     const reviewPages = data.pages?.filter(page => page.requires_review).length || 0;
     const extractionStatus = data.content_validation?.status === "manual_review_required" ?
         "Extraction complete · manual review required" : data.content_validation?.status === "validation_partial" ?
@@ -256,9 +305,12 @@ async function selectWorkspace(id, reset = true) {
         (job.total ? " · " + job.done + "/" + job.total + " pages" : "") +
         (job.ocr_selection?.ocr_backend ? " · " + ocrModeName(job.ocr_selection.ocr_backend) : "") +
         (reviewPages && !active ? " · " + reviewPages + " for review" : ""));
+    $("#runchip").dataset.documentId = id;
+    $("#runchip").dataset.jobStatus = job.status;
     $("#reproc").disabled = active;
     $("#reproc").textContent = job.status === "failed" ? "Retry" : "Reprocess";
     $("#dlxml").disabled = !data.approved;
+    $("#dlpptx").disabled = active || !data.approved || !!data.content_validation?.blocking_pages?.length;
     $("#dlxml").title = data.approved ? "Downloads a ZIP when the XML has images" : "Approve metadata review before exporting";
     workspaceViewer();
     await reviewPanel();
@@ -268,6 +320,95 @@ async function selectWorkspace(id, reset = true) {
 }
 
 const bidiDir = language => language?.base_direction === "rtl" ? "rtl" : language?.base_direction === "ltr" ? "ltr" : "auto";
+const regionColors = {text: "#087568", title: "#6834ac", header: "#3659b2", footer: "#525e71",
+    table: "#a54b14", image: "#af2e65", equation: "#8f371b", list: "#4a6d21", other: "#346983"};
+const regionCategory = label => ["image_block", "equation_block"].includes(label) ? label.split("_")[0] :
+    Object.hasOwn(regionColors, label) ? label : "other";
+const regionName = label => label.replaceAll("_", " ");
+const boxArea = ([left, top, right, bottom]) => (right - left) * (bottom - top);
+const currentPage = () => S.data?.pages?.[W.page - 1];
+const regionLabel = region => regionName(region.class_name) + " · " + (region.confidence * 100).toFixed(1) + "%";
+const blockOrder = block => block.reading_order || block.i + 1;
+const orderedBlocks = page => [...page.blocks].sort((a, b) => blockOrder(a) - blockOrder(b));
+
+function svgRectangle(box, attributes, label) {
+    const [x, y, right, bottom] = box;
+    return '<rect x="' + x + '" y="' + y + '" width="' + (right - x) + '" height="' + (bottom - y) +
+        '" ' + attributes + '><title>' + esc(label) + '</title></rect>';
+}
+
+function zoningOverlay(regions, selectedId) {
+    return [...regions].sort((a, b) => boxArea(b.display_bbox) - boxArea(a.display_bbox)).map(region => {
+        const color = regionColors[regionCategory(region.class_name)];
+        const selected = region.id === selectedId;
+        const label = regionLabel(region);
+        const interactive = selectedId === undefined ? "" : ' data-region="' + esc(region.id) +
+            '" role="button" tabindex="0" aria-label="' + esc(label) + '" aria-pressed="' + selected + '"';
+        return svgRectangle(region.display_bbox, 'class="layout-box' + (selected ? ' selected' : '') +
+            '" fill="' + color + '" stroke="' + color + '"' + interactive, label);
+    }).join("");
+}
+
+function inspectRegion(id) {
+    W.region = id;
+    W.block = null;
+    W.highlight = currentPage()?.layout_regions.find(region => region.id === id)?.display_bbox || null;
+    if (S.stab !== "meta") $("#stabs [data-t=meta]").click();
+    workspaceViewer();
+    updateInspector();
+}
+
+function inspectBlock(index) {
+    W.block = index;
+    W.region = null;
+    W.highlight = currentPage()?.blocks.find(block => block.i === index)?.bbox || null;
+    if (S.stab !== "meta") $("#stabs [data-t=meta]").click();
+    workspaceViewer();
+    updateInspector();
+}
+
+function updateInspector() {
+    const panel = $("#region-inspector"), page = currentPage();
+    if (!panel || !page) return;
+    const regions = page.layout_regions || [];
+    const region = regions.find(item => item.id === W.region);
+    const block = page.blocks.find(item => item.i === W.block);
+    let detail = "";
+    if (region || block) {
+        const box = (region || block).bbox;
+        const heading = region ? regionName(region.class_name) : block.kind || block.tag;
+        const confidence = region ? region.confidence * 100 : block.conf;
+        const engines = region ? region.ocr_engines : [block.ocr_engine].filter(Boolean);
+        const text = region ? region.ocr_text : block.ocr_engine ? block.text : "";
+        const source = region?.source || block?.source_reference?.layout_detection ||
+            (block?.source_reference?.layout_fragments ? "DocLayout-YOLO" :
+                page.diag.layout?.docling_status === "applied" ? "Docling" : "Reconstruction");
+        detail = '<article class="card region-detail"><strong>' + esc(heading) + '</strong><dl>' +
+            '<dt>Confidence</dt><dd>' + (confidence == null ? "Unavailable" : confidence.toFixed(1) + "%") + '</dd>' +
+            '<dt>Page</dt><dd>' + page.n + '</dd><dt>PDF box (top-left)</dt><dd>' +
+            (box ? box.map(value => value.toFixed(2)).join(", ") + ' pt' : "Unavailable") + '</dd>' +
+            '<dt>Layout source</dt><dd>' + esc(source || "Reconstruction") + '</dd><dt>OCR engine</dt><dd>' +
+            esc(engines.map(engine => engineName(engine) || engine).join(", ") || "No OCR linked") + '</dd></dl>' +
+            (text ? '<div><b>OCR text</b><p dir="auto">' + esc(text) + '</p></div>' :
+                region?.text || block?.text ? '<div><b>Extracted text</b><p dir="auto">' +
+                    esc(region?.text || block?.text) + '</p></div>' : "") +
+            (W.highlight ? '<button class="btn" id="locate-element">Locate in source PDF</button>' : "") + '</article>';
+    }
+    const items = S.vtab === "zoning" ? regions.map(item => ({
+        label: regionLabel(item),
+        value: item.id, current: item.id === W.region, attribute: "region"
+    })) : S.vtab === "order" ? orderedBlocks(page)
+        .map(item => ({label: blockOrder(item) + ". " + (item.kind || item.tag) + " · " +
+            (item.text || item.caption || "").slice(0, 85), value: item.i, current: item.i === W.block, attribute: "block"})) : [];
+    panel.innerHTML = detail + (items.length ? '<div class="sec">' + (S.vtab === "zoning" ? "Detected regions" : "Reading order") +
+        '</div><div class="region-list">' + items.map(item => '<button class="btn" data-' + item.attribute +
+            '="' + esc(item.value) + '" aria-pressed="' + item.current + '" dir="auto">' + esc(item.label) + '</button>').join("") +
+        '</div>' : "");
+    panel.querySelectorAll("[data-region]").forEach(button => button.onclick = () => inspectRegion(button.dataset.region));
+    panel.querySelectorAll("[data-block]").forEach(button => button.onclick = () => inspectBlock(Number(button.dataset.block)));
+    const locate = $("#locate-element");
+    if (locate) locate.onclick = () => { S.rot = 0; setView("pdf"); };
+}
 
 function languageLabel(profile) {
     if (!profile?.language) return "";
@@ -275,6 +416,27 @@ function languageLabel(profile) {
     return [language === "und" ? "Undetermined language" : language, profile.script,
         profile.direction, profile.confidence == null ? "" :
             Math.round(profile.confidence * 100) + "% detection confidence"].filter(Boolean).join(" · ");
+}
+
+function renderTextBlocks(blocks, numbered = false) {
+    return '<div class="textview">' + blocks.map(block => {
+        let details = '<div dir="' + bidiDir(block.language) + '">' + esc(block.text || block.caption || block.alt) + '</div>';
+        if (block.cells.length) {
+            const rows = new Map();
+            const rtl = bidiDir(block.language) === "rtl";
+            const cells = rtl && block.source === "native" ? [...block.cells].sort((a, b) => a.row - b.row || b.col - a.col) : block.cells;
+            for (const cell of cells) {
+                if (!rows.has(cell.row)) rows.set(cell.row, []);
+                const tag = cell.header ? "th" : "td";
+                rows.get(cell.row).push('<' + tag + ' dir="' + bidiDir(cell.language) + '" rowspan="' + cell.rowspan + '" colspan="' + cell.colspan + '">' +
+                    esc(cell.text) + '</' + tag + '>');
+            }
+            details += '<table dir="' + bidiDir(block.language) + '">' + [...rows.values()].map(row => "<tr>" + row.join("") + "</tr>").join("") + "</table>";
+        }
+        return '<article class="tb"><small>' + (numbered ? blockOrder(block) + ". " : "") +
+            esc([block.kind || block.tag, languageLabel(block.language)].filter(Boolean).join(" · ")) +
+            '</small>' + details + '</article>';
+    }).join("") + '</div>';
 }
 
 function workspaceViewer() {
@@ -296,32 +458,23 @@ function workspaceViewer() {
     $("#zoom-out").disabled = W.zoom === 50;
     $("#zoom-in").disabled = W.zoom === 200;
     if (S.vtab === "text") {
-        $("#viewer").innerHTML = '<div class="textview">' + page.blocks.map(block => {
-            let details = '<div dir="' + bidiDir(block.language) + '">' + esc(block.text || block.caption || block.alt) + '</div>';
-            if (block.cells.length) {
-                const rows = new Map();
-                const rtl = bidiDir(block.language) === "rtl";
-                const cells = rtl && block.source === "native" ? [...block.cells].sort((a, b) => a.row - b.row || b.col - a.col) : block.cells;
-                for (const cell of cells) {
-                    if (!rows.has(cell.row)) rows.set(cell.row, []);
-                    const tag = cell.header ? "th" : "td";
-                    rows.get(cell.row).push('<' + tag + ' dir="' + bidiDir(cell.language) + '" rowspan="' + cell.rowspan + '" colspan="' + cell.colspan + '">' +
-                        esc(cell.text) + '</' + tag + '>');
-                }
-                details += '<table dir="' + bidiDir(block.language) + '">' + [...rows.values()].map(row => "<tr>" + row.join("") + "</tr>").join("") + "</table>";
-            }
-            return '<article class="tb"><small>' + esc([block.kind || block.tag, languageLabel(block.language)]
-                .filter(Boolean).join(" · ")) + '</small>' + details + '</article>';
-        }).join("") + '</div>';
+        $("#viewer").innerHTML = renderTextBlocks(page.blocks);
         return;
     }
     let overlay = "";
-    const rectangle = (box, color, label) => {
-        const [x, y, right, bottom] = box;
-        return '<rect x="' + x + '" y="' + y + '" width="' + (right - x) + '" height="' + (bottom - y) +
-            '" ' + color + '><title>' + esc(label) + '</title></rect>';
-    };
-    if (S.vtab === "zoning" || S.vtab === "order") {
+    if (S.vtab === "zoning") {
+        const regions = page.layout_regions || [];
+        const legend = $("#legend");
+        legend.hidden = false;
+        legend.innerHTML = '<label><input type="checkbox" id="show-boxes"' + (W.showBoxes ? " checked" : "") +
+            '> Bounding boxes</label><span>' + esc(regions.length ? regions.length + " DocLayout-YOLO regions" :
+                page.diag.layout?.error || "No DocLayout-YOLO regions on this page.") + '</span>' +
+            [...new Set(regions.map(region => regionCategory(region.class_name)))].map(category =>
+                '<span><b style="background:' + regionColors[category] + '"></b>' + category + '</span>').join("");
+        $("#show-boxes").onchange = event => { W.showBoxes = event.target.checked; workspaceViewer(); $("#show-boxes").focus(); };
+        if (W.showBoxes) overlay = zoningOverlay(regions, W.region);
+    }
+    if (S.vtab === "order") {
         const positioned = page.blocks.filter(block => block.bbox);
         const legend = $("#legend");
         legend.hidden = false;
@@ -348,8 +501,9 @@ function workspaceViewer() {
         overlay = positioned.map(block => {
             const [x, y] = block.bbox;
             const color = col(block.tag);
-            return S.vtab === "zoning" ? rectangle(block.bbox, 'fill="' + color + '" fill-opacity=".17" stroke="' +
-                color + '"', block.kind || block.tag) : '<g><title>' + esc((block.reading_order || block.i + 1) +
+            return '<g class="order-marker' + (block.i === W.block ? ' selected' : '') + '" data-block="' + block.i +
+                '" tabindex="0" role="button" aria-label="Block ' + (block.reading_order || block.i + 1) + '"><title>' +
+                esc((block.reading_order || block.i + 1) +
                 " · " + (block.text || block.kind || block.tag).slice(0, 120)) + '</title>' +
                 '<circle cx="' + Math.max(13, x - 12) + '" cy="' + (y + 8) + '" r="10" fill="' + color +
                 '"/><text x="' + Math.max(13, x - 12) + '" y="' + (y + 12) +
@@ -357,7 +511,7 @@ function workspaceViewer() {
         }).join("");
     }
     if (W.highlight && S.vtab === "pdf" && !S.rot) {
-        overlay += rectangle(W.highlight, 'class="highlight"', "Title source");
+        overlay += svgRectangle(W.highlight, 'class="highlight"', "Selected source region");
     }
     const dpi = Math.min(220, Math.round(100 * W.zoom / 100));
     $("#viewer").innerHTML = '<div class="pl"><span>' + esc(page.source === "ocr" ?
@@ -367,15 +521,28 @@ function workspaceViewer() {
         'px"><img src="' + docUrl() + '/page/' + page.n + '.png?dpi=' + dpi + '&amp;rot=' +
         (S.vtab === "pdf" ? S.rot : 0) + '" alt="Page ' + page.n + '">' +
         (overlay ? '<svg viewBox="0 0 ' + page.w + ' ' + page.h + '" preserveAspectRatio="none">' + overlay + '</svg>' : '') + '</div>';
+    $("#viewer").querySelectorAll("[data-region], [data-block]").forEach(control => {
+        const activate = () => {
+            const region = control.dataset.region, block = control.dataset.block;
+            if (region) inspectRegion(region); else inspectBlock(Number(block));
+            $("#viewer").querySelector(region ? '[data-region="' + CSS.escape(region) + '"]' : '[data-block="' + block + '"]')?.focus();
+        };
+        control.onclick = activate;
+        control.onkeydown = event => {
+            if (event.key === "Enter" || event.key === " ") { event.preventDefault(); activate(); }
+        };
+    });
 }
 
 function movePage(step) {
     W.page += step;
     W.highlight = null;
+    W.region = W.block = null;
     workspaceViewer();
     if (S.stab === "meta") {
         const diagnostics = $("#page-diagnostics");
         if (diagnostics) diagnostics.innerHTML = pageDiagnostics(S.data.pages[W.page - 1]);
+        updateInspector();
     }
 }
 
@@ -393,7 +560,8 @@ function pageDiagnostics(page) {
         (Number.isInteger(diag.native_chars) ? ' · ' + diag.native_chars + ' characters' : '') + '</div>' +
         '<div>' + (diag.ocr_required ? "OCR required" : "OCR not required") +
         (diag.appears_scanned ? ' · scanned page' : '') + '</div>' + attempts +
-        (diag.layout ? '<div>Layout: ' + esc(diag.layout.engine) + ' · ' + esc(diag.layout.status) + '</div>' : '') +
+        (diag.layout ? '<div>Layout · ' + esc(diag.layout.engine) + ' · ' + esc(diag.layout.status) + '</div>' : '') +
+        (diag.layout?.docling_status ? '<div>Docling · ' + esc(diag.layout.docling_status) + '</div>' : '') +
         (page.requires_review ? '<strong class="notice">Manual review required</strong>' : '') +
         '<div>' + esc([...(diag.reasons || []), ...(diag.review_reasons || [])].join(" ")) + '</div></div>';
 }
@@ -430,13 +598,23 @@ async function reviewPanel() {
         return;
     }
     const page = data.pages[W.page - 1], title = data.title;
-    panel.innerHTML = '<form id="metadata-form" class="workspace-tools">' +
-        '<div class="fld"><label for="review-title">Title ' + (title ? badge(title.confidence) : '') + '</label>' +
-        '<input id="review-title" maxlength="1000" value="' + esc(title?.value) + '">' +
-        (title?.bbox ? '<button type="button" class="btn" id="locate">Locate title source</button>' : '') + '</div>' +
-        '<div class="fld"><label for="review-lang">Document language</label>' +
-        '<input id="review-lang" required maxlength="35" value="' + esc(data.lang) + '"></div>' +
-        '<div><button class="btn" value="save">Save draft</button> <button class="btn pri" value="approve">Approve</button></div></form>' +
+    const detectedPages = data.pages.filter(item => item.diag.layout?.status === "completed").length;
+    const failedLayoutPages = data.pages.filter(item => item.diag.layout?.status === "failed").length;
+    const layoutStatus = detectedPages === data.pages.length ? "Completed" :
+        detectedPages ? "Completed on " + detectedPages + " of " + data.pages.length + " pages" :
+            failedLayoutPages ? "Failed on " + failedLayoutPages + " pages" : "Unavailable";
+    const layoutCount = data.pages.reduce((total, item) => total + (item.layout_regions?.length || 0), 0);
+    const layoutSeconds = data.jobs?.[0]?.processing?.phases?.detection?.seconds;
+    const selectedOcr = [...new Set(data.pages.map(item => item.ocr_engine).filter(Boolean))];
+    const ocrLabel = selectedOcr.length ? selectedOcr.map(engineName).join(", ") : "Native PDF text";
+    const savedXml = data.submission_export?.outputs?.xml;
+    const advanced = '<div class="sec">Processing details</div><div class="card"><div>Phase ' + esc(data.phase) +
+        ' | ' + esc(data.pages.length) + ' pages | OCR ' + esc(ocrLabel) + '</div>' +
+        '<div>DocLayout-YOLO | ' + esc(layoutStatus) + ' | ' + layoutCount + ' detections' +
+        (Number.isFinite(layoutSeconds) ? ' | ' + esc(layoutSeconds) + ' s inference' : '') + '</div>' +
+        '<div>Processing time | ' + esc(data.seconds) + ' s</div>' +
+        (savedXml ? '<div>XML saved to ' + esc(data.submission_export.output_folder) + '</div>' :
+            data.submission_export?.error ? '<div class="notice">' + esc(data.submission_export.error) + '</div>' : '') + '</div>' +
         counts + '<div id="page-diagnostics">' + pageDiagnostics(page) + '</div>' +
         '<div class="sec">Validation</div><div class="card">XML ' +
         (data.validation.issues.length ? esc(data.validation.issues.join(", ")) : "passed structural checks") +
@@ -446,10 +624,24 @@ async function reviewPanel() {
             data.content_validation?.status === "validation_partial" ?
                 '<strong class="notice">Validation partially passed · content review required</strong>' : '') + '</div>' +
         data.warnings.map(warning => '<div class="notice">' + esc(warning) + '</div>').join("") + history;
+    panel.innerHTML = '<section id="region-inspector" aria-label="Element inspector"></section>' +
+        '<form id="metadata-form" class="workspace-tools">' +
+        '<div class="fld"><label for="review-title">Title</label>' +
+        '<input id="review-title" maxlength="1000" value="' + esc(title?.value) + '">' +
+        (title?.bbox ? '<button type="button" class="btn" id="locate">Locate title source</button>' : '') + '</div>' +
+        '<div class="fld"><label for="review-lang">Document language</label>' +
+        '<input id="review-lang" required maxlength="35" value="' + esc(data.lang) + '"></div>' +
+        '<div><button class="btn" value="save">' + (data.approved ? "Re-edit" : "Save draft") +
+        '</button> <button class="btn pri" value="approve">Submit review</button></div></form>' +
+        '<details class="advanced-details"><summary>Advanced metadata and diagnostics</summary>' +
+        (title ? '<div class="card">Title confidence ' + badge(title.confidence) + '</div>' : '') +
+        advanced + '</details>';
+    updateInspector();
     const locate = $("#locate");
     if (locate) locate.onclick = () => {
         W.page = title.page;
         W.highlight = title.bbox;
+        W.region = W.block = null;
         S.rot = 0;
         setView("pdf");
         $("#page-diagnostics").innerHTML = pageDiagnostics(data.pages[W.page - 1]);
@@ -529,9 +721,15 @@ function changesPanel(data) {
         analysisStatus(W.changes.analysis) + changeList(W.changes.changes);
     const renderExports = async (displayedId = null) => {
         const url = docUrl() + "/presentations";
-        const reports = (await workspaceFetch(url)).filter(report => report.id !== displayedId);
+        const allReports = await workspaceFetch(url);
+        const reports = allReports.filter(report => report.id !== displayedId);
         const history = $("#presentation-history");
         if (!history || S.data !== data || S.stab !== "deck" || W.batch) return;
+        const latest = allReports.find(report => report.job_id === data.jobs[0].id);
+        if (latest?.export_phases) {
+            W.exportPhases.set(data.id, latest.export_phases);
+            showOcrTimeline(data.jobs[0], false);
+        }
         history.innerHTML = (reports.length ? '<div class="sec">Export history</div>' : '') + reports.map(report => report.outputs ?
             exportCard(report, presentationLinks(url, report.id)) :
             '<div class="card"><a class="workspace-link" href="' + presentationLinks(url, report.id).pptx + '">' +
@@ -577,10 +775,7 @@ function changesPanel(data) {
         $("#comparison-results").innerHTML = '<p role="status">Generating and validating export files…</p>';
         try {
             const url = docUrl() + "/presentations";
-            const report = await workspaceFetch(url, {method: "POST", body: form}).catch(error => {
-                if (error.exportReport) return error.exportReport;
-                throw error;
-            });
+            const report = await submitExport(data, form);
             if (S.data !== data || S.stab !== "deck") return;
             $("#comparison-results").innerHTML = analysisStatus(report.analysis) +
                 exportCard(report, presentationLinks(url, report.id)) +
@@ -605,22 +800,148 @@ $("#page-prev").onclick = () => movePage(-1);
 $("#page-next").onclick = () => movePage(1);
 $("#zoom-in").onclick = () => { W.zoom += 25; workspaceViewer(); };
 $("#zoom-out").onclick = () => { W.zoom -= 25; workspaceViewer(); };
+$("#fullscreen").onclick = async () => {
+    try {
+        if (document.fullscreenElement) await document.exitFullscreen();
+        else await $("#viewpane").requestFullscreen();
+    } catch (error) { showError(error); }
+};
+document.addEventListener("fullscreenchange", () => {
+    const active = !!document.fullscreenElement;
+    $("#fullscreen").textContent = active ? "Exit fullscreen" : "Fullscreen";
+    $("#fullscreen").setAttribute("aria-pressed", String(active));
+});
+
+async function submitExport(data, form) {
+    const base = "/api/documents/" + encodeURIComponent(data.id);
+    let finished = false;
+    let timer;
+    async function refresh() {
+        try {
+            const phases = await workspaceFetch(base + "/export-progress");
+            if (!finished && Object.keys(phases).length) {
+                W.exportPhases.set(data.id, phases);
+                if (!W.batch && S.id === data.id) showOcrTimeline(data.jobs[0], false);
+            }
+        } finally {
+            if (!finished) timer = setTimeout(() => refresh().catch(() => {}), 700);
+        }
+    }
+    timer = setTimeout(() => refresh().catch(() => {}), 350);
+    try {
+        const report = await workspaceFetch(base + "/presentations", {method: "POST", body: form}).catch(error => {
+            if (error.exportReport) return error.exportReport;
+            throw error;
+        });
+        W.exportPhases.set(data.id, report.export_phases || {});
+        if (S.id === data.id && !W.batch) showOcrTimeline(data.jobs[0], false);
+        return report;
+    } finally {
+        finished = true;
+        clearTimeout(timer);
+    }
+}
+
+$("#dlpptx").onclick = async () => {
+    const data = S.data, button = $("#dlpptx");
+    if (W.batch || !data?.approved) return;
+    button.disabled = true;
+    try {
+        const form = new FormData();
+        form.set("mode", "generate");
+        const report = await submitExport(data, form);
+        if (S.data !== data) return;
+        const links = presentationLinks(docUrl() + "/presentations", report.id);
+        $("#stabs [data-t=deck]").click();
+        $("#comparison-results").innerHTML = exportCard(report, links);
+        if (report.outputs.pptx) {
+            const download = document.createElement("a");
+            download.href = links.pptx;
+            download.click();
+        }
+    } catch (error) { showError(error); }
+    finally { if (S.data === data) button.disabled = false; }
+};
+
+let pendingFile = null;
+let uploading = false;
+const uploadZone = $("#upload-zone");
+const uploadForm = $("#pdf-submit");
+const uploadStatus = $("#upload-status");
+
+function choosePdf(files) {
+    if (uploading || W.batch) return;
+    pendingFile = null;
+    uploadForm.hidden = true;
+    uploadStatus.textContent = "";
+    if (files.length !== 1 || !/\.pdf$/i.test(files[0].name) || !files[0].size || files[0].size >= 64 * 1024 * 1024) {
+        uploadStatus.textContent = "Choose one non-empty PDF smaller than 64 MB.";
+        return;
+    }
+    pendingFile = files[0];
+    $("#file-details").textContent = pendingFile.name + " · " + new Intl.NumberFormat(undefined, {
+        style: "unit", unit: "kilobyte", maximumFractionDigits: 1
+    }).format(pendingFile.size / 1000);
+    uploadForm.hidden = false;
+}
+
+function uploadPdf(form) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", "/api/documents");
+        xhr.responseType = "json";
+        xhr.upload.onprogress = event => {
+            if (event.lengthComputable) {
+                $("#upload-progress").max = event.total;
+                $("#upload-progress").value = event.loaded;
+            }
+        };
+        xhr.onload = () => xhr.status === 202 ? resolve(xhr.response) :
+            reject(new Error(xhr.response?.error || "Upload failed (" + xhr.status + ")."));
+        xhr.onerror = () => reject(new Error("The upload could not reach the workspace."));
+        xhr.send(form);
+    });
+}
+
 $("#upload").onclick = () => $("#pdf-file").click();
-$("#pdf-file").onchange = async event => {
-    const file = event.target.files[0];
+$("#pdf-file").onchange = event => {
+    if (event.target.files.length) choosePdf(event.target.files);
     event.target.value = "";
-    if (!file) return;
+};
+uploadZone.ondragover = event => { event.preventDefault(); uploadZone.dataset.dragging = "true"; };
+uploadZone.ondragleave = event => { if (!uploadZone.contains(event.relatedTarget)) delete uploadZone.dataset.dragging; };
+uploadZone.ondrop = event => {
+    event.preventDefault();
+    delete uploadZone.dataset.dragging;
+    choosePdf(event.dataTransfer.files);
+};
+uploadForm.onsubmit = async event => {
+    event.preventDefault();
+    if (uploading || !pendingFile) return;
     const form = new FormData();
-    form.append("pdf", file);
+    form.append("pdf", pendingFile);
+    form.append("phase", $("#review-phase-select").value);
     for (const [key, value] of Object.entries(ocrJobOptions())) form.append(key, value);
     const previous = S.data?.pages && window.confirm("Link this upload as a new version of the selected PDF?");
     if (previous) form.append("previous_id", S.id);
-    $("#upload").disabled = true;
+    uploading = true;
+    $("#upload").disabled = $("#batch").disabled = event.submitter.disabled = true;
+    $("#upload-progress").hidden = false;
+    $("#upload-progress").removeAttribute("value");
+    uploadStatus.textContent = "Uploading PDF…";
     try {
-        const doc = await workspaceFetch("/api/documents", {method: "POST", body: form});
+        const doc = await uploadPdf(form);
+        uploadForm.hidden = true;
+        pendingFile = null;
+        uploadStatus.textContent = "";
+        statusText("PDF received");
         await loadWorkspace(doc.id);
-    } catch (error) { showError(error); }
-    finally { $("#upload").disabled = false; }
+    } catch (error) { uploadStatus.textContent = error.message; }
+    finally {
+        uploading = false;
+        $("#upload-progress").hidden = true;
+        $("#upload").disabled = $("#batch").disabled = event.submitter.disabled = false;
+    }
 };
 $("#batch").onclick = async () => {
     clearTimeout(W.timer);
@@ -629,12 +950,14 @@ $("#batch").onclick = async () => {
     S.id = null;
     S.data = null;
     $("#batch").textContent = W.batch ? "Upload workspace" : "Batch review";
-    $("#upload").hidden = W.batch;
+    $("#upload-zone").hidden = W.batch;
+    $("#layout-model").hidden = W.batch;
+    $("#dlpptx").hidden = W.batch;
     $("#ocr-controls").hidden = W.batch;
     $("#ocr-timeline").hidden = true;
+    $("#processing-stages").hidden = true;
     $("#page-tools").hidden = true;
     $("#rot").disabled = true;
-    $("#nv-dash").hidden = !W.batch;
     $("#dlxml").disabled = !W.batch;
     $("#reproc").disabled = !W.batch;
     $("#viewer").textContent = "";
@@ -759,15 +1082,16 @@ $("#settings").onclick = () => {
             "Qwen " + health.qwen.model + " · " + readiness(health.qwen) + (health.qwen.enabled ? "" : " · review disabled"),
             !health.ocr_enabled ? "OCR disabled" : health.ocr_backend === "tesseract" ?
                 "Tesseract languages " + health.ocr_languages.join(", ") : "Default OCR " + ocrModeName(health.ocr_backend),
-            "Docling " + (health.docling?.ready ? "ready" : "unavailable"),
+            "Docling " + (health.docling?.ready ? "configured" : "unavailable"),
         ].join(" · ");
     }).catch(error => { $("#settings-info").textContent = error.message; });
 };
 $("#startup-button").onclick = () => {
-    $("#settings").click();
+    loadStartupStatus();
     $("#startup-status").scrollIntoView({block: "nearest"});
 };
 loadStartupStatus();
+loadLayoutHealth();
 $("#profile-form").onsubmit = async event => {
     event.preventDefault();
     try {
@@ -778,7 +1102,6 @@ $("#profile-form").onsubmit = async event => {
         $("#profile-status").textContent = "Saved";
     } catch (error) { $("#profile-status").textContent = error.message; }
 };
-$("#nv-dash").hidden = true;
 workspaceFetch("/api/profile").then(profile => { $("#reviewer-label").textContent = profile.name; }).catch(showError);
 loadWorkspace().then(async () => {
     const prefs = await workspaceFetch("/api/ocr-settings");

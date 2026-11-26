@@ -4,8 +4,8 @@ Turns scanned / corrupted / multilingual PDFs into structured XML and proof-read
 against the source document. CPU-first and local. Qwen3 4B provides advisory review of document-version changes.
 
 ```
-PDF -> PyMuPDF diagnostics -> native text or GLM-OCR (PaddleOCR fallback)
-    -> Docling or local layout reconstruction -> validated document IR -> XML (<name>.xml)
+PDF -> PyMuPDF diagnostics and rendering -> DocLayout-YOLO -> native text or selected OCR
+    -> layout association -> Docling and local reconstruction -> validated XML and PowerPoint exports
 PDF versions -> deterministic changes -> Qwen3 review -> verified PowerPoint version sync
 PPTX + source PDF -> evidence alignment -> targeted, formatting-preserving fixes -> corrected deck + change report
 ```
@@ -20,10 +20,13 @@ pip install -r project\requirements.txt
 ollama pull glm-ocr:q8_0
 ollama pull qwen3:4b
 
-python project\main.py --input phase-1\input --output phase-1\output
+python project\main.py --phase 1
+# For an advanced team, use the same workflow with --phase 2.
 ```
 
 See [local OCR setup](docs/LOCAL_OCR.md) for PaddleOCR, Docling, Tesseract verification, and runtime controls.
+See the [AI Catalyst compliance checklist](COMPLIANCE_CHECKLIST.md) for official requirements and current evidence.
+See [local sample verification](docs/LOCAL_SAMPLE_VERIFICATION.md) for measured DocLayout inference, XML comparison and PPTX reference results.
 
 * **Input**: any folder containing `*.pdf` (and optionally `*.pptx`). Nothing is hard-coded to file names.
 * **Output** (`--output`): each export has its own `<pdf stem>/<export id>/` folder containing
@@ -33,6 +36,7 @@ See [local OCR setup](docs/LOCAL_OCR.md) for PaddleOCR, Docling, Tesseract verif
   Complete exports also contain an extracted-and-verified ZIP with linked assets, correction evidence, and AI execution details.
 * **Run folder** (`<output>/../docsync_run`): audit log (`audit.jsonl`), manifest, per-document IR, change reports
   (`changes/*.json`), `run_report.json`, `report.html`, OCR cache. It is separate so the output folder stays clean.
+* `--phase 1|2` selects the matching input, output and run folders by default. Explicit `--input`, `--output` and `--work-dir` override them.
 * Useful flags: `--workers N`, `--profile brief|sample|example`, `--no-ocr`, `--skip-pptx`, `--time-budget SECONDS`, `--config file.json`
   (see `project/config/default.example.json`).
 
@@ -76,8 +80,12 @@ If you originally started the backend directly from a terminal, close it from th
 launcher. `-NoBrowser` suppresses the browser for smoke tests. Advanced commands can supply `-Port`, `-Config`,
 `-Storage` and `-Logs`. Use separate storage and logs when testing a second workspace.
 
-Upload one PDF at a time. The local workspace stores each original and its processing attempts under `storage/`
-and shows job progress, native-text diagnostics, OCR attempts, layout status, and pages flagged for review.
+Select **Phase 1** or **Phase 2**, drop a PDF or choose **Browse PDF**, choose the OCR mode, then select **Process PDF**.
+The workspace archives the source PDF in the selected `phase-N/input/` folder and stores processing attempts under
+`storage/`. After a successful run it automatically validates and publishes a versioned XML bundle under the matching
+`phase-N/output/` folder. The document details show the output location, DocLayout page status, detection count and
+measured detection time. **Zoning** overlays DocLayout-YOLO detections on the original page. Select a region to inspect its page,
+confidence, coordinates and associated text. **Reading order** shows the reconstructed block sequence.
 Choose **OCR engine** before upload or reprocessing. **GLM-OCR**, **PaddleOCR-VL (Ollama)** and
 **PaddleOCR (Python)** are strict choices. **Automatic** defaults to GLM-OCR, then PaddleOCR-VL, then
 PaddleOCR Python. It advances after an unavailable engine, a timeout, rejected output, or a result
@@ -110,12 +118,16 @@ benchmark. Run this from the project directory to publish a local comparison in 
 ```
 
 Review a page in Source PDF, Text, Zoning or Reading Order, correct the title or language,
-then approve and export XML. Locate an extracted title in the PDF when the source region is available. Use Changes
+then select **Submit review**. Export XML or choose **Export PPTX** for one image-backed slide per source page with
+the reconstructed text in the speaker notes. **Re-edit** saves your updates as a draft. Locate an extracted title in
+the PDF when the source region is available. Use **PowerPoint & changes**
 to compare two versions and apply matching text updates to an uploaded PowerPoint deck.
 Use **Repair and export XML + PowerPoint** in Changes to proofread a deck against the selected PDF,
 or **Apply version changes and export** to synchronize an existing deck. The result shows both file names,
 sizes, validation outcomes, and the output folder. Download either file separately or both with the
 XML's figure assets in a ZIP. The standalone approved XML download remains available in Document review.
+Uploaded proofreading decks are archived in the selected phase input folder; corrected PPTX exports are versioned in
+that phase's output folder. Deck repair is an explicit action so the user can choose which supplied deck to proofread.
 Uploads and export history are scoped to the browser's local workspace cookie. The first browser to open the
 workspace owns Batch review and adopts documents that predate browser ownership.
 The settings dialog shows local model availability and saves a reviewer name for attribution.
@@ -128,7 +140,49 @@ The project can discover a portable Tesseract under `.venv/tesseract/` on Window
 `TESSERACT_CMD` or the pipeline settings file. Settings in the workspace show the available language packs.
 Qwen3 review is enabled by default. Set `DOCUSYNC_OLLAMA_ENABLED=false` to disable it.
 
+### DocLayout-YOLO runtime
+
+The default checkpoint is `models/layout/universal/DocLayout-YOLO-universal.pt`. DocuSync starts the local
+`.venv-doclayout` interpreter and loads the vendored repository from `third_party/DocLayout-YOLO-release-v2`.
+The worker loads the checkpoint once per document and runs inference on CPU. Docling continues to use its
+separate runtime. **Ready** means the layout model passed initialization. A failed detection is listed for the
+affected page and the extraction retains its native or OCR content for review.
+
+From the repository root, install Git LFS and retrieve the checkpoint and pinned model code. Then create the
+local DocLayout environment from the `hackathon-project` directory.
+
+```powershell
+git lfs install
+git lfs pull
+git submodule update --init -- hackathon-project/third_party/DocLayout-YOLO-release-v2
+Set-Location hackathon-project
+py -3.11 -m venv .venv-doclayout
+.\.venv-doclayout\Scripts\python.exe -m pip install .\third_party\DocLayout-YOLO-release-v2
+```
+
+Set `DOCUSYNC_DOCLAYOUT_PYTHON`, `DOCUSYNC_DOCLAYOUT_REPO` or `DOCUSYNC_DOCLAYOUT_CHECKPOINT` to override their
+paths. Relative paths resolve from the hackathon project root. Set `DOCUSYNC_DOCLAYOUT_ENABLED=false` to use the
+existing reconstruction path without YOLO. `DOCUSYNC_DOCLAYOUT_IMAGE_SIZE`, `DOCUSYNC_DOCLAYOUT_CONFIDENCE` and
+`DOCUSYNC_DOCLAYOUT_TIMEOUT_S` control inference. Zoning supports PDF page rotation. Links to reconstructed
+text require corroborated geometry and may be unavailable for skewed or rotated text.
+
+If Ollama is already running, start the review workspace directly from the hackathon project root:
+
+```powershell
+.\.venv\Scripts\python.exe -B project\ui\server.py --port 8765
+```
+
 ## Tests and benchmark
+
+Run the browser integration check against a running workspace with Chrome and Playwright installed. Supply an
+existing single-page digital PDF and a multi-page PDF with an OCR-required page and visible text. If the
+published sample paths are unavailable, use equivalent local files.
+
+```powershell
+.\.venv\Scripts\python.exe -B project\tests\live_doclayout_check.py `
+  --single storage\b2959a82b78e486fbe06c4e91cc6bef5\source.pdf `
+  --scan storage\ocr-selector-live\sample-en.pdf
+```
 
 ### AI execution audit
 
@@ -223,3 +277,7 @@ project/            main.py, requirements.txt, config/ ingestion/ diagnostics/ o
 phase-1/ phase-2/   input/ and output/ (inputs are git-ignored: the data is confidential)
 docs/               traceability matrix, benchmarks
 ```
+
+Competition inputs are confidential. Keep this repository private and share only with authorized reviewers. The
+`.gitignore` intentionally excludes local inputs and generated output bundles; when preparing the official submission,
+stage only the required, generated examples in the designated private team repository after confirming access and privacy.

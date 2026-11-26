@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -37,10 +38,12 @@ def pdf_with_text(text: str) -> bytes:
         return document.tobytes()
 
 
-def upload(client, data: bytes, filename="report.pdf", previous=None):
+def upload(client, data: bytes, filename="report.pdf", previous=None, phase="1"):
     form = {"pdf": (io.BytesIO(data), filename)}
     if previous:
         form["previous_id"] = previous
+    if phase != "1":
+        form["phase"] = phase
     response = client.post("/api/documents", data=form)
     assert response.status_code == 202, response.data
     return "/api/documents/" + response.json["id"]
@@ -118,6 +121,7 @@ def test_ocr_source_review_blocks_ppt_until_approved(workspace, monkeypatch):
 
     reviewed = client.patch(url + "/metadata", json={"title": "Reviewed source", "lang": "en", "approved": True})
     assert reviewed.status_code == 200 and reviewed.json["approved"]
+    assert reviewed.json["phase_export"]["status"] == "xml_only"
     xml = client.get(url + "/xml?download=1&format=xml")
     assert xml.status_code == 200 and "_draft" not in xml.headers["Content-Disposition"]
 
@@ -173,7 +177,12 @@ def test_upload_review_export_compare_and_sync(workspace):
     assert doc["pages"][0]["source"] == "native"
     execution = client.get(new + "/execution-audit")
     assert execution.status_code == 200
-    assert execution.json["model_usage_report.json"]["requests"] == 0
+    usage = execution.json["model_usage_report.json"]
+    assert usage["requests"] == usage["responses"] == usage["used_responses"] == 1
+    layout_execution = next(item for item in execution.json["ai_execution_report.json"]["executions"]
+                            if item["provider"] == "doclayout-yolo")
+    assert "USED_DOWNSTREAM" in layout_execution["statuses"]
+    assert layout_execution["downstream"][0]["consumer"] == "layout_regions"
     trace = execution.json["processing_trace.json"]
     assert trace["pages"][0]["method"] == "NATIVE_EXTRACTION_USED"
     assert trace["xml_sha256"] and any(block["xml_corresponds_to_ir"] for block in trace["blocks"])
@@ -269,6 +278,7 @@ def test_upload_review_export_compare_and_sync(workspace):
     assert response.status_code == 201, response.data
     result = response.json
     assert result["mode"] == "source" and result["status"] == "completed" and result["presentation_status"] == "updated"
+    assert (root / "phase-1" / "input" / "summary.pptx").is_file()
     assert result["output_folder"] != report["output_folder"]
     assert len(result["applied"]) == 1 and result["applied"][0]["source"]["page"] == 1
     evidence = client.get(f'{new}/presentations/{result["id"]}/evidence.xml')
@@ -340,3 +350,110 @@ def test_reports_encrypted_pdf_without_exposing_local_paths(workspace):
     assert document["jobs"][0]["status"] == "failed"
     assert "requires a password" in document["jobs"][0]["error"]
     assert client.get(url + "/page/1.png").status_code == 422
+
+
+def test_phase_two_upload_is_archived_and_xml_is_published_to_phase_two(workspace):
+    client, root = workspace
+    url = upload(client, pdf_with_text("Phase two reports an audited total of 260 units."),
+                 "phase-two.pdf", phase="2")
+    document = wait_for_attempt(client, url)
+
+    assert document["phase"] == "2"
+    assert document["jobs"][0]["status"] == "completed", document["jobs"][0]
+    assert (root / "phase-2" / "input" / "phase-two.pdf").is_file()
+    export = document["submission_export"]
+    assert export["phase"] == "2" and export["outputs"]["xml"]
+    output = Path(export["outputs"]["xml"]["path"])
+    assert output.is_file()
+    assert output.is_relative_to(root / "phase-2" / "output")
+    assert etree.parse(str(output)).getroot().tag == "document"
+
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    from pptx.util import Inches
+
+    slide.shapes.add_textbox(Inches(1), Inches(1), Inches(8), Inches(1)).text = (
+        "Phase two reports an audited total of 250 units.")
+    contents = io.BytesIO()
+    deck.save(contents)
+    contents.seek(0)
+    response = client.post(url + "/presentations", data={
+        "mode": "source", "pptx": (contents, "phase-two.pptx")
+    })
+    assert response.status_code == 201, response.data
+    assert (root / "phase-2" / "input" / "phase-two.pptx").is_file()
+    deck_output = Path(response.json["outputs"]["pptx"]["path"])
+    assert deck_output.is_file() and deck_output.is_relative_to(root / "phase-2" / "output")
+    corrected = Presentation(deck_output)
+    assert "260 units" in corrected.slides[0].shapes[0].text
+
+
+def test_standalone_pptx_job_needs_no_pdf_and_downloads_corrected_output(workspace, monkeypatch):
+    client, root = workspace
+    invalid = app.test_client().post("/api/presentations", data={
+        "phase": "2", "pptx": (io.BytesIO(b"PKgarbage"), "invalid.pptx")
+    })
+    assert invalid.status_code == 400 and "valid PowerPoint" in invalid.json["error"]
+    ws = app.extensions["workspace"]
+    prior_enabled = ws.settings.ollama_enabled
+    ws.settings.ollama_enabled = True
+    thread_worker = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(ws, "worker", thread_worker)
+    try:
+        from powerpoint import proofread
+
+        monkeypatch.setattr(proofread, "model_info", lambda _settings: {
+            "ready": True, "model": "qwen3:test", "digest": "fixture-digest"})
+
+        def response(_url, _endpoint, payload, _timeout):
+            passages = json.loads(payload["messages"][1]["content"])
+            item, = passages
+            return {"model": payload["model"], "done": True, "done_reason": "stop",
+                    "message": {"content": json.dumps({"corrections": [{
+                        "paragraph_id": item["paragraph_id"],
+                        "corrected_text": "The document contains a clear sentence.",
+                        "issue": "spelling", "confidence": 0.99,
+                    }]})}}
+
+        monkeypatch.setattr(proofread.ollama, "request_json", response)
+        deck = Presentation()
+        slide = deck.slides.add_slide(deck.slide_layouts[6])
+        paragraph = slide.shapes.add_textbox(914400, 914400, 8000000, 900000).text_frame.paragraphs[0]
+        run = paragraph.add_run()
+        run.text = "The documet contains a clear sentnce."
+        run.font.bold = True
+        contents = io.BytesIO()
+        deck.save(contents)
+        contents.seek(0)
+
+        fresh = app.test_client()
+        submitted = fresh.post("/api/presentations", data={
+            "phase": "2", "pptx": (contents, "standalone.pptx")
+        })
+        assert submitted.status_code == 202, submitted.json
+        job_id = submitted.json["id"]
+        assert submitted.json["phase"] == "2"
+        assert not fresh.get("/api/history").json["pdfs"]
+        assert (root / "phase-2" / "input" / "standalone.pptx").is_file()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = fresh.get(f"/api/presentations/{job_id}").json
+            if job["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.02)
+        assert job["status"] == "completed", job
+        assert job["result"]["validation"]["valid"]
+        assert len(job["result"]["applied"]) == 1
+        download = fresh.get(job["result"]["download_url"])
+        assert download.status_code == 200
+        corrected = Presentation(io.BytesIO(download.data))
+        assert corrected.slides[0].shapes[0].text == "The document contains a clear sentence."
+        assert corrected.slides[0].shapes[0].text_frame.paragraphs[0].runs[0].font.bold
+        assert fresh.get("/api/history").json["presentations"][0]["id"] == job_id
+        unauthorized = app.test_client()
+        unauthorized.set_cookie("docusync_workspace", "0" * 64)
+        assert unauthorized.get(f"/api/presentations/{job_id}").status_code == 404
+    finally:
+        thread_worker.shutdown(wait=True)
+        ws.settings.ollama_enabled = prior_enabled

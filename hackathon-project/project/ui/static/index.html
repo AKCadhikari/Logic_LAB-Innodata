@@ -1,22 +1,141 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DocuSync AI | Document workspace</title>
+<link rel="icon" type="image/png" href="/static/docu-sync-icon.png">
 <link rel="stylesheet" href="/static/workspace.css"></head><body>
-<div class="app">
+<div class="app home-view">
 <header class="top">
- <div class="logo"><span class="brand-mark" aria-hidden="true"></span><h1>DocuSync AI</h1></div>
- <button class="btn" id="settings"><span id="reviewer-label"></span>Settings</button>
- <button class="btn" id="startup-button">AI startup</button>
+ <h1 class="logo"><img class="logo-image" src="/static/docu-sync-logo.webp" alt="DocuSync AI"></h1>
+ <nav class="main-nav" aria-label="Main navigation">
+  <button class="on" id="nav-home" aria-current="page">Home</button>
+  <button id="nav-history">Processing History</button>
+  <button id="settings">Settings</button>
+ </nav>
+ <span id="reviewer-label" hidden></span>
 </header>
-<aside class="library" aria-labelledby="library-heading">
+<main id="home" class="home-screen" aria-labelledby="home-heading">
+ <div class="home-intro">
+  <p class="eyebrow">Intelligent Document Processing</p>
+  <h2 id="home-heading">Select a document to get started</h2>
+  <p>Process a PDF or proofread a PowerPoint. You can do either one on its own.</p>
+  <p id="layout-home-status" class="layout-ready" role="status">Layout Detection: Checking...</p>
+ </div>
+ <div class="upload-grid">
+  <article class="upload-card" aria-labelledby="pdf-card-heading">
+   <div class="upload-card-heading"><span class="file-type">PDF</span><div>
+    <h2 id="pdf-card-heading">PDF Document Processing</h2>
+    <p>Upload a PDF to extract its content and generate structured XML.</p>
+   </div></div>
+   <input id="home-pdf-file" class="visually-hidden-input" type="file" accept=".pdf,application/pdf">
+   <div id="pdf-drop" class="drop-zone" role="button" tabindex="0" aria-label="Choose or drop a PDF file">
+    <span class="drop-icon" aria-hidden="true">↑</span>
+    <strong>Drop your PDF here</strong><span>or <u>browse files</u></span><small>PDF files only · up to 64 MB</small>
+   </div>
+   <div id="pdf-selection" class="file-selection" hidden>
+    <div><strong id="pdf-selected-name"></strong><small id="pdf-selected-size"></small></div>
+    <div class="selection-actions"><button type="button" class="btn" id="pdf-replace">Replace</button>
+     <button type="button" class="btn" id="pdf-remove">Remove</button></div>
+   </div>
+   <details class="processing-settings">
+    <summary>Processing settings</summary>
+    <div class="settings-grid">
+     <label for="phase-select">Submission phase</label>
+     <select id="phase-select"><option value="1">Phase 1</option><option value="2">Phase 2</option></select>
+     <label for="home-ocr-engine">OCR engine</label>
+     <select id="home-ocr-engine"><option value="glm-ocr">GLM-OCR (default)</option><option value="paddleocr">PaddleOCR</option></select>
+    </div>
+   </details>
+   <progress id="home-pdf-progress" class="upload-progress" aria-label="PDF processing progress" hidden></progress>
+   <p id="home-pdf-status" class="upload-status" role="status" aria-live="polite"></p>
+   <div id="pdf-result" class="job-result" hidden></div>
+   <button id="pdf-process" class="btn pri process-button" disabled>Process PDF</button>
+   <details class="advanced-details"><summary>Advanced details</summary>
+    <p>DocLayout-YOLO detects page structure. OCR reads the text inside those regions.</p>
+    <p id="pdf-advanced-status" role="status">Checking model status...</p>
+   </details>
+  </article>
+
+  <article class="upload-card" aria-labelledby="pptx-card-heading">
+   <div class="upload-card-heading"><span class="file-type pptx-type">PPTX</span><div>
+    <h2 id="pptx-card-heading">PowerPoint Proofreading</h2>
+    <p>Upload a PowerPoint presentation to detect and correct writing errors.</p>
+   </div></div>
+   <input id="home-pptx-file" class="visually-hidden-input" type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation">
+   <div id="pptx-drop" class="drop-zone" role="button" tabindex="0" aria-label="Choose or drop a PowerPoint file">
+    <span class="drop-icon" aria-hidden="true">↑</span>
+    <strong>Drop your PowerPoint here</strong><span>or <u>browse files</u></span><small>PPTX files only · up to 64 MB</small>
+   </div>
+   <div id="pptx-selection" class="file-selection" hidden>
+    <div><strong id="pptx-selected-name"></strong><small id="pptx-selected-size"></small></div>
+    <div class="selection-actions"><button type="button" class="btn" id="pptx-replace">Replace</button>
+     <button type="button" class="btn" id="pptx-remove">Remove</button></div>
+   </div>
+   <details class="processing-settings">
+    <summary>Processing settings</summary>
+    <div class="settings-grid">
+     <label for="pptx-phase-select">Submission phase</label>
+     <select id="pptx-phase-select"><option value="1">Phase 1</option><option value="2">Phase 2</option></select>
+    </div>
+   </details>
+   <progress id="home-pptx-progress" class="upload-progress" aria-label="PowerPoint proofreading progress" hidden></progress>
+   <p id="home-pptx-status" class="upload-status" role="status" aria-live="polite"></p>
+   <div id="pptx-result" class="job-result" hidden></div>
+   <button id="pptx-process" class="btn pri process-button" disabled>Proofread PowerPoint</button>
+   <details class="advanced-details"><summary>Advanced details</summary>
+    <p>Writing suggestions use the configured local Qwen proofreading model. Changes to numbers and units are held for review.</p>
+   </details>
+  </article>
+ </div>
+ <details id="pdf-inspection" class="advanced-details" hidden>
+  <summary>PDF inspection</summary>
+  <div class="tabs" id="pdf-inspection-tabs" role="group" aria-label="PDF inspection mode">
+   <button type="button" class="tab on" data-inspection="zoning" aria-pressed="true">Zoning / Layout</button>
+   <button type="button" class="tab" data-inspection="order" aria-pressed="false">Reading Order</button>
+   <button type="button" class="tab" data-inspection="meta" aria-pressed="false">Metadata</button>
+  </div>
+  <p id="pdf-inspection-status" role="status">Process the PDF first to see inspection results.</p>
+  <div class="pdf-inspection-page" id="pdf-inspection-page" hidden>
+   <label for="pdf-inspection-page-select">Inspect page</label>
+   <select id="pdf-inspection-page-select"></select>
+  </div>
+  <div id="pdf-inspection-results" hidden></div>
+ </details>
+</main>
+<section id="history" class="history-screen" aria-labelledby="history-heading" hidden>
+ <header class="history-heading"><div><p class="eyebrow">Your local workspace</p><h2 id="history-heading">Processing History</h2></div>
+  <div><button class="btn" id="open-batch">Batch review</button><button class="btn" id="history-refresh">Refresh</button></div></header>
+ <div id="history-list" class="history-list"><p class="empty">Loading processing history...</p></div>
+</section>
+<aside class="library" id="library" aria-labelledby="library-heading" hidden>
  <h2 id="library-heading">Documents</h2>
+ <div id="upload-zone">
+  <span>Drop one PDF here</span>
+  <button class="btn pri upload" id="upload">Browse PDF</button>
+  <label for="review-phase-select">Submission phase</label>
+  <select id="review-phase-select"><option value="1">Phase 1</option><option value="2">Phase 2</option></select>
+  <input id="pdf-file" type="file" accept=".pdf,application/pdf" hidden>
+  <form id="pdf-submit" hidden>
+   <span id="file-details"></span>
+   <button class="btn pri" type="submit">Process PDF</button>
+  </form>
+  <progress id="upload-progress" aria-label="PDF upload progress" hidden></progress>
+  <small id="upload-status" role="status"></small>
+ </div>
+ <section id="layout-model" aria-label="Layout detection model">
+  <small>Layout detection</small>
+  <strong>DocLayout-YOLO <span>Primary</span></strong>
+  <p id="layout-model-status" role="status">Checking model…</p>
+  <button type="button" class="btn" id="layout-check" hidden>Retry model check</button>
+ </section>
  <div id="ocr-controls">
   <label for="ocr-engine">OCR engine</label>
   <select id="ocr-engine">
-   <option value="automatic">Automatic</option>
+   <option value="automatic">Automatic (recommended)</option>
    <option value="glm-ocr">GLM-OCR</option>
-   <option value="paddleocr-vl">PaddleOCR-VL (Ollama)</option>
-   <option value="paddleocr">PaddleOCR (Python)</option>
+   <option value="paddleocr">PaddleOCR</option>
+   <optgroup label="Advanced OCR options">
+    <option value="paddleocr-vl">PaddleOCR-VL (Ollama)</option>
+   </optgroup>
   </select>
   <label class="ocr-remember"><input id="ocr-remember" type="checkbox" checked> Remember engine</label>
   <div id="ocr-paddle-row">
@@ -24,24 +143,20 @@
    <select id="ocr-language"><option value="">Detect / configured default</option></select>
   </div>
   <small id="ocr-choice-status" aria-live="polite"></small>
+  <small>DocLayout-YOLO identifies document structures. GLM-OCR and PaddleOCR recognize the text inside those structures.</small>
  </div>
- <button class="btn pri upload" id="upload"><span aria-hidden="true">+</span> Upload PDF</button>
- <input id="pdf-file" type="file" accept=".pdf,application/pdf" hidden>
  <label for="docsel">Current document</label>
  <select id="docsel" aria-label="Document" disabled><option>No documents yet</option></select>
- <nav class="library-nav" aria-label="Workspace">
-  <button id="nv-review" class="on" aria-pressed="true">Document review</button>
-  <button id="nv-dash" aria-pressed="false" hidden>Run summary</button>
-  <button id="batch">Batch review</button>
- </nav>
+ <button id="batch" class="visually-hidden-input" type="button">Batch review</button>
 </aside>
-<main id="main" class="desk">
+<main id="main" class="desk" hidden>
  <section class="pane" id="viewpane" aria-labelledby="preview-heading">
   <header class="pane-heading">
    <h2 id="preview-heading">Document preview</h2>
    <div class="chip" id="runchip" role="status"></div>
   </header>
   <div id="ocr-timeline" class="legend" aria-live="polite" hidden></div>
+  <ol id="processing-stages" aria-label="Processing stages" hidden></ol>
   <div class="tabs" id="vtabs" role="group" aria-label="Preview mode">
    <button class="tab on" data-t="pdf" aria-pressed="true">Source PDF</button>
    <button class="tab" data-t="text" aria-pressed="false">Extracted text</button>
@@ -59,6 +174,7 @@
     <button class="btn" id="zoom-in" aria-label="Zoom in">+</button>
    </div>
    <button class="btn" id="rot" title="Rotate source view" disabled>Rotate</button>
+   <button class="btn" id="fullscreen" aria-pressed="false">Fullscreen</button>
   </footer>
  </section>
  <aside class="side" aria-labelledby="review-heading">
@@ -66,12 +182,13 @@
   <div class="tabs" id="stabs" role="group" aria-label="Review panel">
    <button class="tab on" data-t="meta" aria-pressed="true">Metadata</button>
    <button class="tab" data-t="xml" aria-pressed="false">XML preview</button>
-   <button class="tab" data-t="deck" aria-pressed="false">Changes</button>
+   <button class="tab" data-t="deck" aria-pressed="false">PowerPoint &amp; changes</button>
   </div>
   <div class="sbar" id="sbar"></div>
   <div class="sbody" id="sbody"></div>
   <footer class="review-actions">
    <button class="btn" id="reproc" disabled>Reprocess</button>
+   <button class="btn" id="dlpptx" disabled>Export PPTX</button>
    <button class="btn pri" id="dlxml" disabled>Export XML</button>
   </footer>
  </aside>
@@ -80,18 +197,21 @@
 </div>
 <dialog id="settings-dialog" aria-labelledby="settings-heading">
  <div class="dialog-heading"><h2 id="settings-heading">Workspace settings</h2><form method="dialog"><button class="btn">Close</button></form></div>
- <p id="settings-info"></p>
- <section id="ocr-dashboard" aria-labelledby="ocr-dashboard-heading">
-  <h3 id="ocr-dashboard-heading">OCR health and comparison</h3>
-  <div id="ocr-dashboard-results" aria-live="polite"></div>
- </section>
- <section id="startup-status" aria-labelledby="startup-heading">
-  <div class="dialog-heading"><h3 id="startup-heading">AI execution audit</h3>
-   <button type="button" class="btn" id="startup-retry">Retry model startup</button></div>
-  <div id="startup-details" aria-live="polite"></div>
-  <div id="document-ai-audit" aria-live="polite"></div>
-  <p>Startup checks use synthetic input. Document OCR and Qwen review are reported in the workspace and export audit.</p>
- </section>
+ <p>Choose the OCR engine in PDF processing settings. Layout detection runs automatically.</p>
+ <details class="advanced-details settings-advanced"><summary>System diagnostics</summary>
+  <p id="settings-info"></p>
+  <section id="ocr-dashboard" aria-labelledby="ocr-dashboard-heading">
+   <h3 id="ocr-dashboard-heading">OCR health and comparison</h3>
+   <div id="ocr-dashboard-results" aria-live="polite"></div>
+  </section>
+  <section id="startup-status" aria-labelledby="startup-heading">
+   <div class="dialog-heading"><h3 id="startup-heading">AI execution audit</h3>
+    <button type="button" class="btn" id="startup-retry">Retry model startup</button>
+    <button type="button" class="btn" id="startup-button">Refresh model details</button></div>
+   <div id="startup-details" aria-live="polite"></div>
+   <div id="document-ai-audit" aria-live="polite"></div>
+  </section>
+ </details>
  <form id="profile-form" class="workspace-tools"><label for="profile-name">Local reviewer</label>
   <input id="profile-name" maxlength="80" required><button class="btn pri">Save profile</button><output id="profile-status"></output>
  </form></dialog>
@@ -158,8 +278,11 @@ function dash(){const s=S.sum;$("#dash").innerHTML=`<div class="grid">${[["Docum
  <table><tr><th>Document<th>Pages<th>OCR<th>Lang<th>Seconds<th>Confidence*<th>Deck changes<th>Validation</tr>${s.docs.map(d=>`<tr class="c" data-id="${esc(d.id)}"><td>${esc(d.file)}<td>${d.pages}<td>${d.ocr_pages}<td>${esc(d.lang)}<td>${d.seconds}<td>${badge(d.conf==null?null:d.conf*100)}<td>${d.changes}<td>${d.ok?(d.issues.length?esc(d.issues.join("; ")):"OK"):"FAILED"}</tr>`).join("")}</table>
  <p style="color:var(--mute)">*Confidence values are heuristics, not measured accuracy.</p>`;
  $("#dash").querySelectorAll("tr.c").forEach(r=>r.onclick=()=>{nav("review");open(r.dataset.id)})}
-function nav(v){$("#main").hidden=v!=="review";$("#dash").hidden=v!=="dash";setActive($("#nv-review"),v==="review");setActive($("#nv-dash"),v==="dash")}
-$("#nv-review").onclick=()=>nav("review");$("#nv-dash").onclick=()=>nav("dash");
+function nav(v){
+ if(window.showAppScreen)return window.showAppScreen(v==="dash"?"batch":"review");
+ $("#home").hidden=true;$("#history").hidden=true;$("#library").hidden=false;
+ $("#main").hidden=v!=="review";$("#dash").hidden=v!=="dash";
+}
 $("#docsel").onchange=e=>W.batch?open(e.target.value).catch(showError):selectWorkspace(e.target.value).catch(showError);
 $("#vtabs").onclick=e=>{const t=e.target.dataset.t;if(!t)return;setView(t)};
 $("#stabs").onclick=e=>{const t=e.target.dataset.t;if(!t)return;S.stab=t;document.querySelectorAll("#stabs .tab").forEach(b=>setActive(b,b.dataset.t===t));if(W.batch)side();else reviewPanel().catch(showError)};
@@ -169,4 +292,4 @@ $("#reproc").onclick=async()=>{if(!S.id)return;const b=$("#reproc");b.disabled=t
  if(W.batch){await J(`/api/reprocess/${encodeURIComponent(S.id)}`,{method:"POST"});await open(S.id)}
  else{await workspaceFetch(docUrl()+"/retry",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(ocrJobOptions())});await selectWorkspace(S.id)}
  }catch(e){showError(e)}finally{if(W.batch)b.disabled=false}};
-</script><script src="/static/workspace.js"></script></body></html>
+</script><script src="/static/workspace.js"></script><script src="/static/home.js"></script></body></html>

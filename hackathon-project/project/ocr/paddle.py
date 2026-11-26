@@ -108,13 +108,15 @@ class PaddleOCR:
             self.process.close()
             self.process = None
 
-    def recognise(self, page, language: str, dpi: int) -> Recognition:
+    def recognise(self, page, language: str, dpi: int, status_update=None) -> Recognition:
         status = readiness(self.settings, language)
         if not status["ready"]:
             raise RecognitionError(status["reason"], unavailable=True)
         weights = models(self.settings, language)
         deadline = time.monotonic() + max(1, self.settings.paddle_ocr_timeout_s)
         if self.process is None or self.weights != weights:
+            if status_update:
+                status_update("loading")
             self.close()
             context = multiprocessing.get_context("spawn")
             self.connection, child = context.Pipe()
@@ -143,6 +145,8 @@ class PaddleOCR:
                 except psutil.Error:
                     pass
                 event["request_status"] = "sent"
+            if status_update:
+                status_update("requesting")
             self.connection.send(image)
             payload = self._receive(deadline)
             audit.response(event, payload, executed=True)

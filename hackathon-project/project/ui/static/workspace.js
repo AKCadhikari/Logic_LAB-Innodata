@@ -276,7 +276,7 @@ async function reviewPanel() {
     }
     const page = data.pages[W.page - 1], title = data.title;
     panel.innerHTML = '<form id="metadata-form" class="workspace-tools">' +
-        '<div class="fld"><label for="review-title">Title ' + (title?.confidence != null ? badge(title.confidence) : '') + '</label>' +
+        '<div class="fld"><label for="review-title">Title ' + (title ? badge(title.confidence) : '') + '</label>' +
         '<input id="review-title" maxlength="1000" value="' + esc(title?.value) + '">' +
         (title?.bbox ? '<button type="button" class="btn" id="locate">Locate title source</button>' : '') + '</div>' +
         '<div class="fld"><label for="review-lang">Document language</label>' +

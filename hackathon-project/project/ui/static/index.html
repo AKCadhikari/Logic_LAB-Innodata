@@ -80,7 +80,8 @@ const $=s=>document.querySelector(s),esc=s=>String(s??"").replace(/[&<>"]/g,c=>(
 const COL={h:"#674b88",p:"#21746a",li:"#426c31",ul:"#426c31",ol:"#426c31",table:"#9a5424",figure:"#a44465",header:"#535f70",footer:"#535f70",aside:"#85621d",hr:"#606d66"};
 const col=t=>COL[t]||COL[t[0]]||COL.p;
 const S={docs:[],id:null,data:null,vtab:"pdf",stab:"meta",rot:0,filter:"all",xml:"",changes:[],cfilter:"all"};
-const badge=c=>{const v=Math.round(c);return `<span class="b ${v>=97?"g":v>=80?"a":"r"}">${v}%</span>`};
+const percent=c=>typeof c==="number"&&Number.isFinite(c)?Math.round(c*100)+"%":"N/A";
+const badge=c=>{if(typeof c!=="number"||!Number.isFinite(c))return '<span class="b n" title="Confidence unavailable">N/A</span>';const v=Math.round(c);return `<span class="b ${v>=97?"g":v>=80?"a":"r"}">${v}%</span>`};
 async function J(u,o){const r=await fetch(u,o);if(!r.ok)throw new Error(r.status);return r.json()}
 async function init(){
  const sm=await J("/api/summary");S.sum=sm;S.docs=sm.docs;
@@ -105,7 +106,7 @@ function viewer(){
    return S.vtab==="zoning"?`<rect x="${x0}" y="${y0}" width="${x1-x0}" height="${y1-y0}" fill="${c}" fill-opacity=".16" stroke="${c}" stroke-width="1.4"><title>${esc(b.tag+(b.kind?" / "+b.kind:"")+" - "+b.text.slice(0,80))}</title></rect>`
    :`<circle cx="${x0}" cy="${y0+8}" r="9" fill="${c}"/><text x="${x0}" y="${y0+11.5}" font-size="10" text-anchor="middle" fill="#fff" font-family="sans-serif">${k+1}</text>`}).join("")+`</svg>`}
   const src=`/api/doc/${encodeURIComponent(d.id)}/page/${p.n}.png?dpi=110&rot=${S.vtab==="pdf"?S.rot:0}`;
-  return `<div class="pl"><span>Page ${p.n}</span><span>${p.source==="ocr"?"OCR":"native text"} &middot; ${badge((p.diag.confidence||0)*100)}</span></div><div class="page"><img loading="lazy" src="${src}" alt="page ${p.n}">${ov}</div>`}).join("")}
+  return `<div class="pl"><span>Page ${p.n}</span><span>${p.source==="ocr"?"OCR":"native text"} &middot; ${badge(p.diag.confidence==null?null:p.diag.confidence*100)}</span></div><div class="page"><img loading="lazy" src="${src}" alt="page ${p.n}">${ov}</div>`}).join("")}
 function side(){
  const d=S.data;if(!d)return;const sb=$("#sbar"),bd=$("#sbody");
  $("#dlxml").style.display=S.stab==="xml"||S.stab==="meta"?"":"none";
@@ -124,17 +125,17 @@ function side(){
  // metadata
  const q=d.quality||{},v=d.validation||{};const cnt={};d.pages.forEach(p=>cnt[p.source]=(cnt[p.source]||0)+1);
  const blocks=[];d.pages.forEach(p=>p.blocks.forEach(b=>{if(b.text||b.n_items)blocks.push({...b,page:p.n,c:b.source==="ocr"?b.conf:b.conf})}));
- const lim=S.filter==="all"?101:+S.filter;const shown=blocks.filter(b=>b.conf<lim);
+ const shown=S.filter==="all"?blocks:blocks.filter(b=>Number.isFinite(b.conf)&&b.conf<+S.filter);
  sb.innerHTML=`<select id="mf" style="min-width:0"><option value="all">Confidence: All</option><option value="98" ${S.filter==="98"?"selected":""}>Below 98%</option><option value="80" ${S.filter==="80"?"selected":""}>Below 80%</option></select><span style="color:var(--mute)">${shown.length+7} fields</span>`;
- const F=(l,val,c)=>`<div class="fld"><label>${l}${c!=null?badge(c):""}</label><div class="val ${c!=null&&c<80?"low":""}">${esc(val)||"&nbsp;"}</div></div>`;
+ const F=(l,val,c,unknown=false)=>`<div class="fld"><label>${l}${c!=null?badge(c):unknown?badge(null):""}</label><div class="val ${c!=null&&c<80?"low":""}">${esc(val)||"&nbsp;"}</div></div>`;
  bd.innerHTML=`<div class="sec">Document</div>`+F("Title",d.title,null)+F("Language",d.lang,null)+F("Pages",`${d.pages.length}  (${Object.entries(cnt).map(([k,n])=>`${n} ${k}`).join(", ")})`,null)
-  +F("Mean page confidence (heuristic)",Math.round((q.mean_page_confidence||0)*100)+"%",null)+F("XML validation",v.well_formed?(v.issues&&v.issues.length?v.issues.join("; "):"well-formed, no issues"):"failed",null)
+  +F("Mean page confidence (heuristic)",percent(q.mean_page_confidence),null)+F("XML validation",v.well_formed?(v.issues&&v.issues.length?v.issues.join("; "):"well-formed, no issues"):"failed",null)
   +F("Structure",`${v.headings||0} headings, ${v.tables||0} tables, ${v.figures||0} figures`,null)+F("Processing time",(d.seconds||"-")+" s",null)
-  +`<div class="sec">Page diagnostics</div>`+d.pages.map(p=>`<div class="card"><div class="h"><b>Page ${p.n}</b><span>${esc(p.diag.health||"")} &rarr; ${esc(p.source)}</span>${badge((p.diag.confidence||0)*100)}</div><div style="color:var(--mute);font-size:12px">${esc((p.diag.reasons||[]).join("; ")||"native text layer looks healthy")}${p.diag.ocr?` &middot; OCR ${p.diag.ocr.conf}% (${esc(p.diag.ocr.langs)})`:""}</div></div>`).join("")
-  +`<div class="sec">Content blocks</div>`+shown.slice(0,300).map(b=>F(`p${b.page} &middot; ${b.tag}${b.kind?" / "+esc(b.kind):""}`,b.text||`${b.n_items} items`,b.conf)).join("");
+  +`<div class="sec">Page diagnostics</div>`+d.pages.map(p=>`<div class="card"><div class="h"><b>Page ${p.n}</b><span>${esc(p.diag.health||"")} &rarr; ${esc(p.source)}</span>${badge(p.diag.confidence==null?null:p.diag.confidence*100)}</div><div style="color:var(--mute);font-size:12px">${esc((p.diag.reasons||[]).join("; ")||"native text layer looks healthy")}${p.diag.ocr?` &middot; OCR ${p.diag.ocr.conf}% (${esc(p.diag.ocr.langs)})`:""}</div></div>`).join("")
+  +`<div class="sec">Content blocks</div>`+shown.slice(0,300).map(b=>F(`p${b.page} &middot; ${b.tag}${b.kind?" / "+esc(b.kind):""}`,b.text||`${b.n_items} items`,b.conf,b.source==="ocr"&&b.conf==null)).join("");
  $("#mf").onchange=e=>{S.filter=e.target.value;side()}}
-function dash(){const s=S.sum;$("#dash").innerHTML=`<div class="grid">${[["Documents",s.documents],["Pages",s.pages],["OCR pages",s.ocr_pages],["Mean confidence*",Math.round((s.mean_confidence||0)*100)+"%"],["Wall time",(s.wall_seconds||0)+" s"]].map(k=>`<div class="kpi"><span style="color:var(--mute)">${k[0]}</span><b>${k[1]}</b></div>`).join("")}</div>
- <table><tr><th>Document<th>Pages<th>OCR<th>Lang<th>Seconds<th>Confidence*<th>Deck changes<th>Validation</tr>${s.docs.map(d=>`<tr class="c" data-id="${esc(d.id)}"><td>${esc(d.file)}<td>${d.pages}<td>${d.ocr_pages}<td>${esc(d.lang)}<td>${d.seconds}<td>${badge((d.conf||0)*100)}<td>${d.changes}<td>${d.ok?(d.issues.length?esc(d.issues.join("; ")):"OK"):"FAILED"}</tr>`).join("")}</table>
+function dash(){const s=S.sum;$("#dash").innerHTML=`<div class="grid">${[["Documents",s.documents],["Pages",s.pages],["OCR pages",s.ocr_pages],["Mean confidence*",percent(s.mean_confidence)],["Wall time",(s.wall_seconds||0)+" s"]].map(k=>`<div class="kpi"><span style="color:var(--mute)">${k[0]}</span><b>${k[1]}</b></div>`).join("")}</div>
+ <table><tr><th>Document<th>Pages<th>OCR<th>Lang<th>Seconds<th>Confidence*<th>Deck changes<th>Validation</tr>${s.docs.map(d=>`<tr class="c" data-id="${esc(d.id)}"><td>${esc(d.file)}<td>${d.pages}<td>${d.ocr_pages}<td>${esc(d.lang)}<td>${d.seconds}<td>${badge(d.conf==null?null:d.conf*100)}<td>${d.changes}<td>${d.ok?(d.issues.length?esc(d.issues.join("; ")):"OK"):"FAILED"}</tr>`).join("")}</table>
  <p style="color:var(--mute)">*Confidence values are heuristics, not measured accuracy.</p>`;
  $("#dash").querySelectorAll("tr.c").forEach(r=>r.onclick=()=>{nav("review");open(r.dataset.id)})}
 function nav(v){$("#main").hidden=v!=="review";$("#dash").hidden=v!=="dash";setActive($("#nv-review"),v==="review");setActive($("#nv-dash"),v==="dash")}

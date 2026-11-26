@@ -222,6 +222,7 @@ select, .fld input, .workspace-tools input {
 .b.g, .ins { background: #e0eee5; color: #205646; }
 .b.a { background: #f6e9c9; color: #69460d; }
 .b.r, .del { background: #f7e1e3; color: var(--danger); }
+.b.n { background: #e9e9e1; color: var(--mute); }
 pre.xml { margin: 0; padding: 10px; border-radius: 6px; background: #f2f0e6; font: 12px/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .xml .t { color: var(--accent); }
 .xml .a { color: #754821; }

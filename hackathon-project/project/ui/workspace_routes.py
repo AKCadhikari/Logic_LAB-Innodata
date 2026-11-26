@@ -17,7 +17,8 @@ from werkzeug.exceptions import HTTPException
 
 from comparison.differ import compare_ir
 from layout.model import DocIR
-from reporting.exports import materialize_assets, output_stem, publish_document, save_original_images, write_zip
+from reporting.exports import (materialize_assets, output_stem, publish_document, requires_manual_review,
+                               save_original_images, write_zip)
 from ui.workspace import Workspace, now
 from utils.textutil import xml_safe
 from xml_engine.assets import inspect_assets, validate_archive
@@ -384,7 +385,8 @@ def xml(document_id: str):
         return fail("XML validation failed. " + " ".join(validation["issues"]), 422)
     if download:
         completeness = compare_content(data, ir, locations, sample=profile == WORKSPACE_XML_PROFILE)
-        draft = bool(extraction.get("multilingual_validation", {}).get("blocking_pages") or completeness["issues"])
+        extraction = {**extraction, "source_review_approved": info["approved"]}
+        draft = requires_manual_review(extraction, completeness)
         filename = f"{stem}{'_draft' if draft else ''}.xml"
         if download_format == "zip" or (download_format == "auto" and assets):
             try:
@@ -551,6 +553,7 @@ def sync_deck(document_id: str):
     ir, settings, extraction = extracted
     if ir.meta.get("ocr_metadata_version") != 2:
         return fail("Retry PDF extraction to generate current language and source validation before exporting.", 409)
+    extraction = {**extraction, "source_review_approved": info["approved"]}
     settings = replace(settings, schema_profile=WORKSPACE_XML_PROFILE)
     previous = None
     if mode == "version":
@@ -582,7 +585,8 @@ def sync_deck(document_id: str):
     try:
         summary = publish_document(ws.output / stem / export_id.hex, stem, ir, settings, extraction,
                                    {"id": str(export_id), "document_id": document_id, "filename": filename,
-                                    "previous_id": previous_id, "mode": mode, "created": now()}, transform)
+                                    "previous_id": previous_id, "mode": mode, "created": now(),
+                                    "source_review_approved": info["approved"]}, transform)
     except OSError:
         current_app.logger.exception("Could not finalize the export report")
         return fail("The output folder could not be written. Check its location and available space.", 500)

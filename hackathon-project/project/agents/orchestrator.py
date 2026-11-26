@@ -10,7 +10,7 @@ from diagnostics.page_diagnostics import analyze_page
 from diagnostics.profile import decorate_document, quality_gate
 from ingestion.discover import describe
 from layout.model import PageIR, DocIR, Line, Block, Span, ir_from_dict
-from layout import native, reconstruct, kinds, figures, ocr_geometry, equations
+from layout import native, reconstruct, kinds, figures, ocr_geometry, equations, pseudocode
 from layout.docling_adapter import DoclingLayout
 from ocr import engine as ocr
 from ocr.router import OCRRouter
@@ -306,6 +306,8 @@ def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             if geometry := ocr_geometry.position_page(doc[pg.n - 1], pg, settings, geometry_packs):
                 pg.diag["layout"]["coordinate_alignment"] = geometry
                 audit.event("layout", "ocr_coordinate_alignment", page=pg.n, **geometry)
+            reconstruct.place_visuals(pg)
+            pseudocode.preserve_pseudocode(pg)
             equations.recognise_formulas(doc[pg.n - 1], pg, settings)
             pg.layout_engine = pg.diag["layout"]["engine"]
             if regions and settings.audit_private_responses:
@@ -365,6 +367,8 @@ def _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, p
                 page.diag.setdefault("layout", {})["coordinate_alignment"] = geometry
                 result["page_log"][page.n - 1]["layout"] = page.diag["layout"]
                 audit.event("layout", "ocr_coordinate_alignment", page=page.n, **geometry)
+            reconstruct.place_visuals(page)
+            pseudocode.preserve_pseudocode(page)
             equations.recognise_formulas(source[page.n - 1], page, settings)
             progress(page.n, len(saved_ir.pages))
     processing({"stage": "validation"})

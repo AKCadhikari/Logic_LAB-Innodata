@@ -6,7 +6,7 @@ import numpy as np
 import pymupdf
 
 from layout.model import Block
-from ocr import glm
+from ocr import engine, glm
 from ocr.recognition import RecognitionError
 from utils import execution_audit as audit
 from utils.textutil import xml_safe
@@ -118,6 +118,29 @@ def tex_tokens(text):
         not depth and xml_safe(text) == text and "\ufffd" not in text) else []
 
 
+def recognise_equation_number(source, crop, settings):
+    """Read the isolated printed label in two rasterizations."""
+    results = []
+    start = audit.cursor()
+    with audit.details(purpose="equation_number", ocr_engine="tesseract", page=source.number + 1):
+        try:
+            for dpi in (375, 525):
+                raster = source.get_pixmap(dpi=dpi, clip=crop, colorspace=pymupdf.csGRAY, alpha=False)
+                pixels = np.frombuffer(raster.samples, dtype=np.uint8).reshape(raster.height, raster.width)
+                lines = engine.ocr_image(pixels, "eng", dpi, settings, psm=7, character_whitelist="0123456789.()",
+                                         input_reference=f"pdf/page/{source.number + 1}/equation-number/{dpi}dpi")
+                match = re.fullmatch(r"\((\d+(?:\.\d+)*)\)", "".join(line.text for line in lines).replace(" ", ""))
+                results.append(match[1] if match else "")
+        except (OSError, RuntimeError, ValueError, engine.subprocess.TimeoutExpired):
+            pass
+    ids = audit.ids_since(start)
+    if len(results) == 2 and results[0] and results[0] == results[1]:
+        audit.mark(ids, validation="passed")
+        return results[0], ids
+    audit.mark(ids, validation="review_required")
+    return "", ids
+
+
 def recognise_formulas(source, page, settings):
     blocks = [block for block in page.blocks if block.kind == "equation"]
     if not blocks:
@@ -154,6 +177,13 @@ def recognise_formulas(source, page, settings):
                 block.source_reference["formula"] = record
                 rows.append(record)
                 continue
+            if not number and read_box.x1 < box.x1 and engine.find_tesseract(settings):
+                label = pymupdf.Rect(read_box.x1, box.y0, box.x1, box.y1)
+                number, number_ids = recognise_equation_number(source, label, settings)
+                record["number_execution_ids"] = number_ids
+                if number:
+                    block.marker = record["number"] = number
+                    record["number_source"] = "two_renders_of_printed_label"
             results = []
             tags = []
             execution_ids = []

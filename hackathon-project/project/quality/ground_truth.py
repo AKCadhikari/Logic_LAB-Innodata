@@ -227,14 +227,19 @@ def verified_sample(pdf, source_path: Path, original: Path, reference_path: Path
     expected_lines = algorithm["lines"]
     code = xml.find(".//p[@kind='pseudocode']")
     lines = (code.text or "").splitlines() if code is not None else []
-    expected_count, output_count = Counter(expected_lines), Counter(lines)
+    if code is not None and (caption := code.getprevious()) is not None and caption.get("kind") == "algorithm_caption":
+        lines.insert(0, "".join(caption.itertext()))
+    expected_tokens = [code_tokens(value) for value in expected_lines]
+    output_tokens = [code_tokens(value) for value in lines]
+    expected_count, output_count = Counter(expected_tokens), Counter(output_tokens)
     pseudocode = {"page": algorithm["page"], "bbox": algorithm["box"], "lines": [
         {"line": index, "source": value, "output": lines[index - 1] if index <= len(lines) else None,
-         "status": "CORRECT" if index <= len(lines) and value == lines[index - 1]
-         else "MISSING" if value not in lines else "INCORRECT"}
+         "status": ("MISSING" if index > len(lines) else
+                    "CORRECT" if expected_tokens[index - 1] == output_tokens[index - 1] else "INCORRECT")}
         for index, value in enumerate(expected_lines, 1)],
-        "extra": [{"content": value, "count": count, "status": "EXTRA"} for value, count in (output_count - expected_count).items()],
-        "ordered_match": expected_lines == lines}
+        "extra": [{"content": lines[output_tokens.index(value)], "count": count, "status": "EXTRA"}
+                  for value, count in (output_count - expected_count).items()],
+        "ordered_match": expected_tokens == output_tokens, "comparison_ignores_indentation": True}
     crops = []
     with ZipFile(actual_path) as actual_package:
         editable = [*editable_lines(actual_package, actual_deck, 26, 4), *editable_lines(actual_package, actual_deck, 27, 4)]

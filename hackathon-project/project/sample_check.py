@@ -15,6 +15,7 @@ from config.settings import Settings
 from powerpoint.amend import amend_deck
 from quality.conformance import compare_pptx, compare_xml
 from quality.evaluate import compare as score_xml
+from quality.xml_alignment import evaluate_xml
 from quality.evaluate_pptx import score as score_deck
 from quality.ground_truth import compare_ground_truth
 from quality.slide_preview import compare_slides, renderer
@@ -75,6 +76,7 @@ def main() -> int:
             return 2
     xml_report = compare_xml(args.expected_xml, actual_xml)
     xml_report["text_metrics"] = score_xml(actual_xml, args.expected_xml)
+    write_report(out / "xml-alignment.json", evaluate_xml(args.expected_xml.read_bytes(), actual_xml.read_bytes()))
     write_report(out / "xml-comparison.json", xml_report)
     summary["xml"] = {"match": xml_report["match"], "diff_counts": xml_report["diff_counts"],
                       "text_metrics": xml_report["text_metrics"]}

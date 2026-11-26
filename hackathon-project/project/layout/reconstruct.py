@@ -390,11 +390,31 @@ def _lines_to_blocks(lines: list[Line], ctx, settings, body: float, hsizes: list
     return grouped
 
 
+def place_visuals(page):
+    """Place adjunct PDF figures using positioned text without changing text order."""
+    if page.ocr_engine not in {"glm-ocr", "paddleocr-vl"}:
+        return
+    blocks = page.blocks
+    for visual in [b for b in blocks if b.tag in {"figure", "table"} and b.bbox and b.source == "native"]:
+        x0, y0, x1, y1 = visual.bbox
+        relevant = [(i, block) for i, block in enumerate(blocks)
+                    if block.bbox and block is not visual and block.tag not in {"header", "footer", "figure", "table"}
+                    and min(x1, block.bbox[2]) - max(x0, block.bbox[0]) > .3 * min(x1 - x0, block.bbox[2] - block.bbox[0])]
+        after = [i for i, block in relevant if block.bbox[1] >= y1 - 2]
+        before = [i for i, block in relevant if block.bbox[3] <= y0 + 2]
+        if after and (not before or max(before) < min(after)):
+            old = blocks.index(visual)
+            dest = min(after)
+            blocks.pop(old)
+            blocks.insert(dest - (old < dest), visual)
+    page.blocks = _attach_captions(blocks)
+
+
 def _attach_captions(blocks: list[Block]) -> list[Block]:
     used = set()
-    objs = [i for i, b in enumerate(blocks) if b.tag in ("table", "figure")]
+    objs = [i for i, b in enumerate(blocks) if b.tag in ("table", "figure") and b.bbox]
     for i, b in enumerate(blocks):
-        if not (b.tag == "p" and b.kind == "figure_caption"):
+        if not (b.tag == "p" and b.bbox and (b.kind == "figure_caption" or CAPTION_RE.match(b.text))):
             continue
         is_tab = bool(TABLE_WORDS.match(b.text))
         best, bd = None, 1e9
@@ -409,10 +429,14 @@ def _attach_captions(blocks: list[Block]) -> list[Block]:
             ov = min(ox1, bx1) - max(ox0, bx0)
             if ov < 0.3 * min(ox1 - ox0, bx1 - bx0):
                 continue
-            d = min(abs(by0 - oy1), abs(oy0 - by1))
+            gaps = [gap for gap in (by0 - oy1, oy0 - by1) if gap >= -2]
+            if not gaps:
+                continue
+            d = min(abs(gap) for gap in gaps)
             if d < bd and d < 70:
                 best, bd = j, d
         if best is not None:
             blocks[best].caption = b.text
+            blocks[best].source_reference.update(caption_bbox=b.bbox, caption_size=b.size)
             used.add(best); b.cls = "__consumed__"
     return [b for b in blocks if b.cls != "__consumed__"]

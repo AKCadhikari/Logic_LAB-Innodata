@@ -146,6 +146,9 @@ def compare_content(data, document, locations, *, sample=False):
                     added=dict(actual_values - expected_values))
         if expected != represented:
             problem(page, path, "content_changed", expected=expected, actual=represented)
+        elif by_path[path].get("kind") == "pseudocode" and (
+                len(entries) != 1 or "".join(by_path[path].itertext()) != entries[0][1]):
+            problem(page, path, "pseudocode_whitespace_changed")
         else:
             totals.update(f"{kind}_represented" for _, _, kind in entries)
 

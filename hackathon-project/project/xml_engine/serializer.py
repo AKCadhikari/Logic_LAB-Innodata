@@ -180,7 +180,12 @@ def _emit(parent, b: Block, cfg, doc_lang, settings, nodes, image_source=None):
         el = etree.SubElement(parent, t, **_attrs(b, cfg, doc_lang, settings)); _inline(el, b.text, b.spans)
     else:
         tag = t if t in BLOCK_TAGS else "p"
-        el = etree.SubElement(parent, tag, **_attrs(b, cfg, doc_lang, settings)); _inline(el, b.text, b.spans)
+        el = etree.SubElement(parent, tag, **_attrs(b, cfg, doc_lang, settings))
+        if b.kind == "pseudocode":
+            el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            el.text = xml_safe(b.text)
+        else:
+            _inline(el, b.text, b.spans)
     if nodes is not None:
         nodes[id(b)] = el
 

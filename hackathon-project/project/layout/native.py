@@ -92,7 +92,11 @@ def extract_lines(page) -> list[Line]:
                             italic=tot > 0 and ital_chars / tot > 0.6, spans=spans, source="native", rtl=is_rtl(text),
                             original_text="".join(span["text"] for span in ln["spans"]),
                             writing_mode="vertical" if ln.get("wmode") == 1 else "horizontal"))
-    return out
+    distinct = {}
+    for line in out:
+        key = (line.text, tuple(round(value * 2) for value in line.bbox))
+        distinct.setdefault(key, line)
+    return list(distinct.values())
 
 
 def recover_running_text(page, recognized: list[Line], band: float) -> list[Line]:

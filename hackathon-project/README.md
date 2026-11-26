@@ -176,6 +176,16 @@ from the organizer's reference XML. The supplied archive has no organizer XSD. T
 \`manifest.json\` and reports for schema validation, source-linked completeness, formatting, and image assets.
 The completeness report compares XML with the intermediate representation and records source uncertainty by page.
 The formatting report distinguishes measured PDF font and geometry data from heuristics.
+
+### Compare an engineering reference
+
+Generate a sample-profile export with `project/main.py --input <folder> --output <output> --profile sample`.
+Then run `project/xml_quality_check.py --reference <expected.xml> --actual <generated.xml> --report <report.json>`.
+Add `--baseline <prior.xml>` for a before-and-after report. The comparison aligns text within each page and
+allows adjacent split or merged blocks. It reports schema and page checks, CER and WER, semantics, reading order,
+headings, references, captions, and equation labels. Use `--equation-evidence <review.json>` to supply
+source-reviewed printed labels when the reference stores equations solely as images. Reference files are used by
+the evaluator. PDF conversion and PowerPoint repair use the source PDF and shared intermediate representation.
 All documents use the same page-level profiling, OCR, layout, and presentation-matching pipeline. The earlier
 source-region map remains available to the offline sample comparison command as historical ground truth.
 

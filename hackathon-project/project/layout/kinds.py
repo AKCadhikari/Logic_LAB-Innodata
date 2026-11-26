@@ -16,6 +16,7 @@ NUMBERED_HEADING = re.compile(r"^(\d+(?:\.\d+){0,4})\s+[A-Z][^\n.:!?]{2,90}$")
 CLASSIFICATION = R(r"^\W*(mathematics subject classification|computing classification system)\b")
 ADDRESS = R(r"\b(street|road|avenue|postal code|p\.?\s*o\.?\s+box)\b")
 AUTHOR_SEPARATOR = R(r",|\s+(?:and|und|et)\s+|،")
+AFTER_REFERENCES = R(r"^(?:appendix|appendices|annex|supplementary (?:material|information))(?:\s+[A-Z0-9]+)?[.:]?$")
 
 
 def metadata_kind(text):
@@ -71,7 +72,8 @@ def assign_kinds(doc: DocIR) -> None:
             if b.tag in ("header", "footer"):
                 b.kind = metadata_kind(b.text) or "publication_metadata"; continue
             if b.tag in ("table", "figure"):
-                b.kind = "figure_caption" if False else b.kind
+                continue
+            if b.kind in {"equation", "pseudocode", "algorithm_caption"}:
                 continue
             txt = b.text or " ".join(c.text for c in b.children)
             number = NUMBERED_HEADING.fullmatch(txt.strip()) if b.tag == "p" and b.source == "ocr" else None
@@ -79,6 +81,8 @@ def assign_kinds(doc: DocIR) -> None:
                 b.tag = f"h{2 + number[1].count('.')}"
             if b.tag == "p" and len(txt.split()) <= 3 and (REFS.match(txt) or ACK.match(txt)) and len(txt) < 32:
                 b.tag = "h2"
+            elif section == "references" and AFTER_REFERENCES.fullmatch(txt.strip()):
+                b.tag, section = "h2", "body"
             elif section == "references" and not (REFS.match(txt) or ACK.match(txt)):
                 if b.tag in ("p", "h2", "h3", "h4", "h5", "h6", "ul", "ol"):
                     b.kind = "reference_entry"
@@ -114,7 +118,7 @@ def assign_kinds(doc: DocIR) -> None:
                 elif ACK.match(head): section = "acknowledgment"; b.kind = "acknowledgment"
                 else: section = "body"
                 continue
-            if b.tag == "aside" or b.kind == "equation":
+            if b.tag == "aside":
                 continue
             items = b.children if b.tag in ("ul", "ol") else [b]
             for it in items:

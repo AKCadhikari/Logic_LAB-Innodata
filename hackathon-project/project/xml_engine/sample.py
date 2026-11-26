@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 from lxml import etree
@@ -170,7 +171,10 @@ def sample_xml(doc: DocIR, settings, locations: dict | None, assets: dict | None
                 if assets is not None and block.bbox:
                     assets[source] = (page.n, tuple(float(value) for value in geometry(block.bbox).values()))
                 if block.caption:
-                    caption = etree.SubElement(figure, "figcaption", **text_attributes(block, page, "FC", "figure_caption"))
+                    caption_block = replace(block, bbox=block.source_reference.get("caption_bbox"),
+                                            size=block.source_reference.get("caption_size", 0), line_boxes=[])
+                    caption = etree.SubElement(figure, "figcaption",
+                                               **text_attributes(caption_block, page, "FC", "figure_caption"))
                     text_node(caption, block.caption, [])
                     nodes[(id(block), "caption")] = caption
                 nodes[id(block)] = figure

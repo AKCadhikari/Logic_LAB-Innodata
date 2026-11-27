@@ -21,7 +21,7 @@ from config.settings import Settings
 from layout.model import DocIR, ir_from_dict
 from powerpoint.package import RunEdit, open_deck, parse, write_deck
 from powerpoint.evidence import EvidenceIndex
-from powerpoint import compatibility, formulas, structured
+from powerpoint import bullets, compatibility, equation_images, formulas, structured
 from utils.logs import AuditLog
 from utils import execution_audit as model_audit
 from utils.textutil import xml_script_digits
@@ -45,12 +45,13 @@ class Unit:
     kind: str = ""
     bbox: tuple | None = None
     language: str = ""
+    section: tuple = ()
 
     def reference(self) -> dict:
         return {"page": self.page, "xml_node": self.node, "text": self.text,
                 "extraction": self.source, "ocr_engine": self.engine or None,
                 "block_id": self.block_id, "execution_ids": list(self.execution_ids),
-                "kind": self.kind, "bbox": self.bbox,
+                "kind": self.kind, "bbox": self.bbox, "section": list(self.section),
                 "extraction_confidence": None if self.engine in {"glm-ocr", "paddleocr-vl"} else self.confidence}
 
 
@@ -87,31 +88,37 @@ def build_evidence(ir: DocIR, settings: Settings) -> list[Unit]:
     locations = {}
     to_xml(ir, settings, locations)
     evidence = []
+    headings = {}
     for page in ir.pages:
         if page.diag.get("error"):
             continue
         for block in page.blocks:
             if block.tag in ("header", "footer") or block.kind == "equation":
                 continue
-            entries = [(id(block), block.text, block.conf)]
+            if re.fullmatch(r"h[1-6]", block.tag) and block.text.strip():
+                level = int(block.tag[1])
+                headings = {depth: text for depth, text in headings.items() if depth < level}
+                headings[level] = block.text
+            entries = [(id(block), block.text, block)]
             if block.tag in ("ul", "ol"):
-                entries = [(id(item), item.text, item.conf) for item in block.children]
+                entries = [(id(item), item.text, item) for item in block.children]
             elif block.tag in ("table", "figure"):
-                entries = [((id(block), "caption"), block.caption, block.conf)]
-            for key, content, confidence in entries:
+                entries = [((id(block), "caption"), block.caption, block)]
+            for key, content, item in entries:
                 text = " ".join(content.split())
                 if block.kind == "byline":
                     text = xml_script_digits(text)
                 if len(text) < 6 or key not in locations:
                     continue
-                reliable = (block.source == "native" and block.validation_status != "manual_review_required"
+                reliable = (item.source == "native" and item.validation_status != "manual_review_required"
                             and page.diag.get("health") == "healthy"
-                            and not page.diag.get("error") and confidence >= 80)
-                evidence.append(Unit(text, ws_lower(text), page.n, locations[key], confidence,
-                                     block.source, reliable, block.ocr_engine, block.source_reference.get("block_id"),
-                                     tuple(block.source_reference.get("execution_ids", [])), block.kind,
-                                     block.source_reference.get("caption_bbox", block.bbox) if isinstance(key, tuple) else block.bbox,
-                                     block.lang))
+                            and not page.requires_review and item.conf >= 80)
+                evidence.append(Unit(text, ws_lower(text), page.n, locations[key], item.conf,
+                                     item.source, reliable, item.ocr_engine or block.ocr_engine,
+                                     item.source_reference.get("block_id") or block.source_reference.get("block_id"),
+                                     tuple(item.source_reference.get("execution_ids", block.source_reference.get("execution_ids", []))),
+                                     item.kind, block.source_reference.get("caption_bbox", item.bbox) if isinstance(key, tuple) else item.bbox,
+                                     item.lang or block.lang, tuple(headings.values())))
     return evidence
 
 
@@ -468,6 +475,7 @@ def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Setting
 def _repair_presentation(ir, source, target, settings, progress=None):
     from powerpoint.numbering import numbering
     from powerpoint.validation import verify_presentation
+    from quality.slide_preview import renderer
 
     if source.resolve() == target.resolve() or (target.exists() and target.samefile(source)):
         raise ValueError("Choose an output path different from the original presentation.")
@@ -481,8 +489,21 @@ def _repair_presentation(ir, source, target, settings, progress=None):
     equation_sources = list(formulas.equation_evidence(ir))
     tables = list(structured.source_tables(ir))
     links = structured.source_links(ir)
+    lists = list(bullets.source_lists(ir))
+    media = {}
+    native_pictures = bool(settings.amend_render_validation and renderer())
+    if any(label for label, _, _ in equation_sources) and settings.ocr_enabled:
+        with ZipFile(source) as original:
+            used_media = equation_images.media_usage(original)
+    else:
+        used_media = None
     inventory = Counter()
-    for number, slide in enumerate(deck.slides, 1):
+    slide_shapes = [list(iter_shapes(slide.shapes)) for slide in deck.slides]
+    direct_pages = [retrieval.corroborated_pages("\n".join(shape.text for shape in shapes
+                  if shape.has_text_frame and not is_furniture(shape)), set()) for shapes in slide_shapes]
+    alignment_summary = []
+    for number, (slide, shapes) in enumerate(zip(deck.slides, slide_shapes), 1):
+        part = str(slide.part.partname).lstrip("/")
         if progress:
             progress("pptx_analysis", number, len(deck.slides))
         hints = source_pages(slide, len(ir.pages)) if settings.amend_use_notes else set()
@@ -490,7 +511,12 @@ def _repair_presentation(ir, source, target, settings, progress=None):
             hints = retrieval.corroborated_pages(slide.notes_slide.notes_text_frame.text, hints)
             inventory["notes"] += 1
         context = slide.shapes.title.text if slide.shapes.title is not None else ""
-        for shape in iter_shapes(slide.shapes):
+        anchors = direct_pages[number - 1]
+        neighbors = set().union(*direct_pages[max(0, number - 2):number + 1]) - anchors
+        alignment_summary.append({"slide": number, "title": context, "visible_anchor_pages": sorted(anchors),
+                                  "speaker_note_pages": sorted(hints), "neighbor_pages": sorted(neighbors)})
+        hints |= anchors or neighbors
+        for shape in shapes:
             inventory["shapes_inspected"] += 1
             inventory[str(shape.shape_type)] += 1
             if shape.has_table:
@@ -498,6 +524,21 @@ def _repair_presentation(ir, source, target, settings, progress=None):
                 inspect_table(ir, slide, number, shape, tables, records, edits)
                 continue
             if not shape.has_text_frame:
+                image = equation_images.inspect(slide, shape, equation_sources, ir.path, used_media, settings) if used_media else None
+                if image:
+                    locator, old, new, proof, replacement, reason = image
+                    if replacement:
+                        key, value = replacement
+                        media[key] = value
+                        locator["media_part"] = key
+                        locator["picture_frame"] = tuple(getattr(shape, name) for name in ("left", "top", "width", "height"))
+                        if native_pictures and (native := equation_images.editable_picture(slide, shape, proof)):
+                            patch, tokens = native
+                            edits[part].append(patch)
+                            locator.update(editable_picture_position=patch.position,
+                                           editable_picture_part=part, native_equation_generated=True)
+                            proof["expected_tokens"] = tokens
+                    records.append(object_record(ir, number, locator, old, new, "equation_image", proof, bool(replacement), reason))
                 if shape.has_chart:
                     try:
                         findings = structured.chart_discrepancies(shape.chart, tables)
@@ -576,7 +617,14 @@ def _repair_presentation(ir, source, target, settings, progress=None):
                            if row.get("page") == best.unit.page and row["validation"] == "passed"]
                     record["source"]["execution_ids"].extend(ids)
                 records.append(record)
-        part = str(slide.part.partname).lstrip("/")
+            restored = bullets.missing_bullet(slide, shape, lists, edits.get(part, ()))
+            if restored:
+                index, proof, patch = restored
+                edits[part].append(patch)
+                locator = {"shape_id": shape.shape_id, "shape": shape.name, "paragraph": index,
+                           "original_bullets": [paragraph.text for paragraph in shape.text_frame.paragraphs]}
+                records.append(object_record(ir, number, locator, "", proof["text"], "missing_bullet", proof, True,
+                                             "A unique source list supplies the item between matching bullet anchors."))
         with ZipFile(source) as original:
             root = parse(original.read(part))
             inventory["office_math_nodes"] += sum(1 for _ in root.iter(qn("m:oMath")))
@@ -639,29 +687,48 @@ def _repair_presentation(ir, source, target, settings, progress=None):
     target.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix="pptx-repair-", dir=target.parent) as temp:
         staged = Path(temp) / target.name
-        write_deck(source, staged, edits, len(deck.slides))
-        validation = verify_presentation(source, staged, edits, records, settings.amend_render_validation)
-        failed = {record["slide"] for record in records if record["validation_status"] == "visible_write_back_failure"}
+        write_deck(source, staged, edits, len(deck.slides), media=media)
+        validation = verify_presentation(source, staged, edits, records, settings.amend_render_validation, media=media)
+        iterations = 1
         render_first = validation["render"]
+        fallback = [row for row in records if row.get("native_equation_generated") and
+                    row.get("render_verification") != "confirmed"]
+        if fallback:
+            for row in fallback:
+                part = row["editable_picture_part"]
+                position = row["editable_picture_position"]
+                edits[part] = [patch for patch in edits[part] if patch.position != position]
+                row["native_equation_generated"] = False
+                row["editable_picture_validation"] = "native_layout_unconfirmed"
+            write_deck(source, staged, edits, len(deck.slides), media=media)
+            validation = verify_presentation(source, staged, edits, records, settings.amend_render_validation, media=media)
+            iterations += 1
+        failed = {record["slide"] for record in records if record["validation_status"] == "visible_write_back_failure"}
         if failed:
             rejected = {str(deck.slides[number - 1].part.partname).lstrip("/") for number in failed}
             rejected.update(record["relationship_part"] for record in records if record["slide"] in failed
                             and record["action"] == "applied" and record["change_type"] == "hyperlink")
+            for record in records:
+                if record["slide"] in failed and record.get("media_part"):
+                    media.pop(record["media_part"], None)
             edits = {part: ops for part, ops in edits.items() if part not in rejected}
             for record in records:
                 if record["slide"] in failed and record["action"] == "applied":
                     record.update(action="review", render_verification="reverted",
                                   proposed_content=record["new"], recommended_action="human review",
                                   reason="The rendered slide failed its visible-content check. The slide edits were reverted.")
-            write_deck(source, staged, edits, len(deck.slides))
-            validation = verify_presentation(source, staged, edits, records, settings.amend_render_validation)
+            write_deck(source, staged, edits, len(deck.slides), media=media)
+            validation = verify_presentation(source, staged, edits, records, settings.amend_render_validation, media=media)
+            iterations += 1
+        if iterations > 1:
             validation["first_render"] = render_first
-        validation["iterations"] = 2 if failed else 1
+        validation["iterations"] = iterations
         staged.replace(target)
     return {"slides": len(deck.slides), "applied": [r for r in records if r["action"] == "applied"],
             "review": [r for r in records if r["action"] == "review"], "records": records,
-            "slide_numbering": numbering(open_deck(target)), "status": "updated" if edits else "unchanged",
-            "object_inventory": dict(inventory), "presentation_validation": validation, "advisory": advisory}
+            "slide_numbering": numbering(open_deck(target)), "status": "updated" if edits or media else "unchanged",
+            "object_inventory": dict(inventory), "presentation_validation": validation, "advisory": advisory,
+            "slide_source_alignment": alignment_summary}
 
 
 def inspect_table(ir, slide, number, shape, sources, records, edits):
@@ -736,4 +803,5 @@ def amend_deck(pdf: Path, pptx: Path, target: Path, work: Path, settings: Settin
     return {**result, "records": report["records"], "slide_numbering": report["slide_numbering"],
             "verification_executions": report["verification_executions"],
             "object_inventory": report["object_inventory"], "presentation_validation": report["presentation_validation"],
-            "qa_artifacts": report["qa_artifacts"], "advisory": report["advisory"]}
+            "qa_artifacts": report["qa_artifacts"], "advisory": report["advisory"],
+            "slide_source_alignment": report["slide_source_alignment"]}

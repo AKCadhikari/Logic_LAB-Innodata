@@ -13,7 +13,7 @@ from utils.textutil import xml_safe
 
 
 TAG = re.compile(r"\\tag\s*\{(\d+(?:\.\d+)*)\}\s*$")
-NUMBER = re.compile(r"(?:\\tag\s*\{(\d+(?:\.\d+)*)\}|\((\d+(?:\.\d+)*)\))\s*$")
+NUMBER = re.compile(r"(?:\\tag\s*\{(\d+(?:\.\d+)*)\}|(?<!\S)\((\d+(?:\.\d+)*)\))\s*$")
 LOOSE_NUMBER = re.compile(r"\(?\d{1,4}(?:\.\d{1,4})?\)\s*$")
 TEX_TOKENS = re.compile(r"\\[A-Za-z]+|\\.|[^\s]")
 VECTOR_STAR = re.compile(r"(\\(?:vec|overrightarrow))\s*\{\s*([A-Za-z])\s*\^\s*(?:\{\s*\*\s*\}|\*)\s*\}")
@@ -158,8 +158,10 @@ def reconcile_displays(page):
             if label.tag == "p" and not label.bbox and label.text.strip() == f"({accepted.marker})":
                 consumed.add(id(label))
     if replacements:
+        from diagnostics.profile import EQUATION_WITHOUT_GEOMETRY, EQUATION_WITHOUT_TRANSCRIPTION
+
         page.blocks = [replacements.get(id(block), block) for block in original if id(block) not in consumed]
-        page.diag["deduplicated_unlocated_displays"] = len(replacements)
+        page.diag["deduplicated_unlocated_displays"] = page.diag.get("deduplicated_unlocated_displays", 0) + len(replacements)
         formula_rows = [block.source_reference["formula"] for block in page.blocks
                         if block.kind == "equation" and "formula" in block.source_reference]
         page.diag["formula_validation"] = formula_rows
@@ -167,6 +169,21 @@ def reconcile_displays(page):
             f"Equation {row['number'] or index} requires text review. {row['reason']}"
             for index, row in enumerate(formula_rows, 1) if row["status"] == "review_required"
         ]
+        # Refresh only derived equation flags in a persisted extraction. OCR and layout failures still block.
+        reasons = page.diag.get("review_reasons", [])
+        resolved = set()
+        if not any(block.kind == "equation" and not block.bbox for block in page.blocks):
+            resolved.add(EQUATION_WITHOUT_GEOMETRY)
+        if not page.diag["equation_review"]:
+            resolved.add(EQUATION_WITHOUT_TRANSCRIPTION)
+        if resolved.intersection(reasons):
+            reasons = [reason for reason in reasons if reason not in resolved]
+            page.diag["review_reasons"] = reasons
+            if (not reasons and not page.diag.get("error")
+                    and page.diag.get("layout", {}).get("status") == "completed"
+                    and page.diag.get("ocr", {}).get("status") == "accepted"
+                    and not page.diag["ocr"].get("requires_review")):
+                page.requires_review = False
 
 
 def recognise_equation_number(source, crop, settings):
@@ -197,11 +214,13 @@ def recognise_formulas(source, page, settings):
     if not blocks:
         return
     from ocr.glm import model_info
+    from layout import formula_ocr
+    from layout.math_structure import mathml, signature
 
-    allowed = (settings.ocr_enabled and (settings.ocr_backend in {"automatic", "glm-ocr"}
-                                         or settings.formula_glm_on_other_engines)
-               and page.source == "ocr" and not source.rotation and any(block.bbox for block in blocks))
-    ready = allowed and model_info(settings)["ready"]
+    visual = settings.ocr_enabled and page.source == "ocr" and not source.rotation and any(block.bbox for block in blocks)
+    allowed = settings.ocr_backend in {"automatic", "glm-ocr"} or settings.formula_glm_on_other_engines
+    ready = visual and allowed and model_info(settings)["ready"]
+    secondary = visual and bool(settings.formula_pix2tex_checkpoint)
     config = replace(settings, glm_ocr_tokens=min(768, settings.glm_ocr_tokens),
                      glm_ocr_timeout_s=min(45, settings.glm_ocr_timeout_s), glm_ocr_keep_alive="2m")
     rows = []
@@ -219,7 +238,7 @@ def recognise_formulas(source, page, settings):
                   "reason": "No corroborated equation text is available."}
         if block.source == "native" and page.diag.get("health") == "healthy" and tex_tokens(block.text):
             record.update(status="native_text", encoding="unicode", reason="")
-        elif block.bbox and ready:
+        elif block.bbox and (ready or secondary):
             box, read_box = formula_crop(source, original_bbox, number or LOOSE_NUMBER.search(block.text))
             if box.is_empty or read_box.is_empty:
                 record["reason"] = "The equation region lies outside the source page."
@@ -236,36 +255,55 @@ def recognise_formulas(source, page, settings):
                     block.marker = record["number"] = number
                     record["number_source"] = "two_renders_of_printed_label"
             results = []
-            tags = []
             execution_ids = []
-            with audit.details(purpose="equation_transcription", ocr_engine="glm-ocr"):
-                try:
-                    for dpi in (300, 450):
-                        raster = source.get_pixmap(dpi=dpi, clip=read_box, colorspace=pymupdf.csGRAY, alpha=False)
-                        result = glm.recognise_image(raster.tobytes("png"), page.n, config, "formula",
-                                                     input_reference=f"pdf/page/{page.n}/equation/{number or len(rows) + 1}/{dpi}dpi")
-                        execution_ids.extend(result.execution_ids)
-                        if not result.issues and len(result.blocks) == 1 and result.blocks[0].kind == "equation":
-                            text = result.blocks[0].text.strip()
-                            tag = TAG.search(text)
-                            tags.append(tag[1] if tag else "")
-                            results.append(VECTOR_STAR.sub(r"\1{\2}^{*}", TAG.sub("", text).strip()))
-                except (RecognitionError, OSError, RuntimeError, ValueError) as error:
-                    ready = False
-                    record["reason"] = str(error)
+            reference = f"pdf/page/{page.n}/equation/{number or len(rows) + 1}"
+
+            def rasterize(dpi):
+                dpi = max(1, min(dpi, int(2800 * 72 / max(read_box.width, read_box.height))))
+                return source.get_pixmap(dpi=dpi, clip=read_box, colorspace=pymupdf.csGRAY, alpha=False).tobytes("png")
+
+            def add(text, recognizer, ids):
+                tag = TAG.search(text)
+                latex = VECTOR_STAR.sub(r"\1{\2}^{*}", TAG.sub("", text).strip())
+                if tokens := tex_tokens(latex):
+                    results.append((latex, tag[1] if tag else "", recognizer, tokens, signature(mathml(latex))))
+                    execution_ids.extend(ids)
+
+            if ready:
+                with audit.details(purpose="equation_transcription", ocr_engine="glm-ocr"):
+                    try:
+                        for dpi in (300, 450):
+                            result = glm.recognise_image(rasterize(dpi), page.n, config, "formula",
+                                                         input_reference=f"{reference}/{dpi}dpi")
+                            if not result.issues and len(result.blocks) == 1 and result.blocks[0].kind == "equation":
+                                add(result.blocks[0].text.strip(), "glm-ocr", result.execution_ids)
+                    except (RecognitionError, OSError, RuntimeError, ValueError) as error:
+                        ready = False
+                        record["reason"] = str(error)
+            if secondary:
+                for dpi in ((450,) if results else (300, 450)):
+                    start = audit.cursor()
+                    if text := formula_ocr.recognise(rasterize(dpi), settings, f"{reference}/{dpi}dpi/pix2tex"):
+                        add(text, "pix2tex", audit.ids_since(start))
             block.bbox = tuple(box)
             record.update(bbox=block.bbox, execution_ids=execution_ids)
-            if len(results) == 2 and tex_tokens(results[0]) and tex_tokens(results[0]) == tex_tokens(results[1]):
+            corroborated = len(results) >= 2 and all(
+                row[3] == results[0][3] or (row[4] is not None and row[4] == results[0][4]) for row in results[1:])
+            independent = len({row[2] for row in results}) > 1
+            if corroborated:
                 block.original_text = block.original_text or block.text
-                block.text, block.spans, block.ocr_engine = results[0], [], "glm-ocr"
+                block.text, block.spans, block.ocr_engine = results[0][0], [], results[0][2]
                 block.source_reference["execution_ids"] = execution_ids
-                if tags[0] and tags[0] == tags[1] and not number:
-                    block.marker = tags[0]
-                    record["number"] = tags[0]
-                record.update(status="two_pass_agreement", encoding="latex", reason="")
+                tags = {row[1] for row in results if row[1]}
+                if len(tags) == 1 and not number and sum(bool(row[1]) for row in results) >= 2:
+                    block.marker = record["number"] = tags.pop()
+                record.update(status="two_pass_agreement", encoding="latex", reason="",
+                              verification="independent_model_agreement" if independent else "two_rasterizations")
                 audit.mark(execution_ids, validation="passed")
             else:
-                if len(results) == 2:
+                if independent:
+                    record["reason"] = "Independent recognizers disagreed on the mathematical structure."
+                elif len(results) >= 2:
                     record["reason"] = "The two rendered crops produced different mathematical tokens."
                 audit.mark(execution_ids, validation="review_required")
         block.source_reference["formula"] = record

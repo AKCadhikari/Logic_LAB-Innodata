@@ -546,6 +546,9 @@ def finish_extraction(pdf, dir_, settings, out_dir, work_dir, audit, res, t0):
 
     doc_id, pages = dir_.doc_id, dir_.pages
     kinds.assign_kinds(dir_)
+    # Running headers and final block classification can change the geometric anchors.
+    for page in pages:
+        equations.reconcile_displays(page)
     profile = decorate_document(dir_)
     dir_.meta["execution_trace_id"] = model_audit.current()["trace_id"]
     execution_reports.anchor_ir(dir_, model_audit.current()["trace_id"])

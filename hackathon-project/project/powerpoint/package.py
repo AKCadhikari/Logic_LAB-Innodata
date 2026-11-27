@@ -17,6 +17,7 @@ REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 TYPES = "http://schemas.openxmlformats.org/package/2006/content-types"
 IMAGE_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+SUBTREE_TAGS = {qn("m:oMath"), qn("p:txBody")}
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class RunEdit:
     new: str
     tag: str = qn("a:t")
     attribute: str | None = None
+    position: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -140,25 +142,46 @@ def serialize(element):
 def patch_value(node, edit):
     if edit.attribute:
         return node.get(edit.attribute, "")
-    if edit.tag == qn("m:oMath"):
+    if edit.position and node.tag == f"{{{MC}}}AlternateContent":
+        return canonical_picture_alternative(node)
+    if edit.tag in SUBTREE_TAGS or edit.position:
         return etree.tostring(node, method="c14n", exclusive=True).decode("utf-8")
     return node.text or ""
+
+
+def canonical_picture_alternative(node):
+    # Parse the standalone fragment so inherited namespace bindings are visible to C14N.
+    fragment = parse(etree.tostring(node, with_tail=False))
+    return etree.tostring(fragment, method="c14n", exclusive=True, inclusive_ns_prefixes=["a14"]).decode("utf-8")
 
 
 def set_patch_value(node, edit, value):
     if edit.attribute:
         node.set(edit.attribute, value)
-    elif edit.tag == qn("m:oMath"):
+    elif edit.tag in SUBTREE_TAGS or edit.position:
         replacement = parse(value.encode("utf-8"))
-        if replacement.tag != edit.tag:
-            raise ValueError("The replacement is not an editable Office equation.")
+        allowed = {edit.tag, f"{{{MC}}}AlternateContent"} if edit.position else {edit.tag}
+        if replacement.tag not in allowed:
+            raise ValueError("The replacement has an unexpected Office part type.")
         node.getparent().replace(node, replacement)
     else:
         node.text = value or None
 
 
+def find_patch(root, edit):
+    if not edit.position:
+        return root.find(edit.path)
+    try:
+        for index in edit.position:
+            root = root[index]
+    except IndexError:
+        return None
+    return root
+
+
 def write_deck(source: Path, target: Path, edits: dict[str, list[RunEdit]], slide_count: int,
-               pictures: dict[str, list[PictureEdit]] | None = None) -> None:
+               pictures: dict[str, list[PictureEdit]] | None = None,
+               media: dict[str, bytes] | None = None) -> None:
     if source.resolve() == target.resolve() or (target.exists() and target.samefile(source)):
         raise ValueError("Choose an output path different from the original presentation.")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -166,9 +189,13 @@ def write_deck(source: Path, target: Path, edits: dict[str, list[RunEdit]], slid
         staged = Path(temp) / "validated.pptx"
         with ZipFile(source) as original, ZipFile(staged, "w") as output:
             pictures = pictures or {}
-            if (edits.keys() | pictures.keys()) - set(original.namelist()):
+            media = media or {}
+            if (edits.keys() | pictures.keys() | media.keys()) - set(original.namelist()):
                 raise ValueError("The original deck does not contain every edited slide.")
+            if any(not name.startswith("ppt/media/") for name in media):
+                raise ValueError("A replacement image must target an existing presentation media part.")
             patches = picture_parts(original, pictures)
+            patches.update(media)
             output.comment = original.comment
             for entry in original.infolist():
                 data = patches.pop(entry.filename, None)
@@ -177,9 +204,10 @@ def write_deck(source: Path, target: Path, edits: dict[str, list[RunEdit]], slid
                 if entry.filename in edits:
                     slide = parse(data)
                     for edit in edits[entry.filename]:
-                        node = slide.find(edit.path)
-                        allowed = (edit.attribute is None and edit.tag in {qn("a:t"), qn("m:t"), qn("m:oMath")}) or (
-                            edit.tag == f"{{{REL}}}Relationship" and edit.attribute == "Target")
+                        node = find_patch(slide, edit)
+                        allowed = (edit.attribute is None and edit.tag in {qn("a:t"), qn("m:t"), *SUBTREE_TAGS}) or (
+                            edit.tag == f"{{{REL}}}Relationship" and edit.attribute == "Target") or (
+                            edit.tag == qn("p:pic") and edit.position and edit.attribute is None)
                         if not allowed or node is None or node.tag != edit.tag:
                             raise ValueError(f"The slide run is missing in {entry.filename}.")
                         old = patch_value(node, edit)
@@ -195,10 +223,12 @@ def write_deck(source: Path, target: Path, edits: dict[str, list[RunEdit]], slid
                 output.writestr(name, data)
         validate_deck(staged, slide_count)
         with ZipFile(staged) as saved:
+            if any(saved.read(part) != value for part, value in media.items()):
+                raise ValueError("The saved equation image does not match its verified source crop.")
             for part, changes in edits.items():
                 tree = parse(saved.read(part))
                 for edit in changes:
-                    node = tree.find(edit.path)
+                    node = find_patch(tree, edit)
                     value = None if node is None else patch_value(node, edit)
                     if value != edit.new:
                         raise ValueError(f"Saved PowerPoint write-back verification failed in {part}.")

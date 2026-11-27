@@ -306,6 +306,9 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
                                                                  for key, item in outputs.items()},
                           "images": result["xml_assets"], "image_originals": originals},
     }
+    if outputs["xml"]:
+        from layout.math_structure import equation_catalog
+        reports["reports/equations.json"] = equation_catalog(ir, xml_path.read_bytes(), locations)
     evidence = extraction.get("execution_evidence", {})
     evidence = {**evidence, "executions": [*evidence.get("executions", []), *verification_executions]}
     reports.update(execution_reports(ir, evidence,

@@ -354,7 +354,8 @@ def _lines_to_blocks(lines: list[Line], ctx, settings, body: float, hsizes: list
         is_eq = bool(numbered_formula and len(para) <= 5 and nwords <= 36 and (
             sym / max(len(text), 1) > 0.22 or (x0 > 0.20 * w and re.search(r"[=±×÷√∑∫]", text))))
         is_eq |= (len(para) == 1 and nwords <= 10 and SIMPLE_EQUATION.fullmatch(text) is not None
-                  and re.search(r"[×÷√^]", text) is not None)
+                  and (re.search(r"[×÷√^]", text) is not None or
+                       (x0 >= .20 * w and re.search(r"[+−*/²³₀-₉]|(?<==)\s*\d", text) is not None)))
         mnum = NUMHEAD_RE.match(text)
         # footnote: small text in the lower part of the page
         if is_eq:

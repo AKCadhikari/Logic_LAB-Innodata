@@ -89,6 +89,7 @@ class EvidenceIndex:
         return [self.units[index] for index in sorted(selected, key=lambda index: (
             index not in fuzzy, -weights[index],
             self.units[index].page not in hints,
+            -len(context_terms & terms(" ".join(self.units[index].section))),
             -len(context_terms & self.page_terms[self.units[index].page])))]
 
     def corroborated_pages(self, notes, reported):

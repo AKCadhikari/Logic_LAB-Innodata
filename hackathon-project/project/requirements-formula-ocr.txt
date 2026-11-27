@@ -1,0 +1,2 @@
+# Optional local equation OCR corroboration. Provision the checkpoint separately.
+pix2tex==0.1.4

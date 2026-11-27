@@ -10,6 +10,8 @@ def block_text(block):
 
 
 NON_PROSE = {"equation", "pseudocode", "publication_metadata", "rights", "byline", "reference_entry"}
+EQUATION_WITHOUT_GEOMETRY = "At least one equation has no verified source coordinates."
+EQUATION_WITHOUT_TRANSCRIPTION = "At least one equation has no corroborated text transcription."
 
 
 def language_text(block):
@@ -67,9 +69,9 @@ def decorate_document(ir) -> dict:
             if xml_safe(raw) != raw or "\ufffd" in raw:
                 issues.append("At least one source block contains replacement or XML-incompatible characters.")
             if block.kind == "equation" and not block.bbox:
-                issues.append("At least one equation has no verified source coordinates.")
+                issues.append(EQUATION_WITHOUT_GEOMETRY)
             if block.source_reference.get("formula", {}).get("status") == "review_required":
-                issues.append("At least one equation has no corroborated text transcription.")
+                issues.append(EQUATION_WITHOUT_TRANSCRIPTION)
             reasons.extend(issues)
             for cell in block.cells:
                 cell.language = language_profile(cell.text, block.lang)

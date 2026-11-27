@@ -57,7 +57,13 @@ Run these commands from `hackathon-project`.
 .\.venv\Scripts\python.exe -B project\repair_pptx.py --pdf "source.pdf" --pptx "original.pptx" --out "corrected.pptx"
 ```
 
-Use the repair command when the PDF should supply the facts for a correction. It applies evidence-backed edits to supported PowerPoint objects, reopens the saved deck to validate the edits, and writes a sibling `corrected_reports/` folder with source evidence, corrections, unresolved items, and an HTML QA report. Optional `--ai-review` adds local advisory review. Complex equations, charts, and figures can require manual verification.
+The repair command and paired workspace use the uploaded PDF as the source for PowerPoint edits. The engine aligns slides to source passages, preserves existing slide objects where possible, and reopens the saved deck to check its package and approved changes. When LibreOffice is available, it renders the whole deck, checks changed content, and retries a safe image fallback or reverts failed slide edits.
+
+The sibling `corrected_reports/` folder contains the HTML QA report, the saved and unresolved correction records, the slide-to-source page mapping, and an equation catalogue with LaTeX, MathML, confidence where available, and PDF crops. The paired export also writes `reports/equations.json` alongside the XML, with IDs and relative image paths that link the two. The final ZIP contains the validated XML, repaired PPTX, and referenced images.
+
+Run-level repairs cover supported visible text and tables. A unique gap within a matching PDF bullet list can be restored if it fits the existing shape. Supported OMML edits preserve editable PowerPoint mathematics. Recognized equation pictures can receive an editable Office alternative and a verified PDF image fallback. Complex equations, chart workbooks, SmartArt, ambiguous matches, and render differences can require manual verification.
+
+GLM-OCR is the standard local visual recognizer. To corroborate equations with a second local model, install `project/requirements-formula-ocr.txt` into a separate environment and set `DOCUSYNC_FORMULA_PIX2TEX_CHECKPOINT` to the absolute path of an approved pix2tex checkpoint. Set `DOCUSYNC_FORMULA_PIX2TEX_PYTHON` to that environment's Python executable. The recognizer uses locally provisioned weights. Optional `--ai-review` adds local advisory review of unresolved slide findings.
 
 ## Outputs and checks
 

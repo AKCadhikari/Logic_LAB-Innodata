@@ -8,11 +8,14 @@ from difflib import SequenceMatcher
 from pptx.oxml.ns import qn
 from lxml import etree
 from layout.equations import equation_number
+from layout.formula_validation import polynomial_equivalence
+from layout.math_structure import mathml, source_equations
 from powerpoint.package import MC, RunEdit
 
 
 SYMBOLS = {"cdot": "·", "times": "×", "pm": "±", "le": "≤", "leq": "≤", "ge": "≥", "geq": "≥",
-           "neq": "≠", "infty": "∞", "sum": "∑", "int": "∫", "vert": "|", "{": "{", "}": "}"}
+           "neq": "≠", "infty": "∞", "sum": "∑", "int": "∫", "vert": "|", "div": "÷",
+           "approx": "≈", "partial": "∂", "to": "→", "prod": "∏", "mp": "∓", "{": "{", "}": "}"}
 SYMBOLS.update(zip(("alpha", "beta", "gamma", "delta", "epsilon", "lambda", "mu", "pi", "rho",
                     "sigma", "tau", "theta", "phi", "omega"), "αβγδελμπρσ τθφω".replace(" ", "")))
 MARKERS = {"vector": ("@vector", "@endvector"), "power": ("@power", "@endpower"),
@@ -241,20 +244,82 @@ def append_verified_terms(node, tape, expected, root):
 
 
 def equation_evidence(ir):
-    for page in ir.pages:
-        for block in page.blocks:
-            proof = block.source_reference.get("formula", {})
-            if (block.kind != "equation" or not block.bbox or proof.get("status") not in
-                    {"two_pass_agreement", "source_reviewed", "native_text"}):
-                continue
-            content = block.text
-            label = block.marker or equation_number(content)
-            if label and content.rstrip().endswith(f"({label})"):
-                content = content.rstrip()[:-len(label) - 2]
-            expected = latex_tokens(content) if proof.get("encoding") == "latex" else list(normalized(content))
-            yield (label, expected, {"page": page.n, "bbox": block.bbox, "text": content,
-                                    "block_id": block.source_reference.get("block_id"),
-                                    "extraction": block.source, "formula_status": proof["status"]})
+    for row, root in source_equations(ir):
+        if (row["kind"] != "display" or not row["bbox"] or root is None or row["status"] not in
+                {"two_pass_agreement", "source_reviewed", "native_text"}):
+            continue
+        expected = latex_tokens(row["latex"])
+        yield row["number"] or "", expected, {"page": row["page"], "bbox": row["bbox"],
+            "text": row["latex"] if row["encoding"] == "latex" else row["unicode"], "block_id": row["id"],
+            "extraction": row["extraction"], "formula_status": row["status"],
+            "extraction_confidence": row["recognition_confidence"], "execution_ids": row["execution_ids"],
+            "equation_latex": row["latex"], "equation_mathml": row["mathml"], "equation_number": row["number"]}
+
+
+def equation_prefix(tokens):
+    return next((tokens[:index] for index, token in enumerate(tokens) if token in "=≠≤≥≈<>"), [])
+
+
+def native_equation(latex, tokens, template=None):
+    """Build OMML from an expression tree so scripts retain their full base."""
+    if not tokens or len(tokens) > 240:
+        return None
+    structure = mathml(latex)
+    if structure is None:
+        return None
+    sample = next(template.iter(qn("m:r")), None) if template is not None else None
+    root = etree.Element(qn("m:oMath"))
+
+    def run(parent, token):
+        node = etree.SubElement(parent, qn("m:r"))
+        if sample is not None:
+            for child in sample:
+                if child.tag in {qn("m:rPr"), qn("a:rPr")}:
+                    node.append(deepcopy(child))
+        etree.SubElement(node, qn("m:t")).text = "−" if token == "-" else token
+
+    def write(source, parent):
+        kind = etree.QName(source).localname
+        child_layout = {"msup": ("sSup", ("e", "sup")), "msub": ("sSub", ("e", "sub")),
+                        "msubsup": ("sSubSup", ("e", "sub", "sup")), "mfrac": ("f", ("num", "den"))}
+        if kind in {"math", "mrow"}:
+            for child in source:
+                write(child, parent)
+        elif kind in child_layout:
+            tag, fields = child_layout[kind]
+            if len(source) != len(fields):
+                raise ValueError("Malformed script or fraction")
+            node = etree.SubElement(parent, qn("m:" + tag))
+            for child, field in zip(source, fields):
+                write(child, etree.SubElement(node, qn("m:" + field)))
+        elif kind == "msqrt":
+            node = etree.SubElement(parent, qn("m:rad"))
+            properties = etree.SubElement(node, qn("m:radPr"))
+            etree.SubElement(properties, qn("m:degHide")).set(qn("m:val"), "1")
+            etree.SubElement(node, qn("m:deg"))
+            content = etree.SubElement(node, qn("m:e"))
+            for child in source:
+                write(child, content)
+        elif kind == "mover" and len(source) == 2 and (source[1].text or "") in {"→", "⃗", "⟶"}:
+            node = etree.SubElement(parent, qn("m:acc"))
+            properties = etree.SubElement(node, qn("m:accPr"))
+            etree.SubElement(properties, qn("m:chr")).set(qn("m:val"), "⃗")
+            write(source[0], etree.SubElement(node, qn("m:e")))
+        elif kind in {"mi", "mn", "mo", "mtext"} and source.text:
+            run(parent, source.text)
+        else:
+            raise ValueError("Unsupported Office equation node")
+
+    try:
+        write(structure, root)
+        check = office_tokens(root)
+        return root if check is not None and check.tokens == tokens else None
+    except (ValueError, RecursionError):
+        return None
+
+
+def canonical(node):
+    return etree.tostring(node, method="c14n", exclusive=True).decode("utf-8")
 
 
 def inspect_formulas(root, evidence, hinted):
@@ -262,13 +327,13 @@ def inspect_formulas(root, evidence, hinted):
         if any(parent.tag == f"{{{MC}}}Fallback" for parent in node.iterancestors()):
             continue
         text = "".join(child.text or "" for child in node.iter(qn("m:t")))
-        if "=" not in normalized(text) or len(normalized(text)) < 5:
-            continue
         paragraph = next(node.iterancestors(qn("a:p")), None)
         label = ""
         if paragraph is not None:
             plain = "".join(child.text or "" for child in paragraph.iter(qn("a:t")))
             label = equation_number(plain.strip())
+        if not label and (not equation_prefix(list(normalized(text))) or len(normalized(text)) < 5):
+            continue
         tape = office_tokens(node)
         shape = next(node.iterancestors(qn("p:sp")), None)
         identity = shape.find(".//" + qn("p:cNvPr")) if shape is not None else None
@@ -284,19 +349,35 @@ def inspect_formulas(root, evidence, hinted):
         candidates = [(SequenceMatcher(None, formula, expected, autojunk=False).ratio(), marker, expected, proof)
                       for marker, expected, proof in evidence if expected and (not label or marker == label)]
         candidates.sort(key=lambda item: (-item[0], item[3]["page"] not in hinted))
-        if not candidates or candidates[0][0] < .85:
+        if not candidates:
             if label:
                 yield target, text, "", None, [], "The printed equation label did not identify a compatible verified source formula."
             continue
         score, _, expected, proof = candidates[0]
         if expected == formula:
             continue
+        labelled = (label and len([item for item in evidence if item[0] == label]) == 1 and
+                    equation_prefix(formula) and equation_prefix(formula) == equation_prefix(expected))
+        if score < .85 and not labelled:
+            if label:
+                yield target, text, "", proof, [], "The equation does not share enough verified source structure."
+            continue
         competing = any(score - candidate[0] < .075 and candidate[2] != expected for candidate in candidates[1:])
         changes = [] if competing else (edits_for(tape, expected, root.getroottree())
                                         or append_verified_terms(node, tape, expected, root.getroottree()))
+        if labelled and not competing and not changes:
+            replacement = native_equation(proof["equation_latex"], expected, node)
+            if replacement is not None:
+                path = root.getroottree().getelementpath(node)
+                changes = [RunEdit(path, canonical(node), canonical(replacement), qn("m:oMath"))]
+                target["native_equation_rebuilt"] = True
         reason = ("Another source equation is too close to distinguish." if competing else
                   "Verified PDF and Office equation structures agree at the edited tokens." if changes else
                   "The source differs structurally. A verified replacement would require rebuilding this equation.")
         if changes:
             target["equation_path"] = root.getroottree().getelementpath(node)
-        yield target, text, proof["text"], {**proof, "alignment": score, "expected_tokens": expected}, changes, reason
+        symbolic = None
+        if (all(len(token) == 1 for token in formula) and all(len(token) == 1 for token in expected)):
+            symbolic = polynomial_equivalence("".join(formula), "".join(expected))
+        yield target, text, proof["text"], {**proof, "alignment": score, "expected_tokens": expected,
+                                          "symbolic_equivalence": symbolic}, changes, reason

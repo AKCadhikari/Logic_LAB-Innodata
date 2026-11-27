@@ -11,4 +11,6 @@ pytest>=8.0              # tests only
 psutil>=5.9              # launcher process ownership and memory checks
 Pillow>=10.1             # synthetic image for GLM-OCR startup inference
 pydantic>=2.10,<3        # shared extraction and document validation
+latex2mathml>=3.77,<4    # local presentation MathML conversion
+sympy>=1.13,<2           # bounded symbolic checks on simple equations
 # External, not pip-installable: Tesseract OCR 5.x with language packs ara jpn kor ces slk deu nld ita fra eng osd

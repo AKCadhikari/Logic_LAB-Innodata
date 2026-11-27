@@ -1,7 +1,8 @@
 from lxml import etree
 import pymupdf
 
-from layout.equations import position_numbered_equations, recognise_formulas
+from diagnostics.profile import EQUATION_WITHOUT_GEOMETRY, EQUATION_WITHOUT_TRANSCRIPTION
+from layout.equations import position_numbered_equations, recognise_formulas, reconcile_displays
 from layout.model import Block, DocIR, Line, PageIR
 from ocr import glm
 from ocr.recognition import Recognition
@@ -45,3 +46,20 @@ def test_xml_keeps_formula_crops_and_only_marks_agreed_transcriptions(monkeypatc
     validation = validate_xml(xml, 1, settings)
     assert validation["formulas"] == 2 and validation["formula_transcriptions"] == 1
     assert validation["formulas_for_review"] == 1 and not validation["issues"]
+
+
+def test_reconcile_saved_duplicate_refreshes_only_equation_review():
+    before = Block("p", "The formula follows.", bbox=(10, 90, 170, 110))
+    alternate = Block("p", r"q=\vec{p}+4", source="ocr", kind="equation")
+    positioned = Block("figure", r"q=\overrightarrow{p}+4", source="ocr", kind="equation",
+                       marker="2", bbox=(90, 140, 270, 160),
+                       source_reference={"formula": {"status": "two_pass_agreement", "number": "2", "reason": ""}})
+    after = Block("p", "The next paragraph begins.", bbox=(10, 180, 190, 200))
+    for extra in ([], ["Layout geometry requires independent review."]):
+        diag = {"layout": {"status": "completed"}, "ocr": {"status": "accepted"},
+                "review_reasons": [EQUATION_WITHOUT_GEOMETRY, EQUATION_WITHOUT_TRANSCRIPTION, *extra]}
+        page = PageIR(1, 595, 842, [before, alternate, positioned, after], source="ocr", requires_review=True, diag=diag)
+        reconcile_displays(page)
+        assert page.blocks == [before, positioned, after]
+        assert alternate.text in positioned.source_reference["alternate_transcriptions"]
+        assert page.diag["review_reasons"] == extra and page.requires_review == bool(extra)

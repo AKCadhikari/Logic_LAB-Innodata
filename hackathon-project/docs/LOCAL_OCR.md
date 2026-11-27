@@ -3,7 +3,9 @@
 The upload and batch entry points share one pipeline. PyMuPDF inspects each page for native character
 count, image coverage, and signs of a broken text layer. Reliable native text goes directly to layout.
 The workspace offers GLM-OCR, PaddleOCR-VL (Ollama), PaddleOCR (Python), and Automatic. Automatic
-defaults to GLM-OCR, PaddleOCR-VL, then PaddleOCR Python. If recognition attempts fail, the page stays
+defaults to GLM-OCR, PaddleOCR-VL, then PaddleOCR Python. For Arabic PDF pages with missing Unicode
+mappings, Automatic first uses the local Tesseract Arabic language pack (`ara.traineddata`) when
+available. It reconstructs Arabic columns from right to left. If recognition attempts fail, the page stays
 in the IR and draft XML for review. The selected mode, each executed model, and the accepted output
 are recorded separately.
 

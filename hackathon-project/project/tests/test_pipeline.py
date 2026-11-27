@@ -73,6 +73,51 @@ def test_diagnostics_decisions(tmp_path, settings):
     assert blank["health"] == "absent" and blank["decision"] == "ocr"
 
 
+def test_unmapped_arabic_pdf_uses_visual_ocr_and_keeps_rtl(tmp_path, settings, audit, monkeypatch):
+    from ocr import engine
+    from utils.textutil import script_of
+
+    sentence = "هذا المستند يحتوي على معلومات في التقرير بتاريخ 28/3/1446."
+    source = tmp_path / "arabic.pdf"
+    with pymupdf.open() as pdf:
+        page = pdf.new_page()
+        pdf.xref_set_key(pdf.pdf_catalog(), "Lang", "(ar)")
+        page.insert_htmlbox(page.rect + (45, 60, -45, -55), f'<p dir="rtl">{sentence}</p>')
+        arabic = next(span for span in page.get_texttrace() if any(script_of(chr(char)) == "arab" for char, *_ in span["chars"]))
+        font = next(font for font in page.get_fonts() if "Arabic" in font[3])
+        _, reference = pdf.xref_get_key(font[0], "ToUnicode")
+        glyphs = {glyph: char for char, glyph, *_ in arabic["chars"] if glyph > 0}
+        glyphs[next(glyph for glyph, char in glyphs.items() if script_of(chr(char)) == "arab")] = 0xfffd
+        pairs = "\n".join(f"<{glyph:04x}> <{char:04x}>" for glyph, char in glyphs.items())
+        cmap = f"""begincmap
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+{len(glyphs)} beginbfchar
+{pairs}
+endbfchar
+endcmap"""
+        pdf.update_stream(int(reference.split()[0]), cmap.encode("ascii"))
+        pdf.save(source)
+
+    with pymupdf.open(source) as pdf:
+        diagnostic = analyze_page(pdf[0], settings, "ar")
+        assert diagnostic["native_unmapped_characters"] > 0
+        assert diagnostic["decision"] == "ocr" and diagnostic["lang_hint"] == "ar"
+
+    monkeypatch.setattr(engine, "available_langs", lambda _settings: {"ara", "eng"})
+    monkeypatch.setattr(engine, "ocr_page", lambda *args, **options: (
+        [Line(sentence, (120, 58, 540, 76), source="ocr", rtl=True, conf=94)], {"langs": "ara"}))
+    settings.doclayout_enabled = settings.docling_enabled = False
+    out = tmp_path / "out"
+    result = process_pdf(source, settings, out, tmp_path / "work", audit)
+    root = etree.parse(str(out / "arabic.xml")).getroot()
+    assert result["ok"] and result["processing_counts"]["tesseract"] == 1
+    assert not result["multilingual_validation"]["blocking_pages"]
+    assert root.get("dir") == "rtl" and sentence in "".join(root.itertext())
+    assert "\ufffd" not in "".join(root.itertext())
+
+
 def test_never_emits_invalid_xml_for_hostile_text(tmp_path, settings, audit):
     def hostile(pg):
         pg.insert_text((60, 100), "ok text before <tag> & \"quotes\" and ampersands &amp; more words here", fontsize=11)

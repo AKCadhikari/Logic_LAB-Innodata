@@ -349,6 +349,7 @@ pre.xml { margin: 0; padding: 10px; border-radius: 6px; background: #f2f0e6; fon
 #processing-stages li { display: grid; align-content: start; gap: 2px; padding: 6px; border-radius: 6px; background: var(--shell); font-size: 11px; line-height: 1.28; }
 #processing-stages span { color: var(--mute); }
 #processing-stages [data-state="running"] { background: #f6e9cc; }
+#processing-stages [data-state="blocked"] { background: #f6e9cc; }
 #processing-stages [data-state="completed"] { background: var(--accent-soft); }
 #processing-stages [data-state="failed"] { background: #f7e1e3; }
 .review-view:not(.batch-tools-visible) #ocr-timeline { justify-content: space-between; }

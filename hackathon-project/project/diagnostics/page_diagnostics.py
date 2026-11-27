@@ -35,9 +35,15 @@ def text_health(text: str) -> dict:
 
 
 def analyze_page(page, settings, metadata_language: str = "und") -> dict:
-    text = page.get_text("text") or ""
+    import pymupdf
+
+    # Use the same Unicode policy as styled extraction. Raw glyph IDs can look
+    # like valid characters and hide missing mappings during diagnostics.
+    flags = pymupdf.TEXTFLAGS_TEXT & ~pymupdf.TEXT_USE_CID_FOR_UNKNOWN_UNICODE
+    text = page.get_text("text", flags=flags) or ""
     stripped = text.strip()
     h = text_health(stripped)
+    missing_unicode = stripped.count("\ufffd")
     area = max(page.rect.width * page.rect.height, 1.0)
     try:
         imgs = page.get_image_info()
@@ -57,6 +63,9 @@ def analyze_page(page, settings, metadata_language: str = "und") -> dict:
         health, decision = "corrupt", "ocr"; reasons.append(f"control-character ratio {h['ctrl']:.0%}")
     elif h["pua"] > 0.2:
         health, decision = "corrupt", "ocr"; reasons.append(f"private-use glyph ratio {h['pua']:.0%} (legacy symbol-font encoding)")
+    elif missing_unicode:
+        health, decision = "corrupt", "ocr"
+        reasons.append(f"The PDF text layer contains {missing_unicode} unmapped Unicode characters.")
     elif h["moji"] >= 6:
         health, decision = "corrupt", "ocr"; reasons.append(f"{h['moji']} mojibake sequences")
     elif h["latin_tokens"] >= 40 and h["wordlike"] < 0.55:
@@ -92,6 +101,8 @@ def analyze_page(page, settings, metadata_language: str = "und") -> dict:
         "wordlike": round(h["wordlike"], 3), "n_images": len(imgs), "image_coverage": round(cov, 3),
         "scripts": language["scripts"], "health": health, "decision": decision, "reasons": reasons,
         "native_language": language,
+        "native_unmapped_characters": missing_unicode,
         "native_decoding_risk": decoding_risk,
-        "lang_hint": language["language"] if health == "healthy" else "und",
+        "lang_hint": language["language"] if health == "healthy" or (
+            missing_unicode and language["script"] == "arab" and language["confidence"] >= .6) else "und",
     }

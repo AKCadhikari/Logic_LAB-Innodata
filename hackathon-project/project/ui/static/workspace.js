@@ -196,7 +196,8 @@ function showOcrTimeline(job, active) {
     const pane = $("#ocr-timeline"), step = job?.processing;
     pane.hidden = !job || job.status === "uploaded";
     const seconds = job?.started ? (new Date(job.finished || Date.now()) - new Date(job.started)) / 1000 : null;
-    const message = job?.status === "queued" ? "Waiting in queue" : active ?
+    const message = job?.status === "review" ? "Source review required before slide analysis" :
+        job?.status === "queued" ? "Waiting in queue" : active ?
         processingStatus(step) || "Starting PDF processing" : "Processing " + job?.status;
     if (!pane.firstElementChild) {
         const status = document.createElement("span"), elapsed = document.createElement("span");
@@ -215,16 +216,20 @@ function showOcrTimeline(job, active) {
             ocr: "Text extraction", association: "Region matching", layout: "Reading order", validation: "XML"};
     if (!S.data?.source_pptx && phases.pptx && phases.pptx.status !== "skipped") names.pptx = "PowerPoint";
     stages.innerHTML = Object.entries(names).map(([key, label]) => {
-        const phase = phases[key], state = phase?.status || "pending";
+        const phase = phases[key];
+        const awaitingReview = job?.status === "review" && key === "pptx_analysis" && !phase;
+        const state = phase?.status || (awaitingReview ? "blocked" : "pending");
         const duration = state === "running" && phase.at ? (Date.now() - new Date(phase.at)) / 1000 : phase?.seconds;
         return '<li data-state="' + esc(state) + '"' + (state === "running" ? ' aria-current="step"' : '') + '><strong>' + label + '</strong><span>' +
-            state[0].toUpperCase() + state.slice(1) + (duration == null ? "" : " · " + Math.max(0, duration).toFixed(1) + " s") +
+            (awaitingReview ? "Waiting for source review" : state[0].toUpperCase() + state.slice(1)) +
+            (duration == null ? "" : " · " + Math.max(0, duration).toFixed(1) + " s") +
             '</span></li>';
     }).join("");
 }
 const processingCounts = counts => counts ? '<div class="card" aria-live="polite">' +
     '<div>OCR required on ' + counts.required + ' pages</div>' +
     '<div>GLM-OCR ' + counts.glm_ocr + ' · PaddleOCR-VL ' + (counts.paddle_vl || 0) + ' · PaddleOCR Python ' + counts.paddle_ocr +
+    (counts.tesseract ? ' · Tesseract ' + counts.tesseract : '') +
     ' · OCR failures ' + counts.failed + '</div>' +
     '<div>Manual review ' + counts.review + '</div></div>' : "";
 const analysisStatus = analysis => analysis ? '<p role="status">' + esc(analysis.model) + ' · ' +
@@ -509,9 +514,12 @@ function updateInspector() {
 function languageLabel(profile) {
     if (!profile?.language) return "";
     const language = profile.languages?.length > 1 ? profile.languages.join(", ") : profile.language;
+    const base = profile.base_direction === "rtl" ? "Right to left (RTL)" :
+        profile.base_direction === "ltr" ? "Left to right (LTR)" : "";
+    const direction = profile.direction === "mixed" ? [base, "mixed directions"].filter(Boolean).join(", ") : base;
     return [language === "und" ? "Undetermined language" : language, profile.script,
-        profile.direction, profile.confidence == null ? "" :
-            Math.round(profile.confidence * 100) + "% detection confidence"].filter(Boolean).join(" · ");
+        direction, profile.confidence == null ? "" :
+            Math.round(profile.confidence * 100) + "% language detection confidence"].filter(Boolean).join(" · ");
 }
 
 function renderTextBlocks(blocks, numbered = false) {
@@ -721,7 +729,8 @@ function pageDiagnostics(page) {
         '<div>Native text: ' + esc(diag.health || "unknown") +
         (Number.isInteger(diag.native_chars) ? ' · ' + diag.native_chars + ' characters' : '') + '</div>' +
         '<div>' + (diag.ocr_required ? "OCR required" : "OCR not required") +
-        (diag.appears_scanned ? ' · scanned page' : '') + '</div>' + attempts +
+        (diag.appears_scanned ? ' · scanned page' : '') + '</div>' +
+        (ocr?.recovery_reason ? '<div>' + esc(ocr.recovery_reason) + '</div>' : '') + attempts +
         (diag.layout ? '<div>Layout · ' + esc(diag.layout.engine) + ' · ' + esc(diag.layout.status) + '</div>' : '') +
         (diag.layout?.error ? '<div class="notice">' + esc(diag.layout.error) + '</div>' : '') +
         (diag.layout?.docling_status ? '<div>Docling · ' + esc(diag.layout.docling_status) + '</div>' : '') +
@@ -825,7 +834,9 @@ async function reviewPanel() {
             '<select id="retry-engine"><option value="automatic">Automatic</option><option value="glm-ocr">GLM-OCR</option>' +
             '<option value="paddleocr">PaddleOCR</option></select>' : '') +
         affected.map(number => '<button type="button" class="btn" data-review-page="' + number + '">Page ' + number + '</button>').join(" ") +
-        [...review.items, ...review.issues].slice(0, 12).map(row => '<div>' + esc(row.reason || row.kind || "Check source content") + '</div>').join("") + '</div>';
+        [...review.items, ...review.issues].slice(0, 12).map(row => '<div>' +
+            esc(row.reasons?.join(" ") || row.reason || row.kind?.replaceAll("_", " ") || "Check source content") +
+            '</div>').join("") + '</div>';
     const warnings = job.final_export?.source_warnings || [];
     const warningList = warnings.length ? '<details class="advanced-details"><summary>Source warnings (' + warnings.length +
         ')</summary>' + warnings.map(item => '<div>Page ' + esc(item.page) + ' · ' +

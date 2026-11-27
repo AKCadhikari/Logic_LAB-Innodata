@@ -174,6 +174,18 @@ def test_docling_enrichment_keeps_ocr_text_and_uses_matched_geometry():
         "Same extracted title", "h1", region["bbox"])
 
 
+def test_docling_native_unicode_loss_cannot_veto_visual_ocr():
+    box = (42, 50, 400, 70)
+    visual = "هذا المستند يحتوي على بيانات مهمة للقراءة."
+    region = {"kind": "text", "text": "Damaged text reconstructed from an unmapped font.", "bbox": box}
+    for missing in (0, 4):
+        page = PageIR(1, 612, 792, [Block("p", visual, bbox=box, source="ocr")], source="ocr",
+                      diag={"native_unmapped_characters": missing})
+        apply_regions(page, [region])
+        assert page.blocks[0].text == visual
+        assert page.requires_review == (not missing)
+
+
 def test_ir_rejects_disordered_pages_and_invalid_geometry():
     doc = DocIR("example", "example.pdf", pages=[PageIR(1, 612, 792)]).to_dict()
     doc["pages"][0]["n"] = 2

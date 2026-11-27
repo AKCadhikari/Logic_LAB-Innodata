@@ -164,7 +164,17 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             if fast and decision == "compare":
                 decision = "native"; d["reasons"].append("fast mode: compare skipped")
                 d["ocr"] = {"engine": None, "status": "skipped", "requires_review": True}
-            if decision != "native" and settings.ocr_enabled and settings.ocr_backend in ENGINE_MODES:
+            recovery = None
+            if decision == "ocr" and settings.ocr_enabled and router is not None:
+                recovery = router.recover_unmapped_arabic(page, dpi, d,
+                    lambda engine: stage("ocr", page=i + 1, engine=engine))
+            if recovery:
+                rec["lines"], d["ocr"] = recovery
+                rec["source"] = "ocr"
+                rec["figs"] = native.extract_figures(page, settings, [])
+                counts["tesseract"] = counts.get("tesseract", 0) + 1
+                audit.event("ocr", "selection", doc=doc_id, page=i + 1, **d["ocr"])
+            elif decision != "native" and settings.ocr_enabled and settings.ocr_backend in ENGINE_MODES:
                 model_names = {"glm-ocr": settings.glm_ocr_model, "paddleocr-vl": settings.paddle_vl_model}
                 result, info = router.recognise(page, page_language, dpi, d,
                                                lambda engine: stage("ocr", page=i + 1, engine=engine, model=model_names.get(engine)),
@@ -315,7 +325,8 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             rtl = False
             try:
                 ls = rp["lines"]
-                rtl = language_profile(_text_of(ls))["base_direction"] == "rtl"
+                flow = language_profile(_text_of(ls) + " " + " ".join(block.text for block in rp["blocks"] or []))
+                rtl = flow["script"] in {"arab", "hebrew"} or flow["base_direction"] == "rtl"
                 pg = reconstruct.build_page(rp["n"], source_width, source_height, ls, rp["tables"], rp["figs"],
                                             ctx, settings, rp["source"], doc_rtl=rtl)
                 if rp["blocks"] is not None:
@@ -331,6 +342,7 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                 rp["diag"].setdefault("review_reasons", []).append("Layout reconstruction failed.")
             pg.width, pg.height = rp["w"], rp["h"]
             pg.diag = {**rp["diag"], **pg.diag, "source_width": source_width, "source_height": source_height}
+            pg.diag["reading_direction"] = "rtl" if rtl else "ltr"
             if pg.source == "native" and pg.diag.get("health") == "healthy":
                 pg.diag["native_numeric_inventory"] = dict(numeric_values(doc[pg.n - 1].get_text()))
             ocr_info = pg.diag.get("ocr", {})
@@ -524,7 +536,9 @@ def _refresh_layout(pdf, saved_ir, settings, out_dir, work_dir, audit, result, p
                 region_association.associate(page, current["detections"], classify=True)
                 ocr_geometry.recover_captions(original, page, native_lines or positioned, settings, packs)
                 region_association.retain_figure_text(page, current["detections"])
-                rtl = language_profile(" ".join(block.text for block in page.blocks))["base_direction"] == "rtl"
+                flow = language_profile(" ".join(block.text for block in page.blocks))
+                rtl = flow["script"] in {"arab", "hebrew"} or flow["base_direction"] == "rtl"
+                page.diag["reading_direction"] = "rtl" if rtl else "ltr"
                 reconstruct.order_positioned_blocks(page, rtl)
             equations.recognise_formulas(original, page, settings)
             equations.reconcile_displays(page)

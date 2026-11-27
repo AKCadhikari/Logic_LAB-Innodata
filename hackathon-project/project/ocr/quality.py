@@ -23,7 +23,7 @@ def validate_recognition(result: Recognition, page: int, diagnostics: dict, sett
             and size < diagnostics["native_chars"] * settings.ocr_min_native_ratio):
         issues.append("Recognised text may be incomplete compared with the visible text layer.")
     health = text_health(text)
-    if health["ctrl"] + health["pua"] + health["moji"] / len(text) > settings.ocr_max_corruption_ratio:
+    if "\ufffd" in text or health["ctrl"] + health["pua"] + health["moji"] / len(text) > settings.ocr_max_corruption_ratio:
         issues.append("Recognised text contains unusual control or replacement characters.")
     tokens = re.findall(r"\w+|[^\w\s]", text.casefold())
     windows = Counter(zip(*(tokens[offset:] for offset in range(6))))

@@ -134,6 +134,7 @@ def apply_regions(page: PageIR, regions: list[dict]) -> int:
     candidates = Counter(SPECIAL.get(block.kind) or SPECIAL.get(block.tag) for block in page.blocks)
     matches = {}
     conflicting_text = False
+    native_text_usable = not page.diag.get("native_unmapped_characters")
     for block in page.blocks:
         group = SPECIAL.get(block.kind) or SPECIAL.get(block.tag)
         text = norm_cmp(block.text).strip()
@@ -151,12 +152,13 @@ def apply_regions(page: PageIR, regions: list[dict]) -> int:
                 score = 100 * overlap(block.bbox, box)
                 if not group and page.source == "ocr" and score >= 90 and overlap_ratio(block.bbox, box) >= 0.8:
                     if min(len(text), len(source)) >= 20 and fuzz.ratio(text, source) < 65:
-                        conflicting_text = True
+                        # Docling runs with OCR disabled, so damaged PDF text is not independent evidence.
+                        conflicting_text |= native_text_usable
                         continue
             elif group and candidates[group] == 1 and sum(r["kind"] == group for r in regions) == 1:
                 score = 100
             else:
-                score = fuzz.ratio(text, source) if len(text) >= 5 and len(source) >= 5 else 0
+                score = fuzz.ratio(text, source) if native_text_usable and len(text) >= 5 and len(source) >= 5 else 0
             if score >= 85:
                 candidate.append((score, i))
         candidate.sort(reverse=True)
@@ -176,7 +178,7 @@ def apply_regions(page: PageIR, regions: list[dict]) -> int:
         used.add(index)
         matches[id(block)] = index
         applied += 1
-    if page.source == "ocr" and len(matches) == len(page.blocks):
+    if page.source == "ocr" and len(matches) == len(page.blocks) and page.diag.get("reading_direction") != "rtl":
         page.blocks.sort(key=lambda block: matches[id(block)])
     if conflicting_text:
         page.requires_review = True

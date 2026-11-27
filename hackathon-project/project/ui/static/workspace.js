@@ -189,19 +189,25 @@ function showOcrTimeline(job, active) {
     const pane = $("#ocr-timeline"), step = job?.processing;
     pane.hidden = !job || job.status === "uploaded";
     const seconds = job?.started ? (new Date(job.finished || Date.now()) - new Date(job.started)) / 1000 : null;
-    pane.textContent = [active ? processingStatus(step) || "Waiting to process" : "Processing " + job?.status,
-        active && step?.model, seconds == null ? "" : Math.max(0, seconds).toFixed(1) + " s elapsed",
-        active && step?.last_ocr_attempt?.fallback_reason].filter(Boolean).join(" · ");
+    const message = job?.status === "queued" ? "Waiting in queue" : active ?
+        processingStatus(step) || "Starting PDF processing" : "Processing " + job?.status;
+    if (!pane.firstElementChild) {
+        const status = document.createElement("span"), elapsed = document.createElement("span");
+        elapsed.setAttribute("aria-hidden", "true");
+        pane.replaceChildren(status, elapsed);
+    }
+    if (pane.firstElementChild.textContent !== message) pane.firstElementChild.textContent = message;
+    pane.lastElementChild.textContent = seconds == null ? "" : Math.floor(Math.max(0, seconds)) + " s elapsed";
     const stages = $("#processing-stages");
-    stages.hidden = !active;
-    const names = {diagnostics: "PDF diagnostics", rendering: "Page rendering", detection: "DocLayout-YOLO detection",
-        ocr: "OCR processing", association: "Layout / OCR association", layout: "Docling reconstruction",
-        validation: "XML generation", pptx: "PPTX generation"};
     const phases = {...step?.phases, ...W.exportPhases.get(S.id)};
+    stages.hidden = pane.hidden || !Object.keys(phases).length;
+    const names = {diagnostics: "PDF check", rendering: "Rendering", detection: "Layout detection",
+        ocr: "Text extraction", association: "Region matching", layout: "Reading order", validation: "XML"};
+    if (phases.pptx && phases.pptx.status !== "skipped") names.pptx = "PowerPoint";
     stages.innerHTML = Object.entries(names).map(([key, label]) => {
         const phase = phases[key], state = phase?.status || "pending";
         const duration = state === "running" && phase.at ? (Date.now() - new Date(phase.at)) / 1000 : phase?.seconds;
-        return '<li data-state="' + esc(state) + '"><strong>' + label + '</strong><span>' +
+        return '<li data-state="' + esc(state) + '"' + (state === "running" ? ' aria-current="step"' : '') + '><strong>' + label + '</strong><span>' +
             state[0].toUpperCase() + state.slice(1) + (duration == null ? "" : " · " + Math.max(0, duration).toFixed(1) + " s") +
             '</span></li>';
     }).join("");

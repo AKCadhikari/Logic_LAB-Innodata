@@ -78,10 +78,10 @@ def http_error(error: HTTPException):
     return fail(error.description, error.code)
 
 
-def upload_file(field: str, extension: str, magic: bytes | None = None):
+def upload_file(field: str, extension: str, magic: bytes | None = None, *, file_count: int = 1):
     files = request.files.getlist(field)
-    if len(files) != 1 or sum(len(values) for _, values in request.files.lists()) != 1:
-        return None, "Select exactly one file."
+    if len(files) != 1 or sum(len(values) for _, values in request.files.lists()) != file_count:
+        return None, "Select exactly one file." if file_count == 1 else "Select one source PDF and one PowerPoint."
     file = files[0]
     filename = PureWindowsPath(file.filename or "").name
     if (Path(filename).suffix.lower() != extension or len(filename) > 255
@@ -89,6 +89,8 @@ def upload_file(field: str, extension: str, magic: bytes | None = None):
         return None, f"Select a valid {extension} file."
     if magic is not None and file.stream.read(len(magic)) != magic:
         return None, f"The file does not have a valid {extension} header."
+    if file_count > 1 and file.stream.seek(0, io.SEEK_END) >= 64 * 1024 * 1024:
+        return None, "Each file must be smaller than 64 MB."
     file.stream.seek(0)
     return (filename, file.stream), None
 
@@ -267,6 +269,37 @@ def create_document():
     return jsonify(ws.get(document_id)), 202
 
 
+@api.post("/paired-jobs")
+def create_paired_job():
+    request.max_content_length = 129 * 1024 * 1024
+    phase = request.form.get("phase", "1")
+    if phase not in {"1", "2"}:
+        return fail("Choose Phase 1 or Phase 2.", 400)
+    key = request.form.get("upload_key", "")
+    if not re.fullmatch(r"[0-9a-f-]{36}", key):
+        return fail("The upload needs a valid request identifier.", 400)
+    try:
+        engine, language = requested_ocr(request.form.get("ocr_engine"), request.form.get("ocr_language"))
+    except ValueError as error:
+        return fail(str(error), 400)
+    pdf_file, error = upload_file("pdf", ".pdf", b"%PDF-", file_count=2)
+    if error:
+        return fail(error, 400)
+    deck, error = upload_file("pptx", ".pptx", b"PK", file_count=2)
+    if error:
+        return fail(error, 400)
+    if error := validate_presentation_upload(deck[1]):
+        return fail(error, 400)
+    ws = workspace()
+    try:
+        document_id = ws.upload(*pdf_file, None, browser_owner(create=True), phase=phase, engine=engine,
+                                language=language, presentation=deck, upload_key=key)
+    except OSError:
+        current_app.logger.exception("Could not archive the document pair")
+        return fail("The document pair could not be saved in the selected phase folder.", 500)
+    return jsonify(ws.get(document_id)), 202
+
+
 @api.get("/history")
 def processing_history():
     owner = browser_owner(create=True)
@@ -278,6 +311,8 @@ def processing_history():
             linked.setdefault(deck["document_id"], deck["pptx_download_url"])
     reports_by_folder = {}
     for pdf in pdfs:
+        if pdf["source_pptx"]:
+            continue
         folder = ws.phase_output_dir(pdf["phase"]) / output_stem(pdf["filename"])
         if folder not in reports_by_folder:
             reports_by_folder[folder] = list(export_manifests(folder))
@@ -313,27 +348,34 @@ def create_standalone_presentation():
     if error:
         return fail(error, 400)
     filename, stream = uploaded
-    try:
-        with ZipFile(stream) as archive:
-            names = set(archive.namelist())
-            if ("ppt/presentation.xml" not in names or "[Content_Types].xml" not in names
-                    or not any(name.startswith("ppt/slides/slide") and name.endswith(".xml") for name in names)
-                    or archive.testzip() is not None):
-                return fail("This file is not a valid PowerPoint presentation. Choose a .pptx file.", 400)
-        stream.seek(0)
-        from pptx import Presentation
-
-        if not Presentation(stream).slides:
-            return fail("The PowerPoint presentation must contain at least one slide.", 400)
-        stream.seek(0)
-    except (BadZipFile, KeyError, OSError, ValueError):
-        return fail("This file is not a valid PowerPoint presentation. Choose a .pptx file.", 400)
+    if error := validate_presentation_upload(stream):
+        return fail(error, 400)
     try:
         job_id = ws.enqueue_presentation(filename, stream, owner, phase, document_id=document_id)
     except OSError:
         current_app.logger.exception("Could not archive the standalone PowerPoint input")
         return fail("The presentation could not be saved in the selected phase folder.", 500)
     return jsonify(ws.get_presentation(job_id, owner)), 202
+
+
+def validate_presentation_upload(stream):
+    try:
+        with ZipFile(stream) as archive:
+            names = set(archive.namelist())
+            if (len(names) != len(archive.infolist()) or len(names) > 10000
+                    or sum(item.file_size for item in archive.infolist()) > 256 * 1024 * 1024
+                    or "ppt/presentation.xml" not in names or "[Content_Types].xml" not in names
+                    or not any(name.startswith("ppt/slides/slide") and name.endswith(".xml") for name in names)
+                    or archive.testzip() is not None):
+                return "This file is not a valid PowerPoint presentation. Choose a .pptx file."
+        stream.seek(0)
+        from pptx import Presentation
+
+        if not Presentation(stream).slides:
+            return "The PowerPoint presentation must contain at least one slide."
+        stream.seek(0)
+    except (BadZipFile, KeyError, OSError, ValueError):
+        return "This file is not a valid PowerPoint presentation. Choose a .pptx file."
 
 
 @api.get("/presentations/<job_id>")
@@ -368,16 +410,40 @@ def standalone_presentation_source(job_id: str):
 @api.get("/presentations/<job_id>/preview")
 @api.get("/presentations/<job_id>/preview/<int:page>.png")
 def standalone_presentation_preview(job_id: str, page: int | None = None):
-    import pymupdf
-    from powerpoint.validation import render_pdf
-    from quality.slide_preview import renderer
-
     ws = workspace()
     source = ws.presentation_source(job_id, browser_owner())
     if not source:
         return fail("Presentation not found.", 404)
+    return slide_preview(ws, source, job_id, page)
+
+
+@api.get("/documents/<document_id>/slides/<variant>")
+@api.get("/documents/<document_id>/slides/<variant>/<int:page>.png")
+def paired_presentation_preview(document_id: str, variant: str, page: int | None = None):
+    ws = workspace()
+    info = ws.get(document_id)
+    if not info["source_pptx"] or variant not in {"original", "repaired"}:
+        return fail("Presentation preview not found.", 404)
+    if variant == "original":
+        return slide_preview(ws, ws.paired_source(document_id), f"{document_id}-original", page)
+    found = latest_unified_export(document_id, info)
+    if found:
+        folder, report = found
+        deck = report["outputs"]["pptx"]
+        if deck and deck["valid"] and (source := export_file(folder, deck["filename"])):
+            return slide_preview(ws, source, f"{document_id}-{report['id']}", page)
+    return fail("The repaired presentation is unavailable.", 409)
+
+
+def slide_preview(ws, source, key, page):
+    import pymupdf
+    from powerpoint.validation import render_pdf
+    from quality.slide_preview import renderer
+
+    if not source.is_file():
+        return fail("The saved presentation is missing.", 404)
     folder = ws.root / "presentation-previews"
-    target = folder / f"{job_id}.pdf"
+    target = folder / f"{key}.pdf"
     try:
         if not target.is_file():
             with ws.preview_lock:
@@ -482,6 +548,10 @@ def document(document_id: str):
                     submission_export=result.get("submission_export"),
                     processing_counts=result.get("processing_counts"),
                     content_validation=result.get("multilingual_validation", {}))
+    if info["source_pptx"] and info["jobs"][0].get("final_export", {}).get("archive_ready"):
+        final = info["jobs"][0]["final_export"]
+        if unified_archive(document_id, info) is None:
+            final.update(archive_ready=False, error="The saved final archive is missing. Reprocess the stored pair to rebuild it.")
     return jsonify(info)
 
 
@@ -550,9 +620,15 @@ def metadata(document_id: str):
             or not re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", lang) or len(lang) > 35
             or not isinstance(approved, bool)):
         return fail("Use a title up to 1000 characters and a language code such as en, ar or und.", 400)
-    if not ws.review(document_id, title.strip(), lang, approved):
+    try:
+        reviewed = ws.review(document_id, title.strip(), lang, approved)
+    except ValueError as error:
+        return fail(str(error), 422)
+    if not reviewed:
         return fail("Wait until processing finishes before reviewing.", 409)
     response = document(document_id).get_json()
+    if response.get("source_pptx"):
+        return jsonify(response)
     if approved:
         info = ws.get(document_id)
         snapshot = ws.extracted(document_id)
@@ -796,6 +872,11 @@ def sync_deck(document_id: str):
         if not info["approved"]:
             return fail("Submit the metadata review before generating PowerPoint.", 409)
         filename = info["filename"]
+    elif info["source_pptx"]:
+        filename = info["source_pptx"]
+        source_path = ws.paired_source(document_id)
+        if not source_path.is_file():
+            return fail("The saved PowerPoint is missing.", 404)
     else:
         uploaded, error = upload_file("pptx", ".pptx")
         if error:
@@ -809,19 +890,24 @@ def sync_deck(document_id: str):
     export_id = uuid4()
     stem = output_stem(info["filename"])
 
+    def transform_deck(source, target):
+        if mode == "source":
+            return ws.worker.submit(repair_presentation, ir, source, target, settings).result()
+        changes = version_changes(document_id, previous_id, (ir, settings, extraction), previous)
+        reviewed, analysis = assess_changes(document_id, changes)
+        return {**synchronize(source, target, reviewed), "analysis": analysis}
+
     def transform(output: Path) -> dict:
         if mode == "generate":
             return ws.worker.submit(render_presentation, ir, output).result()
+        if info["source_pptx"]:
+            return transform_deck(source_path, output)
         with TemporaryDirectory(prefix="presentation-", dir=ws.source(document_id).parent) as temp:
             source = Path(temp) / "source.pptx"
             with source.open("xb") as file:
                 while chunk := stream.read(1024 * 1024):
                     file.write(chunk)
-            if mode == "source":
-                return ws.worker.submit(repair_presentation, ir, source, output, settings).result()
-            changes = version_changes(document_id, previous_id, (ir, settings, extraction), previous)
-            reviewed, analysis = assess_changes(document_id, changes)
-            return {**synchronize(source, output, reviewed), "analysis": analysis}
+            return transform_deck(source, output)
 
     with ws.export_lock:
         if document_id in ws.export_progress:
@@ -896,6 +982,34 @@ def bundle(document_id: str, export_id: UUID):
         if report.get("document_id") == document_id and report.get("id") == str(export_id):
             return folder, available_outputs(folder, report)
     return None
+
+
+def latest_unified_export(document_id: str, info):
+    final = info["jobs"][0].get("final_export") or {}
+    if not info["source_pptx"] or not final.get("id"):
+        return None
+    found = bundle(document_id, UUID(final["id"]))
+    return found if found and found[1]["mode"] == "unified" else None
+
+
+def unified_archive(document_id: str, info):
+    if info["jobs"][0]["status"] != "completed":
+        return None
+    if found := latest_unified_export(document_id, info):
+        folder, report = found
+        archive = report.get("archive")
+        if (archive and archive["valid"] and report["status"] == "completed" and
+                report["validation"]["zip"]["valid"]):
+            return export_file(folder, archive["filename"])
+    return None
+
+
+@api.get("/documents/<document_id>/final-output")
+def final_output(document_id: str):
+    target = unified_archive(document_id, workspace().get(document_id))
+    if target is None:
+        return fail("The validated final output is not available.", 409)
+    return send_file(target, mimetype="application/zip", as_attachment=True, download_name=target.name)
 
 
 @api.get("/documents/<document_id>/presentations/<uuid:export_id>")

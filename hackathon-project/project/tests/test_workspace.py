@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import time
+from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from zipfile import ZipFile
@@ -26,6 +27,7 @@ def workspace(tmp_path_factory):
     with pytest.MonkeyPatch.context() as patch, app.test_client() as client:
         for key in ("run", "input", "output"):
             patch.setitem(CFG, key, root / key)
+        client.get("/api/documents")
         yield client, root
     app.extensions["workspace"].worker.shutdown()
 
@@ -53,10 +55,94 @@ def wait_for_attempt(client, url):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         result = client.get(url).json
-        if result["jobs"][0]["status"] in ("completed", "failed"):
+        if result["jobs"][0]["status"] in ("completed", "failed", "review"):
             return result
         time.sleep(0.05)
     pytest.fail("The processing attempt did not finish.")
+
+
+def test_paired_job_reuses_inputs_after_review_and_exports_one_valid_zip(workspace, monkeypatch):
+    from reporting import exports
+
+    _, root = workspace
+    client = app.test_client()
+    client.get("/api/documents")
+    ws = app.extensions["workspace"]
+    source = "The regional inventory contains 260 units verified by the audit coordinator."
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    shape = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(7), Inches(1))
+    run = shape.text_frame.paragraphs[0].add_run()
+    run.text = source.replace("260", "987")
+    run.font.bold = True
+    stream = io.BytesIO()
+    deck.save(stream)
+    original = stream.getvalue()
+    original_compare = exports.compare_content
+
+    def require_review(data, ir, locations, **options):
+        result = original_compare(data, ir, locations, **options)
+        result["source_review"].append({"page": 1, "kind": "source_numeric_disagreement"})
+        return result
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        monkeypatch.setattr(ws, "worker", worker)
+        monkeypatch.setattr(ws.settings, "amend_render_validation", False)
+        monkeypatch.setattr(exports, "compare_content", require_review)
+        key = str(uuid4())
+
+        def submit():
+            return client.post("/api/paired-jobs", data={"upload_key": key, "phase": "2",
+                "pdf": (io.BytesIO(pdf_with_text(source)), "unified-review.pdf"),
+                "pptx": (io.BytesIO(original), "unified-original.pptx")})
+
+        first = submit()
+        assert first.status_code == 202, first.data
+        document_id = first.json["id"]
+        assert submit().json["id"] == document_id
+        base = f"/api/documents/{document_id}"
+        paused = wait_for_attempt(client, base)
+        job, = paused["jobs"]
+        assert job["status"] == "review", job
+        assert paused["pages"] and job["final_export"]["xml_ready"]
+        assert client.get(base + "/final-output").status_code == 409
+        assert client.get("/api/history").json["presentations"] == []
+        assert (root / document_id / "source.pptx").read_bytes() == original
+        assert (root / "phase-2/input/unified-original.pptx").read_bytes() == original
+        approval = client.patch(base + "/metadata", json={"title": "Quarterly review", "lang": "en", "approved": True})
+        assert approval.status_code == 200, approval.data
+        finished = wait_for_attempt(client, base)
+        resumed, = finished["jobs"]
+        assert resumed["id"] == job["id"] and resumed["status"] == "completed", resumed
+        assert all(resumed["processing"]["phases"][stage]["status"] == "completed" for stage in (
+            "pdf_extraction", "xml_generation", "assets", "validation", "pptx_analysis", "pptx_correction",
+            "final_validation", "zip"))
+        download = client.get(base + "/final-output")
+        assert download.status_code == 200
+        with ZipFile(io.BytesIO(download.data)) as archive:
+            assert set(archive.namelist()) == {"unified-review.xml", "unified-review_repaired.pptx",
+                                              "output_images/unified-review/"}
+            corrected = Presentation(io.BytesIO(archive.read("unified-review_repaired.pptx")))
+            assert corrected.slides[0].shapes[0].text == source
+            assert corrected.slides[0].shapes[0].text_frame.paragraphs[0].runs[0].font.bold
+        assert app.test_client().get(base + "/final-output").status_code == 404
+
+        def block_content(data, ir, locations, **options):
+            result = original_compare(data, ir, locations, **options)
+            result["issues"].append({"page": 1, "kind": "missing_paragraph"})
+            return result
+
+        monkeypatch.setattr(exports, "compare_content", block_content)
+        key = str(uuid4())
+        other = submit()
+        assert other.json["id"] != document_id
+        other_url = f"/api/documents/{other.json['id']}"
+        blocked = wait_for_attempt(client, other_url)["jobs"][0]
+        assert blocked["status"] == "review"
+        assert blocked["final_export"]["source_review"]["blocking_pages"] == [1]
+        assert client.patch(other_url + "/metadata", json={"title": "Quarterly review", "lang": "en",
+                                                            "approved": True}).status_code == 422
+        assert client.get(other_url + "/final-output").status_code == 409
 
 
 def test_deferred_pdf_upload_can_be_inspected_before_processing(workspace):

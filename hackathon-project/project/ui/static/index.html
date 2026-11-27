@@ -16,6 +16,9 @@
 <nav id="document-switch" class="tabs" aria-label="Uploaded documents" hidden>
  <button type="button" class="tab" id="switch-pdf" aria-pressed="false">PDF</button>
  <button type="button" class="tab" id="switch-pptx" aria-pressed="false">PowerPoint</button>
+ <div id="paired-result" hidden><span id="paired-status" role="status"></span>
+  <button type="button" class="btn pri" id="final-download" disabled>Download Final Output (ZIP)</button></div>
+ <div id="paired-progress" hidden></div>
 </nav>
 <main id="home" class="home-screen" aria-labelledby="home-heading">
  <div class="home-intro">
@@ -60,7 +63,7 @@
   <article class="upload-card" aria-labelledby="pptx-card-heading">
    <div class="upload-card-heading"><span class="file-type pptx-type">PPTX</span><div>
     <h2 id="pptx-card-heading">PowerPoint Proofreading</h2>
-    <p>Upload a PowerPoint presentation to detect and correct writing errors.</p>
+    <p>Upload the original presentation to repair it against the source PDF.</p>
    </div></div>
    <input id="home-pptx-file" class="visually-hidden-input" type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation">
    <div id="pptx-drop" class="drop-zone" role="button" tabindex="0" aria-label="Choose or drop a PowerPoint file">
@@ -72,17 +75,10 @@
     <div class="selection-actions"><button type="button" class="btn" id="pptx-replace">Replace</button>
      <button type="button" class="btn" id="pptx-remove">Remove</button></div>
    </div>
-   <details class="processing-settings">
-    <summary>Processing settings</summary>
-    <div class="settings-grid">
-     <label for="pptx-phase-select">Submission phase</label>
-     <select id="pptx-phase-select"><option value="1">Phase 1</option><option value="2">Phase 2</option></select>
-    </div>
-   </details>
    <progress id="home-pptx-progress" class="upload-progress" aria-label="PowerPoint proofreading progress" hidden></progress>
    <p id="home-pptx-status" class="upload-status" role="status" aria-live="polite"></p>
    <details class="advanced-details"><summary>Advanced details</summary>
-    <p>Writing suggestions use the configured local Qwen proofreading model. Changes to numbers and units are held for review.</p>
+    <p>Supported corrections use evidence extracted from the uploaded PDF.</p>
    </details>
   </article>
  </div>
@@ -102,6 +98,7 @@
     <button type="button" class="btn" id="pptx-next">Next slide</button>
    </div>
    <a id="pptx-original" class="btn" download>Download original</a>
+   <label id="paired-variant-control" hidden>Show <select id="paired-variant"><option value="repaired">Repaired</option><option value="original">Original</option></select></label>
   </footer>
  </section>
  <aside class="side" aria-labelledby="pptx-review-heading">

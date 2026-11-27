@@ -6,7 +6,7 @@ opencv-contrib-python==4.10.0.84  # same cv2 wheel required by PaddleOCR
 python-pptx>=1.0         # tested 1.0.2
 rapidfuzz>=3.0           # tested 3.14
 regex>=2024.11.6        # Unicode Script properties and grapheme segmentation
-flask>=3.0               # dashboard only; tested 3.1
+flask>=3.1               # dashboard and per-route upload limits
 pytest>=8.0              # tests only
 psutil>=5.9              # launcher process ownership and memory checks
 Pillow>=10.1             # synthetic image for GLM-OCR startup inference

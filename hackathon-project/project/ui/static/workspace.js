@@ -7,7 +7,8 @@ const statusText = message => $("#runchip").textContent = message;
 const engineName = engine => ({"glm-ocr": "GLM-OCR", "paddleocr-vl": "PaddleOCR-VL (Ollama)",
     paddleocr: "PaddleOCR", tesseract: "Tesseract"}[engine] || "");
 const ocrModeName = mode => engineName(mode) || (mode === "automatic" ? "Automatic" : "");
-const ocrJobOptions = () => ({ocr_engine: $("#ocr-engine").value, ocr_language: $("#ocr-language").value});
+const ocrJobOptions = () => ({ocr_engine: $("#retry-engine")?.value || $("#ocr-engine").value,
+    ocr_language: $("#ocr-language").value});
 let ocrHealth;
 let ocrPreferenceChanged = false;
 let ocrPreferenceWrite = Promise.resolve();
@@ -182,6 +183,12 @@ const processingStatus = step => {
     if (step.stage === "association") return "Associating layout and OCR";
     if (step.stage === "layout") return "Reconstructing document" + (step.page ? " · page " + step.page : "");
     if (step.stage === "validation") return "Validating document and XML";
+    if (step.stage === "xml_generation") return "Generating XML";
+    if (step.stage === "assets") return "Extracting images and formula crops";
+    if (step.stage === "pptx_analysis") return "Analyzing slide " + step.slide + " of " + step.total_slides;
+    if (step.stage === "pptx_correction" || step.stage === "pptx") return "Correcting PowerPoint against the PDF";
+    if (step.stage === "final_validation") return "Validating the repaired presentation";
+    if (step.stage === "zip") return "Preparing the final ZIP";
     return "";
 };
 
@@ -201,9 +208,12 @@ function showOcrTimeline(job, active) {
     const stages = $("#processing-stages");
     const phases = {...step?.phases, ...W.exportPhases.get(S.id)};
     stages.hidden = pane.hidden || !Object.keys(phases).length;
-    const names = {diagnostics: "PDF check", rendering: "Rendering", detection: "Layout detection",
-        ocr: "Text extraction", association: "Region matching", layout: "Reading order", validation: "XML"};
-    if (phases.pptx && phases.pptx.status !== "skipped") names.pptx = "PowerPoint";
+    const names = S.data?.source_pptx ? {pdf_extraction: "PDF extraction", xml_generation: "XML generation",
+        assets: "Images and formulas", validation: "XML validation", pptx_analysis: "Slide analysis",
+        pptx_correction: "Slide correction", final_validation: "Final validation", zip: "ZIP"} :
+        {diagnostics: "PDF check", rendering: "Rendering", detection: "Layout detection",
+            ocr: "Text extraction", association: "Region matching", layout: "Reading order", validation: "XML"};
+    if (!S.data?.source_pptx && phases.pptx && phases.pptx.status !== "skipped") names.pptx = "PowerPoint";
     stages.innerHTML = Object.entries(names).map(([key, label]) => {
         const phase = phases[key], state = phase?.status || "pending";
         const duration = state === "running" && phase.at ? (Date.now() - new Date(phase.at)) / 1000 : phase?.seconds;
@@ -348,6 +358,7 @@ async function selectWorkspace(id, reset = true) {
     W.source = source;
     S.id = id;
     S.data = data;
+    window.updatePairedWorkspace?.(data);
     $("#docsel").value = id;
     const job = data.jobs[0];
     const listed = W.documents.find(document => document.id === id);
@@ -374,11 +385,11 @@ async function selectWorkspace(id, reset = true) {
     $("#reproc").disabled = active;
     $("#reproc").hidden = job.status === "uploaded";
     $("#reproc").textContent = job.status === "failed" ? "Retry" : "Reprocess";
-    const canDownloadXml = data.approved || (job.status === "completed" && hasSavedPdfXml(data.submission_export));
+    const canDownloadXml = !data.source_pptx && (data.approved || (job.status === "completed" && hasSavedPdfXml(data.submission_export)));
     $("#dlxml").disabled = !canDownloadXml;
     $("#dlpptx").disabled = active || !data.approved || !!data.content_validation?.blocking_pages?.length;
-    $("#dlpptx").hidden = !data.approved;
-    $("#deck-tab").hidden = !data.pages;
+    $("#dlpptx").hidden = !!data.source_pptx || !data.approved;
+    $("#deck-tab").hidden = !!data.source_pptx || !data.pages;
     $("#dlxml").hidden = !canDownloadXml;
     $("#dlxml").title = canDownloadXml ? "Downloads a ZIP when the XML has images" : "Approve metadata review before exporting";
     workspaceViewer();
@@ -743,7 +754,9 @@ async function reviewPanel() {
         panel.textContent = "Loading XML…";
         try {
             let url = base + "/xml";
-            if (hasSavedPdfXml(saved) && !data.approved) {
+            if (data.source_pptx && job.final_export?.xml_ready) {
+                url = base + "/presentations/" + encodeURIComponent(job.final_export.id) + "/xml?preview=1";
+            } else if (hasSavedPdfXml(saved) && !data.approved) {
                 const report = await savedPdfXmlReport(data, base);
                 url = base + "/presentations/" + encodeURIComponent(report.id) + "/xml?preview=1";
             }
@@ -802,7 +815,22 @@ async function reviewPanel() {
             data.content_validation?.status === "validation_partial" ?
                 '<strong class="notice">Validation partially passed · content review required</strong>' : '') + '</div>' +
         data.warnings.map(warning => '<div class="notice">' + esc(warning) + '</div>').join("") + history;
-    panel.innerHTML = '<section id="region-inspector" aria-label="Element inspector"></section>' +
+    const review = job.status === "review" ? job.final_export?.source_review : null;
+    const blocking = review?.blocking_pages?.length || review?.issues?.length;
+    const affected = review ? [...new Set([...review.blocking_pages, ...[...review.items, ...review.issues].map(row => row.page)].filter(Boolean))] : [];
+    const reviewNotice = !review ? "" : '<div class="card"><strong>Source review required</strong><p>' +
+        (blocking ? "Recover missing or inconsistent content by reprocessing the saved files." :
+            "Check the affected pages against the original PDF. Submit review to resume the same job.") + '</p>' +
+        (blocking ? '<label for="retry-engine">OCR for reprocessing</label> ' +
+            '<select id="retry-engine"><option value="automatic">Automatic</option><option value="glm-ocr">GLM-OCR</option>' +
+            '<option value="paddleocr">PaddleOCR</option></select>' : '') +
+        affected.map(number => '<button type="button" class="btn" data-review-page="' + number + '">Page ' + number + '</button>').join(" ") +
+        [...review.items, ...review.issues].slice(0, 12).map(row => '<div>' + esc(row.reason || row.kind || "Check source content") + '</div>').join("") + '</div>';
+    const warnings = job.final_export?.source_warnings || [];
+    const warningList = warnings.length ? '<details class="advanced-details"><summary>Source warnings (' + warnings.length +
+        ')</summary>' + warnings.map(item => '<div>Page ' + esc(item.page) + ' · ' +
+        esc(item.kind.replaceAll("_", " ")) + '</div>').join("") + '</details>' : '';
+    panel.innerHTML = reviewNotice + warningList + '<section id="region-inspector" aria-label="Element inspector"></section>' +
         '<section id="source-fields">' + sourceFields() + '</section><div class="sec">Extracted metadata</div>' +
         '<form id="metadata-form" class="workspace-tools">' +
         '<div class="fld"><label for="review-title">Title</label>' +
@@ -816,6 +844,10 @@ async function reviewPanel() {
         '<details class="advanced-details"><summary>Advanced metadata and diagnostics</summary>' +
         advanced + '</details>';
     updateInspector();
+    panel.querySelectorAll("[data-review-page]").forEach(button => button.onclick = () => {
+        setView("pdf");
+        movePage(Number(button.dataset.reviewPage) - W.page);
+    });
     const locate = $("#locate");
     if (locate) locate.onclick = () => {
         W.page = title.page;
@@ -826,7 +858,9 @@ async function reviewPanel() {
         $("#page-diagnostics").innerHTML = pageDiagnostics(data.pages[W.page - 1]);
     };
     const form = $("#metadata-form");
-    form.querySelectorAll("input,button").forEach(control => control.disabled = job.status !== "completed");
+    const editable = data.source_pptx ? !!review && !blocking : job.status === "completed";
+    form.querySelectorAll("input,button").forEach(control => control.disabled = !editable);
+    if (data.source_pptx && !editable) form.querySelectorAll('button[value]').forEach(control => control.hidden = true);
     form.onsubmit = async event => {
         event.preventDefault();
         const payload = {title: $("#review-title").value, lang: $("#review-lang").value,
@@ -878,9 +912,9 @@ function changesPanel(data) {
         alternatives.map(doc => '<option value="' + esc(doc.id) + '">' + esc(doc.filename) + ' · ' +
                                  doc.id.slice(0, 6) + '</option>').join("") + '</select>' +
         '<button id="compare" class="btn pri">Compare versions</button>' +
-        '<form id="deck-upload" class="workspace-tools"><label for="deck-file">Related PowerPoint</label>' +
+        '<form id="deck-upload" class="workspace-tools">' + (data.source_pptx ? '' : '<label for="deck-file">Related PowerPoint</label>' +
         '<input id="deck-file" type="file" accept=".pptx" required>' +
-        '<button class="btn" value="source">Repair and export XML + PowerPoint</button>' +
+        '<button class="btn" value="source">Repair and export XML + PowerPoint</button>') +
         '<button class="btn" value="version">Apply version changes and export</button></form></div>' +
         '<div id="comparison-results"></div><div id="presentation-history"></div>';
     $("#previous").value = W.previous;
@@ -901,15 +935,19 @@ function changesPanel(data) {
     const renderExports = async (displayedId = null) => {
         const url = docUrl() + "/presentations";
         const allReports = await workspaceFetch(url);
-        const reports = allReports.filter(report => report.id !== displayedId);
+        const finalId = data.jobs[0].final_export?.id;
+        const reports = allReports.filter(report => report.id !== displayedId && report.id !== finalId);
         const history = $("#presentation-history");
         if (!history || S.data !== data || S.stab !== "deck" || W.batch) return;
-        const latest = allReports.find(report => report.job_id === data.jobs[0].id);
+        const latest = reports.find(report => report.job_id === data.jobs[0].id && report.mode !== "unified");
         if (latest?.export_phases) {
             W.exportPhases.set(data.id, latest.export_phases);
             showOcrTimeline(data.jobs[0], false);
         }
-        history.innerHTML = (reports.length ? '<div class="sec">Export history</div>' : '') + reports.map(report => report.outputs ?
+        history.innerHTML = (reports.length ? '<div class="sec">Export history</div>' : '') + reports.map(report => report.mode === "unified" ?
+            '<div class="card">' + esc(new Date(report.created).toLocaleString()) + ' · ' + esc(report.status) +
+                (report.status === "completed" && report.archive?.valid ? '<div><a class="workspace-link" href="' +
+                    presentationLinks(url, report.id).zip + '">Download archived final ZIP</a></div>' : '') + '</div>' : report.outputs ?
             exportCard(report, presentationLinks(url, report.id)) :
             '<div class="card"><a class="workspace-link" href="' + presentationLinks(url, report.id).pptx + '">' +
             esc(report.filename) + '</a> · ' + report.applied.length + ' edits · ' +
@@ -945,7 +983,7 @@ function changesPanel(data) {
     $("#deck-upload").onsubmit = async event => {
         event.preventDefault();
         const form = new FormData();
-        form.append("pptx", $("#deck-file").files[0]);
+        if (!data.source_pptx) form.append("pptx", $("#deck-file").files[0]);
         const button = event.submitter;
         form.append("mode", button.value);
         if (button.value === "version") form.append("previous_id", W.previous);
@@ -1291,7 +1329,7 @@ $("#profile-form").onsubmit = async event => {
     } catch (error) { $("#profile-status").textContent = error.message; }
 };
 workspaceFetch("/api/profile").then(profile => { $("#reviewer-label").textContent = profile.name; }).catch(showError);
-loadWorkspace().then(async () => {
+(new URLSearchParams(location.search).has("job") ? Promise.resolve() : loadWorkspace()).then(async () => {
     const prefs = await workspaceFetch("/api/ocr-settings");
     if (!ocrPreferenceChanged) $("#ocr-engine").value = prefs.engine;
     showOcrChoice();

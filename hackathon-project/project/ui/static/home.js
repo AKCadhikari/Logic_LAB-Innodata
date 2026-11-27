@@ -1,5 +1,5 @@
 const homeState = {pdf: null, pptx: null, uploading: false, activePptx: null, pair: null,
-    uploads: {}, selecting: {pdf: 0, pptx: 0}};
+    uploadKey: null, selecting: {pdf: 0, pptx: 0}};
 const pptxPreview = {slide: 1, total: 0};
 const home$ = selector => document.querySelector(selector);
 const homeEsc = value => String(value ?? "").replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
@@ -15,12 +15,26 @@ window.showAppScreen = function (screen) {
     home$("#pptx-workspace").hidden = screen !== "pptx";
     const reviewVisible = screen === "review" || screen === "batch";
     home$("#library").hidden = !reviewVisible || !W.batch;
-    const pair = homeState.pair;
-    const paired = !W.batch && pair && ((screen === "review" && S.id === pair.pdf.id) ||
-        (screen === "pptx" && homeState.activePptx === pair.pptx.id));
+    const paired = !W.batch && homeState.pair?.id === S.id &&
+        (screen === "review" || (screen === "pptx" && !homeState.activePptx));
     home$("#document-switch").hidden = !paired;
+    home$("#paired-result").hidden = !paired;
+    home$("#paired-progress").hidden = !paired;
     app.classList.toggle("paired-workspace", Boolean(paired));
     app.classList.toggle("batch-tools-visible", reviewVisible && W.batch);
+    const viewerTabs = home$("#vtabs");
+    const timeline = [home$("#ocr-timeline"), home$("#processing-stages")];
+    if (paired) home$("#paired-progress").append(...timeline);
+    else viewerTabs.before(...timeline);
+    const url = new URL(location.href);
+    if (paired) {
+        url.searchParams.set("job", homeState.pair.id);
+        url.searchParams.set("tab", screen === "pptx" ? "pptx" : "pdf");
+    } else {
+        url.searchParams.delete("job");
+        url.searchParams.delete("tab");
+    }
+    history.replaceState(null, "", url);
     setActive(home$("#switch-pdf"), screen === "review");
     setActive(home$("#switch-pptx"), screen === "pptx");
     home$("#main").hidden = !reviewVisible;
@@ -89,8 +103,7 @@ async function selectHomeFile(kind, files) {
         await validateSelectedFile(selected[0], kind);
         if (selection !== homeState.selecting[kind] || homeState.uploading) return;
         homeState[kind] = selected[0];
-        delete homeState.uploads[kind];
-        if (kind === "pdf") delete homeState.uploads.pptx;
+        homeState.uploadKey = null;
         home$("#pair-retry").hidden = true;
         syncSelection(kind);
         const other = kind === "pdf" ? "pptx" : "pdf";
@@ -130,8 +143,7 @@ function setupDrop(kind) {
         if (homeState.uploading) return;
         homeState.selecting[kind]++;
         homeState[kind] = null;
-        delete homeState.uploads[kind];
-        if (kind === "pdf") delete homeState.uploads.pptx;
+        homeState.uploadKey = null;
         home$("#pair-retry").hidden = true;
         setUploadStatus(kind, "File removed.");
         syncSelection(kind);
@@ -153,63 +165,51 @@ function uploadWithProgress(url, form, progress) {
     });
 }
 
-async function openPdfWorkspace(id) {
+async function openPdfWorkspace(id, screen = "review", advanced = false) {
     W.batch = false;
     home$("#batch").textContent = "Batch review";
     for (const control of ["#upload-zone", "#layout-model", "#ocr-controls"]) home$(control).hidden = false;
     S.vtab = "pdf";
-    S.stab = "meta";
+    S.stab = advanced ? "deck" : "meta";
     for (const group of ["#vtabs", "#stabs"]) {
         home$(group).querySelectorAll("button").forEach(button =>
-            setActive(button, button.dataset.t === (group === "#vtabs" ? "pdf" : "meta")));
+            setActive(button, button.dataset.t === (group === "#vtabs" ? "pdf" : S.stab)));
     }
     await loadWorkspace(id);
-    window.showAppScreen("review");
-}
-
-async function uploadSelected(kind) {
-    if (homeState.uploads[kind]) return;
-    const pdf = kind === "pdf";
-    const progress = home$("#home-" + kind + "-progress");
-    progress.hidden = false;
-    progress.removeAttribute("value");
-    setUploadStatus(kind, pdf ? "Uploading PDF?" : "Uploading PowerPoint?");
-    const form = new FormData();
-    form.append(kind, homeState[kind]);
-    form.append("phase", home$(pdf ? "#phase-select" : "#pptx-phase-select").value);
-    if (pdf) {
-        form.append("ocr_engine", home$("#home-ocr-engine").value);
-        form.append("defer", "1");
-    } else {
-        form.append("document_id", homeState.uploads.pdf.id);
-    }
-    try {
-        homeState.uploads[kind] = await uploadWithProgress(pdf ? "/api/documents" : "/api/presentations", form,
-            (loaded, total) => { progress.max = total; progress.value = loaded; });
-        setUploadStatus(kind, "Uploaded.", "success");
-    } catch (error) {
-        const message = (pdf ? "PDF" : "PowerPoint") + " upload failed. " + error.message;
-        setUploadStatus(kind, message, "error");
-        throw new Error(message);
-    } finally {
-        progress.hidden = true;
-    }
+    homeState.activePptx = null;
+    window.showAppScreen(screen);
+    if (screen === "pptx" && homeState.pair) updatePairedWorkspace(S.data);
 }
 
 async function uploadPair() {
     if (homeState.uploading || !homeState.pdf || !homeState.pptx) return;
     homeState.uploading = true;
     home$("#pair-retry").hidden = true;
-    for (const kind of ["pdf", "pptx"]) syncSelection(kind);
+    const progress = ["pdf", "pptx"].map(kind => {
+        syncSelection(kind);
+        setUploadStatus(kind, "Uploading document pair…");
+        const bar = home$("#home-" + kind + "-progress");
+        bar.hidden = false;
+        bar.removeAttribute("value");
+        return bar;
+    });
     try {
         const backend = await workspaceFetch("/api/startup/identity");
-        if (backend.workspace_api_version !== 2) throw new Error(workspaceUpdateMessage);
-        await uploadSelected("pdf");
-        await uploadSelected("pptx");
-        homeState.pair = {...homeState.uploads};
-        await openPdfWorkspace(homeState.pair.pdf.id);
-        openPptxWorkspace(homeState.pair.pptx, false);
-        homeState.uploads = {};
+        if (backend.workspace_api_version !== 3) throw new Error(workspaceUpdateMessage);
+        homeState.uploadKey ||= crypto.randomUUID();
+        const form = new FormData();
+        form.append("pdf", homeState.pdf);
+        form.append("pptx", homeState.pptx);
+        form.append("upload_key", homeState.uploadKey);
+        form.append("phase", home$("#phase-select").value);
+        form.append("ocr_engine", home$("#home-ocr-engine").value);
+        // Establish the browser ownership cookie before a retriable submission.
+        await workspaceFetch("/api/documents");
+        const job = await uploadWithProgress("/api/paired-jobs", form, (loaded, total) => {
+            for (const bar of progress) { bar.max = total; bar.value = loaded; }
+        });
+        await openPdfWorkspace(job.id);
+        homeState.uploadKey = null;
         for (const kind of ["pdf", "pptx"]) {
             homeState[kind] = null;
             setUploadStatus(kind, "");
@@ -219,21 +219,84 @@ async function uploadPair() {
         home$("#pair-retry").hidden = false;
     } finally {
         homeState.uploading = false;
+        for (const bar of progress) bar.hidden = true;
         for (const kind of ["pdf", "pptx"]) syncSelection(kind);
     }
 }
 
 home$("#retry-pair").onclick = uploadPair;
-home$("#switch-pdf").onclick = () => {
-    const id = homeState.pair.pdf.id;
-    if (!W.batch && S.id === id) window.showAppScreen("review");
-    else openPdfWorkspace(id).catch(showError);
-};
+home$("#switch-pdf").onclick = () => window.showAppScreen("review");
 home$("#switch-pptx").onclick = () => {
-    const job = homeState.pair.pptx;
-    if (homeState.activePptx === job.id) window.showAppScreen("pptx");
-    else openPptxWorkspace(job);
+    homeState.activePptx = null;
+    window.showAppScreen("pptx");
+    updatePairedWorkspace(S.data);
 };
+home$("#final-download").onclick = () => {
+    if (homeState.pair && S.data?.jobs[0].final_export?.archive_ready) {
+        location.href = docUrl() + "/final-output";
+    }
+};
+
+function renderPairedCorrections(final) {
+    const result = home$("#pptx-workspace-results");
+    const rows = [...(final?.applied || []), ...(final?.review || [])];
+    result.innerHTML = '<p>' + (final?.deck_ready ?
+        final.applied.length + " corrections applied · " + final.review.length + " items for review" :
+        "Source-backed corrections will appear here after processing.") + '</p>' +
+        rows.map(row => '<article class="job-issue"><strong>Slide ' + homeEsc(row.slide) + ' · ' +
+            homeEsc(row.action === "applied" ? "Applied" : "Review") + '</strong><small>' +
+            homeEsc(row.old || row.old_content) + '</small><small>' + homeEsc(row.new || row.proposed_content) +
+            '</small><small>' + homeEsc(row.reason) + (row.source?.page ? ' · PDF page ' + homeEsc(row.source.page) : '') +
+            '</small></article>').join("");
+}
+
+window.updatePairedWorkspace = function (data) {
+    if (!data?.source_pptx) {
+        homeState.pair = null;
+        return;
+    }
+    const job = data.jobs[0], final = job.final_export;
+    homeState.pair = data;
+    home$("#final-download").disabled = job.status !== "completed" || !final?.archive_ready;
+    const status = job.status === "review" ? "Source review required" : final?.error || job.error || (job.status === "completed" ?
+        (final?.warnings ? "Ready · " + final.warnings + " items remain for review" : "Final output ready") : statusLabel(job.status));
+    if (home$("#paired-status").textContent !== status) home$("#paired-status").textContent = status;
+    if (home$("#pptx-workspace").hidden || homeState.activePptx) return;
+    home$("#pptx-workspace-name").textContent = data.source_pptx;
+    home$("#pptx-original").hidden = true;
+    const ready = !!final?.deck_ready;
+    const variantControl = home$("#paired-variant"), available = data.id + ":" + (ready ? final.id : "original");
+    home$("#paired-variant-control").hidden = !ready;
+    if (available !== pptxPreview.version) {
+        pptxPreview.version = available;
+        if (pptxPreview.document !== data.id) pptxPreview.slide = 1;
+        pptxPreview.document = data.id;
+        variantControl.value = ready ? "repaired" : "original";
+        renderPairedCorrections(final);
+    }
+    requestPairedPreview(variantControl.value);
+};
+
+function requestPairedPreview(variant) {
+    const base = docUrl() + "/slides/" + variant;
+    const key = pptxPreview.version + ":" + variant;
+    if (pptxPreview.key === key) return;
+    pptxPreview.key = key;
+    pptxPreview.base = base;
+    home$("#pptx-slide-tools").hidden = true;
+    home$("#pptx-viewer").textContent = "Rendering slides…";
+    workspaceFetch(base).then(info => {
+        if (pptxPreview.key !== key) return;
+        pptxPreview.total = info.slides;
+        pptxPreview.slide = Math.min(pptxPreview.slide, info.slides);
+        home$("#pptx-slide-tools").hidden = false;
+        pptxSlide();
+    }).catch(error => {
+        if (pptxPreview.key === key) home$("#pptx-viewer").textContent = error.message;
+    });
+}
+
+home$("#paired-variant").onchange = event => requestPairedPreview(event.target.value);
 
 function renderPptxResult(job) {
     const result = job.result || {};
@@ -256,8 +319,8 @@ function renderPptxResult(job) {
 function pptxSlide() {
     const {slide, total} = pptxPreview;
     const image = document.createElement("img");
-    image.alt = "Original slide " + slide;
-    image.src = "/api/presentations/" + encodeURIComponent(homeState.activePptx) + "/preview/" + slide + ".png";
+    image.alt = (pptxPreview.base.endsWith("/repaired") ? "Repaired slide " : "Original slide ") + slide;
+    image.src = pptxPreview.base + "/" + slide + ".png";
     const frame = document.createElement("div");
     frame.className = "page";
     frame.append(image);
@@ -291,6 +354,10 @@ async function openPptxWorkspace(job, show = true) {
     homeState.activePptx = job.id;
     pptxPreview.slide = 1;
     const base = "/api/presentations/" + encodeURIComponent(job.id);
+    pptxPreview.base = base + "/preview";
+    pptxPreview.key = pptxPreview.version = null;
+    home$("#paired-variant-control").hidden = true;
+    home$("#pptx-original").hidden = false;
     home$("#pptx-workspace-name").textContent = job.filename;
     home$("#pptx-original").href = base + "/source";
     home$("#pptx-slide-tools").hidden = true;
@@ -313,7 +380,7 @@ async function openPptxWorkspace(job, show = true) {
 }
 
 function statusLabel(status) {
-    return ({uploaded: "Ready to process", queued: "Queued", running: "Processing", completed: "Completed", failed: "Failed"})[status] || status;
+    return ({uploaded: "Ready to process", review: "Source review required", queued: "Queued", running: "Processing", completed: "Completed", failed: "Failed"})[status] || status;
 }
 
 function renderHistory(data) {
@@ -326,7 +393,9 @@ function renderHistory(data) {
             homeEsc(new Date(item.created).toLocaleString()) + (item.total ? ' · ' + homeEsc(item.done) + '/' + homeEsc(item.total) + ' pages' : '') +
             '</span></div><span class="history-status ' + (item.status === "failed" ? "failed" : "") + '">' +
             homeEsc(statusLabel(item.status)) + '</span><div class="history-item-actions"><button class="btn" data-history-pdf="' +
-            homeEsc(item.id) + '">Open PDF review</button>' + (item.status === "completed" ?
+            homeEsc(item.id) + '">Open ' + (item.source_pptx ? 'job' : 'PDF review') + '</button>' +
+            (item.source_pptx && item.status === "completed" ? '<button class="btn" data-history-versions="' +
+                homeEsc(item.id) + '">Versions &amp; exports</button>' : '') + (!item.source_pptx && item.status === "completed" ?
             '<button class="btn" data-history-xml="' + homeEsc(item.id) + '">Download XML</button>' : '') +
             pptxLink(item) + '</div></article>'});
     }
@@ -345,6 +414,8 @@ function renderHistory(data) {
         try { await openPdfWorkspace(button.dataset.historyPdf); }
         catch (error) { home$("#history-list").prepend(Object.assign(document.createElement("p"), {className: "notice", textContent: error.message})); }
     });
+    home$("#history-list").querySelectorAll("[data-history-versions]").forEach(button => button.onclick = () =>
+        openPdfWorkspace(button.dataset.historyVersions, "review", true).catch(showError));
     home$("#history-list").querySelectorAll("[data-history-xml]").forEach(button => button.onclick = async () => {
         button.disabled = true;
         try {
@@ -390,3 +461,9 @@ setupDrop("pdf");
 setupDrop("pptx");
 syncSelection("pdf"); syncSelection("pptx");
 loadHomeOcrPreference();
+
+const savedView = new URLSearchParams(location.search);
+if (/^[a-f0-9]{32}$/.test(savedView.get("job") || "")) {
+    openPdfWorkspace(savedView.get("job"), savedView.get("tab") === "pptx" ? "pptx" : "review")
+        .catch(error => setUploadStatus("pdf", error.message, "error"));
+}

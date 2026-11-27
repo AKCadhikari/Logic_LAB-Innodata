@@ -32,10 +32,12 @@ The launcher opens [DocuSync AI on localhost](http://127.0.0.1:8765/). See the [
 
 ## Use the workspace
 
-1. Add one PDF and one PowerPoint in their respective upload boxes, in either order. The workspace opens automatically when both uploads succeed.
-2. The **PDF** tab opens on **Source PDF**. Use page navigation, zoom, fit width, rotation, or fullscreen to inspect the original. Select **Start Processing** to extract the document.
-3. After processing, **Zoning** overlays DocLayout-YOLO detections on the page, **Reading Order** shows the reconstructed sequence, and **Text** shows the extracted content. **Metadata** shows available fields and confidence values supplied by the pipeline. **XML** previews the generated file. Download the XML when a validated export is available, or submit a source review when the workspace requests one.
-4. Switch to **PowerPoint** to view the original slides, review the results, and download the corrected deck. Local proofreading starts after upload and flags proposed changes to numbers or units for review.
+1. Add the source PDF and its PowerPoint in either order. Once both files upload, DocuSync starts one job and uses the saved PDF as evidence for repairs.
+2. Use the **PDF** tab to inspect the source, zoning, reading order, text, metadata, and XML. The shared timeline tracks extraction, slide repair, validation, and packaging.
+3. Switch to **PowerPoint** to inspect the repaired slides and review the correction details. Use the preview selector to compare with the original when both are available.
+4. Choose **Download Final Output (ZIP)** from either tab. The archive contains the validated XML, repaired deck, and assets referenced by the XML.
+
+If the job pauses for source review, check the affected pages and submit the review to resume the saved job. For blocking content or validation failures, reprocess the saved inputs after addressing the reported issue.
 
 **Processing History** lets you reopen documents and completed jobs. The browser's local workspace session controls access to its uploads and history.
 

@@ -80,7 +80,7 @@ def inspect_assets(data: bytes, folder: Path) -> dict:
             "files": sorted(source for source, status in verified.items() if isinstance(status, dict))}
 
 
-def validate_archive(archive, xml_name: str, deck_name: str | None = None) -> dict:
+def validate_archive(archive, xml_name: str, deck_name: str | None = None, *, allow_directories: bool = False) -> dict:
     """Extract with portable path checks, then resolve XML links against the extracted files."""
     import shutil
 
@@ -88,15 +88,19 @@ def validate_archive(archive, xml_name: str, deck_name: str | None = None) -> di
         raise ValueError("An expected archive path is unsafe.")
     with TemporaryDirectory(prefix="docusync-verify-") as temp, ZipFile(archive) as bundle:
         entries = bundle.infolist()
-        names = [item.filename for item in entries]
+        names = [item.filename.removesuffix("/") if item.is_dir() else item.filename for item in entries]
         if (any(not relative_path(name) for name in names)
                 or len({name.casefold() for name in names}) != len(names)
-                or any(item.is_dir() or (item.external_attr >> 16) & 0o170000 == 0o120000 for item in entries)
+                or any((item.is_dir() and (not allow_directories or item.file_size))
+                       or (item.external_attr >> 16) & 0o170000 == 0o120000 for item in entries)
                 or len(entries) > 10000 or sum(item.file_size for item in entries) > 512 * 1024 * 1024):
             raise ValueError("The archive contains unsafe paths, duplicate entries, or oversized contents.")
         root = Path(temp)
         for item in entries:
             target = root.joinpath(*PurePosixPath(item.filename).parts)
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
             target.parent.mkdir(parents=True, exist_ok=True)
             with bundle.open(item) as source, target.open("xb") as output:
                 shutil.copyfileobj(source, output)

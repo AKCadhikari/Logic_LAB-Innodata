@@ -217,6 +217,8 @@ def candidate_matches(text: str, evidence: list[Unit], normalized: list[str],
                                            limit=None, score_cutoff=settings.amend_review_match):
         unit = evidence[index]
         alignment = labeled_number(text, unit.text)
+        if alignment is None:
+            alignment = exact_numeric_alignment(text, unit.text)
         if alignment is None and unit.kind == "byline":
             alignment = author_alignment(text, unit.text)
         if alignment is None and unit.kind == "keywords":
@@ -276,6 +278,25 @@ def metadata_alignment(old, source):
 
 
 NUMBER_LABEL = re.compile(r"^([^:\r\n]{5,80}:\s*)([+-]?\d+(?:[.,]\d+)*)(\s*[%\w°.-]*)$")
+NUMBER_TOKEN = re.compile(r"(?<![\w.])[+−-]?\d+(?:[.,]\d+)*(?!\w)")
+
+
+def exact_numeric_alignment(old: str, source: str) -> Alignment | None:
+    """Correct a different value only when its surrounding sentence matches exactly."""
+    before, after = list(NUMBER_TOKEN.finditer(old)), list(NUMBER_TOKEN.finditer(source))
+    if len(before) != 1 or len(after) != 1:
+        return None
+    first, second = before[0], after[0]
+    if sum(token.isalpha() for token in word_tokens(old)) < 6:
+        return None
+    if (ws_lower(old[:first.start()]) != ws_lower(source[:second.start()]) or
+            ws_lower(old[first.end():]) != ws_lower(source[second.end():])):
+        return None
+    if first[0] == second[0]:
+        return Alignment(old, 1, mode="high")
+    new = old[:first.start()] + second[0] + old[first.end():]
+    return Alignment(new, 1, [{"type": "number_error", "old": first[0], "new": second[0],
+                               "oov": False, "applied": True}], "high")
 
 
 def labeled_number(old: str, source: str) -> Alignment | None:
@@ -431,20 +452,20 @@ def source_pages(slide, total: int) -> set[int]:
     return {page for page in pages if 1 <= page <= total}
 
 
-def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Settings) -> dict:
+def repair_presentation(ir: DocIR, source: Path, target: Path, settings: Settings, *, progress=None) -> dict:
     from powerpoint.repair_qa import write_qa
 
     started = time.monotonic()
     with model_audit.scope(ir.doc_id, ir.meta.get("source_sha256"),
                            trace_id=ir.meta.get("execution_trace_id")) as trace:
-        report = _repair_presentation(ir, source, target, settings)
+        report = _repair_presentation(ir, source, target, settings, progress)
         report["verification_executions"] = trace["executions"]
     report["repair_seconds"] = round(time.monotonic() - started, 2)
     report["qa_artifacts"] = write_qa(ir, target, report)
     return report
 
 
-def _repair_presentation(ir, source, target, settings):
+def _repair_presentation(ir, source, target, settings, progress=None):
     from powerpoint.numbering import numbering
     from powerpoint.validation import verify_presentation
 
@@ -462,6 +483,8 @@ def _repair_presentation(ir, source, target, settings):
     links = structured.source_links(ir)
     inventory = Counter()
     for number, slide in enumerate(deck.slides, 1):
+        if progress:
+            progress("pptx_analysis", number, len(deck.slides))
         hints = source_pages(slide, len(ir.pages)) if settings.amend_use_notes else set()
         if settings.amend_use_notes and slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
             hints = retrieval.corroborated_pages(slide.notes_slide.notes_text_frame.text, hints)
@@ -611,6 +634,8 @@ def _repair_presentation(ir, source, target, settings):
         record["error_id"] = f"E{index:04d}"
     from powerpoint.advisory import review
     advisory = review(records, settings)
+    if progress:
+        progress("pptx_correction", len(deck.slides), len(deck.slides))
     target.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix="pptx-repair-", dir=target.parent) as temp:
         staged = Path(temp) / target.name

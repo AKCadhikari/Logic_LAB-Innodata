@@ -27,6 +27,19 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def apply_reviewed_metadata(ir, row):
+    if row["lang"]:
+        ir.lang = row["lang"]
+    if row["title"] is None:
+        return
+    title = next((block for page in ir.pages for block in page.blocks if block.kind == "title"), None)
+    if title is not None and title.text != row["title"]:
+        title.source = "reviewed"
+        title.text, title.spans = row["title"], []
+    elif title is None and row["title"]:
+        ir.pages[0].blocks.insert(0, Block(tag="h1", kind="title", text=row["title"], source="reviewed"))
+
+
 @contextmanager
 def connect(root: Path):
     db = sqlite3.connect(root / "workspace.sqlite3")
@@ -133,6 +146,12 @@ class Workspace:
                 db.execute("ALTER TABLE documents ADD COLUMN phase TEXT NOT NULL DEFAULT '1'")
             if "document_id" not in {row["name"] for row in db.execute("PRAGMA table_info(presentation_jobs)")}:
                 db.execute("ALTER TABLE presentation_jobs ADD COLUMN document_id TEXT REFERENCES documents(id)")
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(documents)")}
+            if "source_pptx" not in columns:
+                db.execute("ALTER TABLE documents ADD COLUMN source_pptx TEXT")
+            if "upload_key" not in columns:
+                db.execute("ALTER TABLE documents ADD COLUMN upload_key TEXT")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS documents_upload_key ON documents(owner, upload_key)")
             db.execute("UPDATE jobs SET status='failed', finished=?, error=? WHERE status IN ('queued','running')",
                        (now(), "Processing was interrupted. Retry to start a new attempt."))
             db.execute("UPDATE presentation_jobs SET status='failed', finished=?, "
@@ -166,6 +185,9 @@ class Workspace:
 
     def source(self, document_id: str) -> Path:
         return self.root / document_id / "source.pdf"
+
+    def paired_source(self, document_id: str) -> Path:
+        return self.source(document_id).with_name("source.pptx")
 
     def _submission_root(self) -> Path:
         if self.output.parent.name in {"phase-1", "phase-2"}:
@@ -311,7 +333,7 @@ class Workspace:
 
     def upload(self, filename: str, stream: BinaryIO, previous_id: str | None, owner: str,
                *, phase: str = "1", engine: str | None = None, language: str | None = None,
-               defer: bool = False) -> str:
+               defer: bool = False, presentation=None, upload_key: str | None = None) -> str:
         if phase not in {"1", "2"}:
             raise ValueError("Choose Phase 1 or Phase 2.")
         document_id = uuid4().hex
@@ -319,11 +341,16 @@ class Workspace:
         filename = Path(filename).name
         input_dir = self.phase_input_dir(phase)
         input_path = input_dir / filename
-        if input_path.exists():
-            input_path = input_dir / f"{Path(filename).stem}_{document_id[:8]}{Path(filename).suffix}"
         with self.db() as db:
-            db.execute("INSERT INTO documents(id, filename, created, previous_id, owner, phase) VALUES (?, ?, ?, ?, ?, ?)",
-                       (document_id, filename, now(), previous_id, owner, phase))
+            db.execute("BEGIN IMMEDIATE")
+            if upload_key and (existing := db.execute("SELECT id FROM documents WHERE owner=? AND upload_key=?",
+                                                      (owner, upload_key)).fetchone()):
+                return existing["id"]
+            if input_path.exists():
+                input_path = input_dir / f"{Path(filename).stem}_{document_id[:8]}{Path(filename).suffix}"
+            db.execute("INSERT INTO documents(id, filename, created, previous_id, owner, phase, source_pptx, upload_key) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (document_id, filename, now(), previous_id, owner, phase,
+                        presentation[0] if presentation else None, upload_key))
             source.parent.mkdir()
             input_dir.mkdir(parents=True, exist_ok=True)
             try:
@@ -331,8 +358,16 @@ class Workspace:
                     while chunk := stream.read(1024 * 1024):
                         output.write(chunk)
                         phase_input.write(chunk)
+                if presentation:
+                    pptx_name, pptx_stream = presentation
+                    with self.paired_source(document_id).open("xb") as paired:
+                        while chunk := pptx_stream.read(1024 * 1024):
+                            paired.write(chunk)
+                    pptx_stream.seek(0)
+                    self.save_phase_input(pptx_name, pptx_stream, phase)
             except OSError:
                 source.unlink(missing_ok=True)
+                self.paired_source(document_id).unlink(missing_ok=True)
                 source.parent.rmdir()
                 input_path.unlink(missing_ok=True)
                 raise
@@ -355,7 +390,8 @@ class Workspace:
             db.execute("UPDATE local_profile SET batch_owner=? WHERE id=1 AND batch_owner IS NULL", (owner,))
             db.execute("UPDATE documents SET owner=? WHERE owner IS NULL", (owner,))
             return [dict(row) for row in db.execute("""
-                SELECT d.id, d.filename, d.created, d.previous_id, d.approved, d.phase,
+                SELECT d.id, d.filename, d.created, d.previous_id, d.approved, d.phase, d.source_pptx,
+                       json_extract(j.result, '$.final_export.status') AS final_status,
                        j.status, j.done, j.total
                 FROM documents d JOIN jobs j ON j.id =
                     (SELECT MAX(id) FROM jobs WHERE document_id=d.id)
@@ -369,8 +405,9 @@ class Workspace:
                 return None
             jobs = db.execute("""
                 SELECT id, status, created, started, finished, done, total, error, settings,
-                       CASE WHEN status='running' OR json_type(result, '$.stage')='text' THEN result
-                            ELSE json_extract(result, '$.processing') END AS stage_json
+                       json_extract(result, '$.final_export') AS final_json,
+                       COALESCE(json_extract(result, '$.processing'),
+                           CASE WHEN json_type(result, '$.stage')='text' THEN result END) AS stage_json
                 FROM jobs WHERE document_id=? ORDER BY id DESC
             """, (document_id,))
             review = db.execute("""
@@ -381,6 +418,9 @@ class Workspace:
             for job in jobs:
                 state = dict(job)
                 stage_data = state.pop("stage_json")
+                final_data = state.pop("final_json")
+                if final_data:
+                    state["final_export"] = json.loads(final_data)
                 config = json.loads(state.pop("settings"))
                 state["ocr_selection"] = {key: config.get(key) for key in (
                     "ocr_backend", "ocr_automatic_primary", "ocr_automatic_secondary", "ocr_automatic_tertiary",
@@ -395,6 +435,7 @@ class Workspace:
                 public_jobs.append(state)
             document = dict(row)
             document.pop("owner")
+            document.pop("upload_key")
             return {**document, "jobs": public_jobs, "review": dict(review) if review else None}
 
     def enqueue(self, document_id: str, *, layout_only: bool = False, engine: str | None = None,
@@ -435,9 +476,10 @@ class Workspace:
         """, (document_id, status, now(), json.dumps(settings.to_dict()), document_id))
         return cursor.lastrowid if cursor.rowcount else None
 
-    def _submit(self, document_id: str, job: int, layout_from: int | None = None, *, phase: str = "1") -> None:
+    def _submit(self, document_id: str, job: int, layout_from: int | None = None, *, phase: str = "1",
+                resume: bool = False) -> None:
         try:
-            future = self.worker.submit(self._process, self.root, self.output, document_id, job, layout_from, phase)
+            future = self.worker.submit(self._process, self.root, self.output, document_id, job, layout_from, phase, resume)
         except RuntimeError:
             self._worker_failed(job)
         else:
@@ -454,19 +496,27 @@ class Workspace:
 
     @staticmethod
     def _process(root: Path, output: Path, document_id: str, job: int, layout_from: int | None = None,
-                 phase: str = "1") -> None:
+                 phase: str = "1", resume: bool = False) -> None:
         run = root / document_id / str(job)
         with connect(root) as db:
-            settings_json = db.execute("SELECT settings FROM jobs WHERE id=?", (job,)).fetchone()[0]
+            prior = db.execute("SELECT settings,result FROM jobs WHERE id=?", (job,)).fetchone()
+            info = db.execute("SELECT filename,source_pptx,title,lang,approved FROM documents WHERE id=?",
+                              (document_id,)).fetchone()
             previous_result = (db.execute("SELECT result FROM jobs WHERE id=? AND document_id=? AND status='completed'",
                                           (layout_from, document_id)).fetchone() if layout_from is not None else None)
-            db.execute("UPDATE jobs SET status='running', started=? WHERE id=?", (now(), job))
-        settings = Settings(**json.loads(settings_json))
+            db.execute("UPDATE jobs SET status='running', started=COALESCE(started,?) WHERE id=?", (now(), job))
+        settings = Settings(**json.loads(prior["settings"]))
+        paired = info["source_pptx"] is not None
         history = deque(maxlen=30)
         page_seconds = {}
         phases = {}
         clocks = {}
-        snapshot = {}
+        result = json.loads(prior["result"]) if resume else {}
+        snapshot = result.get("processing", {})
+        if resume:
+            result.pop("final_export", None)
+            phases.update({key: state for key, state in snapshot.get("phases", {}).items()
+                           if key in {"pdf_extraction", "diagnostics", "rendering", "detection", "ocr", "association", "layout"}})
 
         def progress(done: int, total: int) -> None:
             with connect(root) as db:
@@ -491,13 +541,18 @@ class Workspace:
                         "phases": phases, "last_ocr_attempt": next((item for item in reversed(recent)
                                                                    if item["stage"] == "ocr_attempt"), None)}
             with connect(root) as db:
-                db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(snapshot), job))
+                stored = {**result, "processing": snapshot} if paired and result.get("ok") else snapshot
+                db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(stored), job))
 
-        result = {}
         error = None
+        needs_review = False
         try:
             audit = AuditLog(run / "audit.jsonl")
-            if layout_from is not None:
+            if paired and not resume:
+                processing({"stage": "pdf_extraction", "state": "running"})
+            if resume:
+                pass
+            elif layout_from is not None:
                 old_ir = run.parent / str(layout_from) / "ir" / "source.json"
                 if previous_result is None:
                     raise ValueError("The saved OCR attempt is unavailable.")
@@ -508,31 +563,73 @@ class Workspace:
             else:
                 result = process_pdf(run.parent / "source.pdf", settings, run / "output", run, audit,
                                      progress=progress, processing=processing, document_id=document_id)
+            if paired and not resume:
+                processing({"stage": "pdf_extraction", "state": "completed" if result.get("ok") else "failed"})
             if result.get("ok"):
                 from layout.model import ir_from_dict
                 from reporting.exports import output_stem, publish_document
 
                 ir = ir_from_dict(json.loads((run / "ir" / "source.json").read_text(encoding="utf-8")))
                 ir.doc_id = document_id
-                info = connect(root)
-                with info as db:
-                    filename = db.execute("SELECT filename FROM documents WHERE id=?", (document_id,)).fetchone()[0]
+                if paired and info["approved"]:
+                    apply_reviewed_metadata(ir, info)
+                    result["source_review_approved"] = True
+                filename = info["filename"]
                 export_id = uuid4()
+                stem = output_stem(filename)
+
+                def export_progress(stages):
+                    if paired:
+                        for name, state in stages.items():
+                            if phases.get(name) != state:
+                                phases[name] = state
+                        current = next(reversed(stages))
+                        processing({"stage": current})
+                    else:
+                        processing({"stage": "validation", "state": stages.get("validation", {}).get("status"),
+                                    "export_phases": stages})
+
+                def repair(target):
+                    from powerpoint.amend import repair_presentation
+
+                    def repair_progress(stage, slide, total):
+                        previous = "pptx_analysis"
+                        if stage != previous and phases.get(previous, {}).get("status") == "running":
+                            processing({"stage": previous, "state": "completed"})
+                        state = {"state": "running"} if stage not in clocks else {}
+                        processing({"stage": stage, "slide": slide, "total_slides": total, **state})
+
+                    repaired = repair_presentation(ir, run.parent / "source.pptx", target, settings, progress=repair_progress)
+                    processing({"stage": "pptx_correction", "state": "completed"})
+                    return repaired
+
                 export = publish_document(
-                    Workspace.phase_output_path(output, phase) / output_stem(filename) / export_id.hex,
-                    output_stem(filename), ir, settings, result,
+                    Workspace.phase_output_path(output, phase) / stem / export_id.hex,
+                    stem, ir, settings, result,
                     {"id": str(export_id), "document_id": document_id, "filename": filename,
-                     "phase": phase, "mode": "pdf_processing", "created": now(), "job_id": job},
-                    None, xml_only=True,
-                    progress=lambda stages: processing({"stage": "validation",
-                                                        "state": stages.get("validation", {}).get("status"),
-                                                        "export_phases": stages}),
+                     "phase": phase, "mode": "unified" if paired else "pdf_processing", "created": now(), "job_id": job},
+                    repair if paired else None, xml_only=not paired, progress=export_progress, final_package=paired,
                 )
                 result["submission_export"] = {
                     "phase": phase, "output_folder": export["output_folder"], "outputs": export["outputs"],
                     "status": export["status"], "xml_profile": export["xml_profile"],
                     "error": export.get("error", ""),
                 }
+                if paired:
+                    needs_review = export["status"] == "manual_review_required"
+                    result["final_export"] = {
+                        "id": export["id"], "status": export["status"], "error": export.get("error"),
+                        "source_review": export.get("source_review"), "archive_ready": bool(export.get("archive")),
+                        "deck_ready": bool(export["outputs"]["pptx"]), "xml_ready": bool(export["outputs"]["xml"]),
+                        "applied": export["applied"], "review": export["review"], "slides": export.get("slides"),
+                        "source_warnings": export.get("source_warnings", []),
+                        "warnings": len(export["review"]) + len(export.get("source_warnings", [])) +
+                                    sum(item.get("render_verification") in {"unconfirmed", "visual_check_pending",
+                                        "no_visual_change_in_renderer", "requires_visual_equation_check"}
+                                        for item in export["applied"]),
+                    }
+                    if export["status"] != "completed" and not needs_review:
+                        error = export.get("error") or "The final package could not be validated."
                 if not export["outputs"].get("xml"):
                     error = "PDF extraction completed, but the XML could not be saved to the phase output folder."
             if result.get("validation", {}).get("issues"):
@@ -555,45 +652,52 @@ class Workspace:
         result["processing"] = snapshot
         with connect(root) as db:
             db.execute("UPDATE jobs SET status=?, finished=?, error=?, result=? WHERE id=?",
-                       ("failed" if error else "completed", now(), error, json.dumps(result), job))
+                       ("failed" if error else "review" if needs_review else "completed", now(), error, json.dumps(result), job))
 
     def extracted(self, document_id: str, *, reviewed: bool = True) -> tuple[DocIR, Settings, dict] | None:
         with self.db() as db:
             row = db.execute("""
                 SELECT j.id, j.settings, j.result, d.title, d.lang FROM jobs j
                 JOIN documents d ON d.id=j.document_id
-                WHERE j.document_id=? AND j.status='completed' ORDER BY j.id DESC LIMIT 1
+                WHERE j.document_id=? AND (j.status='completed' OR
+                    (d.source_pptx IS NOT NULL AND json_extract(j.result, '$.ok')=1))
+                ORDER BY j.id DESC LIMIT 1
             """, (document_id,)).fetchone()
         if row is None:
             return None
         path = self.root / document_id / str(row["id"]) / "ir" / "source.json"
         ir = ir_from_dict(json.loads(path.read_text(encoding="utf-8")))
         ir.doc_id = document_id
-        if reviewed and row["lang"]:
-            ir.lang = row["lang"]
-        if reviewed and row["title"] is not None:
-            title = next((block for page in ir.pages for block in page.blocks if block.kind == "title"), None)
-            if title is not None:
-                if title.text != row["title"]:
-                    title.source = "reviewed"
-                    title.text, title.spans = row["title"], []
-            elif row["title"]:
-                ir.pages[0].blocks.insert(0, Block(tag="h1", kind="title", text=row["title"], source="reviewed"))
+        if reviewed:
+            apply_reviewed_metadata(ir, row)
         return ir, Settings(**json.loads(row["settings"])), json.loads(row["result"])
 
     def review(self, document_id: str, title: str, lang: str, approved: bool) -> bool:
+        resume = False
         with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            job = db.execute("SELECT j.id,j.status,j.result,d.phase,d.source_pptx FROM jobs j JOIN documents d "
+                             "ON d.id=j.document_id WHERE d.id=? ORDER BY j.id DESC LIMIT 1", (document_id,)).fetchone()
+            if not job or job["status"] != ("review" if job["source_pptx"] else "completed"):
+                return False
+            if job["source_pptx"] and approved:
+                review = json.loads(job["result"])["final_export"].get("source_review") or {}
+                if review.get("blocking_pages") or review.get("issues"):
+                    raise ValueError("Reprocess the identified pages to recover missing or inconsistent content before approval.")
+                db.execute("UPDATE jobs SET status='queued',finished=NULL,error=NULL WHERE id=?", (job["id"],))
+                resume = True
             updated = db.execute("""
-                UPDATE documents SET title=?, lang=?, approved=? WHERE id=? AND
-                (SELECT status FROM jobs WHERE document_id=? ORDER BY id DESC LIMIT 1)='completed'
-            """, (title, lang, approved, document_id, document_id))
+                UPDATE documents SET title=?, lang=?, approved=? WHERE id=?
+            """, (title, lang, approved, document_id))
             if not updated.rowcount:
                 return False
             db.execute("""
                 INSERT INTO reviews(document_id, created, reviewer, approved)
                 SELECT ?, ?, name, ? FROM local_profile WHERE id=1
             """, (document_id, now(), approved))
-            return True
+        if resume:
+            self._submit(document_id, job["id"], phase=job["phase"], resume=True)
+        return True
 
     def reviewer(self, name: str | None = None) -> str:
         with self.db() as db:

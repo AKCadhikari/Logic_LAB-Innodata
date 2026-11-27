@@ -35,6 +35,19 @@ def requires_manual_review(extraction: dict, completeness: dict) -> bool:
     return bool(quality.get("blocking_pages") or completeness.get("issues") or unresolved_source)
 
 
+def classify_source_review(document, completeness):
+    review_pages = {page.n for page in document.pages if page.requires_review}
+    visual_formulas = {item["node"] for item in completeness.get("mathematics", []) if item["has_source_crop"]}
+    review, warnings = [], []
+    for item in completeness["source_review"]:
+        kind = item["kind"]
+        # An accepted OCR page or a verified source crop can still be exported with a warning.
+        nonblocking = (kind == "source_extraction_requires_review" and item["page"] not in review_pages
+                       or kind == "unverified_formula_transcription" and item["node"] in visual_formulas)
+        (warnings if nonblocking else review).append(item)
+    return {**completeness, "source_review": review}, warnings
+
+
 def write_report(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     staged = path.with_suffix(".tmp")
@@ -131,11 +144,11 @@ def save_original_images(data, ir, locations, folder, asset_report):
 
 
 def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, report: dict,
-                     transform, *, xml_only: bool = False, progress=None) -> dict:
+                     transform, *, xml_only: bool = False, progress=None, final_package: bool = False) -> dict:
     """Write validated XML first, then publish the deck and the final status."""
     folder.mkdir(parents=True, exist_ok=False)
     xml_path = folder / f"{stem}.xml"
-    deck_path = folder / f"{stem}_updated.pptx"
+    deck_path = folder / f"{stem}_{'repaired' if final_package else 'updated'}.pptx"
     validation = {"xml": {"valid": False}, "pptx": {"valid": False}}
     outputs = {"xml": None, "pptx": None}
     result = {**report, "output_folder": str(folder), "outputs": outputs, "applied": [], "review": [],
@@ -159,7 +172,8 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         quality = {**quality, "source_review_approved": True}
     staged = xml_path.with_suffix(".tmp")
     xml_started = monotonic()
-    stage("validation", "running", xml_started)
+    stage("xml_generation" if final_package else "validation", "running", xml_started)
+    validation_started = xml_started
     try:
         if not extraction.get("ok"):
             raise ValueError("The source PDF extraction did not pass validation.")
@@ -167,6 +181,16 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         locations = {}
         data = to_xml(ir, settings, locations=locations, assets=assets)
         staged.write_bytes(data)
+        if final_package:
+            stage("xml_generation", "completed", xml_started)
+            asset_started = monotonic()
+            stage("assets", "running", asset_started)
+            if assets:
+                data = materialize_assets(data, assets, ir.path, folder)
+                staged.write_bytes(data)
+            stage("assets", "completed", asset_started)
+            validation_started = monotonic()
+            stage("validation", "running", validation_started)
         validation["xml"].update(validate_xml(staged.read_bytes(), len(ir.pages), settings))
         if not validation["xml"]["well_formed"] or validation["xml"]["issues"]:
             raise ValueError("The document XML failed structural validation.")
@@ -174,7 +198,7 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         quality = {**quality, "xml": unicode_check}
         if unicode_check["unconfirmed_nodes"] and quality.get("status") != "manual_review_required":
             quality["status"] = "validation_partial"
-        if assets:
+        if assets and not final_package:
             data = materialize_assets(data, assets, ir.path, folder)
             staged.write_bytes(data)
         asset_report = inspect_assets(data, folder)
@@ -185,7 +209,8 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         ]
         if not asset_report["valid"]:
             raise ValueError("The generated XML refers to unresolved image assets.")
-        save_original_images(data, ir, locations, folder, asset_report)
+        if not final_package:
+            save_original_images(data, ir, locations, folder, asset_report)
         completeness = compare_content(data, ir, locations, sample=settings.schema_profile == "sample")
         quality["completeness"] = {"status": completeness["status"], "issues": len(completeness["issues"]),
                                    "source_review": len(completeness["source_review"])}
@@ -203,12 +228,22 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         validation["xml"]["error"] = result["error"]
     finally:
         staged.unlink(missing_ok=True)
-        stage("validation", "completed" if outputs["xml"] else "failed", xml_started)
+        for name in ("xml_generation", "assets"):
+            if phases.get(name, {}).get("status") == "running":
+                stage(name, "failed", asset_started if name == "assets" else xml_started)
+        if "validation" in phases:
+            stage("validation", "completed" if outputs["xml"] else "failed", validation_started)
 
-    if outputs["xml"] and requires_manual_review(extraction, completeness):
+    source_gate = completeness
+    if final_package and outputs["xml"]:
+        source_gate, result["source_warnings"] = classify_source_review(ir, completeness)
+    if outputs["xml"] and requires_manual_review(extraction, source_gate):
         outputs["xml"]["draft"] = True
         result.update(status="manual_review_required",
                       error="The XML is a draft. Resolve source review and content differences before exporting the PowerPoint.")
+        if final_package:
+            result["source_review"] = {"issues": completeness["issues"],
+                "items": source_gate["source_review"], "blocking_pages": quality.get("blocking_pages", [])}
         validation["pptx"]["status"] = "blocked_by_source_review"
     elif outputs["xml"] and xml_only:
         result["status"] = "xml_only"
@@ -218,6 +253,9 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         stage("pptx", "running", pptx_started)
         try:
             presentation = transform(deck_path)
+            final_started = monotonic()
+            if final_package:
+                stage("final_validation", "running", final_started)
             slide_count = validate_deck(deck_path, presentation["slides"])
             outputs["pptx"] = file_info(deck_path)
             validation["pptx"].update(valid=True, slides=slide_count)
@@ -234,10 +272,16 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
             corrections = [correction_record(report["document_id"], item) for item in records]
             result["presentation_status"] = presentation["status"]
             result["status"] = "completed"
+            if final_package:
+                stage("final_validation", "completed", final_started)
         except Exception:
             logging.getLogger(__name__).exception("PowerPoint export failed")
             result.update(status="partial", error="PowerPoint generation or validation failed. The XML is available.")
             validation["pptx"]["error"] = result["error"]
+            outputs["pptx"] = None
+            validation["pptx"]["valid"] = False
+            if phases.get("final_validation", {}).get("status") == "running":
+                stage("final_validation", "failed", final_started)
             deck_path.unlink(missing_ok=True)
         finally:
             stage("pptx", "completed" if outputs["pptx"] else "failed", pptx_started)
@@ -270,25 +314,30 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
                                      edits=audited_edits, analysis=result.get("analysis"),
                                      pptx=deck_path if outputs["pptx"] else None))
     complete = result["status"] == "completed"
-    if complete or (outputs["xml"] and result["xml_assets"] and not outputs["pptx"]):
-        archive = folder / f"{stem}.zip"
+    if complete or (not final_package and outputs["xml"] and result["xml_assets"] and not outputs["pptx"]):
+        archive = folder / (f"{stem}_Final_Output.zip" if final_package else f"{stem}.zip")
         temp_zip = archive.with_suffix(".tmp")
         deck_name = deck_path.name if complete else None
         qa_files = [name for name in result.get("qa_artifacts", []) if relative_path(name)
                     and (folder / name).resolve().is_relative_to(folder.resolve()) and (folder / name).is_file()]
         files = [xml_path.name, *([deck_name] if deck_name else []), *result["xml_assets"], *originals, *qa_files]
+        zip_started = monotonic()
+        if final_package:
+            files = [xml_path.name, deck_path.name, *result["xml_assets"]]
+            stage("zip", "running", zip_started)
         try:
-            write_zip(temp_zip, folder, files)
-            validation["zip"] = validate_archive(temp_zip, xml_path.name, deck_name)
+            directories = (f"output_images/{stem}",) if final_package and not result["xml_assets"] else ()
+            write_zip(temp_zip, folder, files, directories=directories)
+            validation["zip"] = validate_archive(temp_zip, xml_path.name, deck_name, allow_directories=final_package)
             if not validation["zip"]["valid"]:
                 raise ValueError("Image references are missing after extracting the ZIP.")
-            reports["processing_report.json"] = {**result, "metadata": ir.meta,
-                                                  "extraction_seconds": extraction.get("seconds")}
-            validation["zip"]["entries"] = len(files) + len(reports)
-            write_zip(temp_zip, folder, files, reports)
-            final_check = validate_archive(temp_zip, xml_path.name, deck_name)
-            if not final_check["valid"]:
-                raise ValueError("Final ZIP validation failed.")
+            if not final_package:
+                reports["processing_report.json"] = {**result, "metadata": ir.meta,
+                                                      "extraction_seconds": extraction.get("seconds")}
+                validation["zip"]["entries"] = len(files) + len(reports)
+                write_zip(temp_zip, folder, files, reports)
+                if not validate_archive(temp_zip, xml_path.name, deck_name)["valid"]:
+                    raise ValueError("Final ZIP validation failed.")
             temp_zip.replace(archive)
             result["archive"] = file_info(archive)
         except Exception:
@@ -299,6 +348,8 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
             validation["zip"] = {"valid": False, "error": message}
         finally:
             temp_zip.unlink(missing_ok=True)
+            if final_package:
+                stage("zip", "completed" if result["archive"] else "failed", zip_started)
     reports["processing_report.json"] = {**result, "metadata": ir.meta if ir else {},
                                           "extraction_seconds": extraction.get("seconds")}
     for name, values in reports.items():
@@ -306,7 +357,7 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
     return result
 
 
-def write_zip(target, folder: Path, files: list[str], reports: dict | None = None) -> None:
+def write_zip(target, folder: Path, files: list[str], reports: dict | None = None, *, directories=()) -> None:
     with ZipFile(target, "w", compression=ZIP_DEFLATED) as archive:
         for relative in dict.fromkeys(files):
             if not relative_path(relative) or not (folder / relative).resolve().is_relative_to(folder.resolve()):
@@ -314,3 +365,7 @@ def write_zip(target, folder: Path, files: list[str], reports: dict | None = Non
             archive.write(folder / relative, relative)
         for name, data in (reports or {}).items():
             archive.writestr(name, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        for name in directories:
+            if not relative_path(name):
+                raise ValueError("An archive directory is outside its output folder.")
+            archive.writestr(name + "/", b"")

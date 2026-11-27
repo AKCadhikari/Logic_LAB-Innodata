@@ -166,7 +166,7 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                 d["ocr"] = {"engine": None, "status": "skipped", "requires_review": True}
             recovery = None
             if decision == "ocr" and settings.ocr_enabled and router is not None:
-                recovery = router.recover_unmapped_arabic(page, dpi, d,
+                recovery = router.recover_unmapped_text(page, dpi, d,
                     lambda engine: stage("ocr", page=i + 1, engine=engine))
             if recovery:
                 rec["lines"], d["ocr"] = recovery

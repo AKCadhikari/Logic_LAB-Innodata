@@ -104,5 +104,5 @@ def analyze_page(page, settings, metadata_language: str = "und") -> dict:
         "native_unmapped_characters": missing_unicode,
         "native_decoding_risk": decoding_risk,
         "lang_hint": language["language"] if health == "healthy" or (
-            missing_unicode and language["script"] == "arab" and language["confidence"] >= .6) else "und",
+            missing_unicode and language["confidence"] >= .6) else "und",
     }

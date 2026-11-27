@@ -1,4 +1,5 @@
 import pymupdf
+import pytest
 from lxml import etree
 from tests.helpers import make_pdf, paragraph
 from agents.orchestrator import process_pdf
@@ -73,21 +74,29 @@ def test_diagnostics_decisions(tmp_path, settings):
     assert blank["health"] == "absent" and blank["decision"] == "ocr"
 
 
-def test_unmapped_arabic_pdf_uses_visual_ocr_and_keeps_rtl(tmp_path, settings, audit, monkeypatch):
+@pytest.mark.parametrize(("language", "script", "direction", "pack", "sentence"), [
+    ("ar", "arab", "rtl", "ara", "هذا المستند يحتوي على معلومات في التقرير بتاريخ 28/3/1446."),
+    ("fr", "latin", "ltr", "fra", "Le rapport de la station indique que la pression est stable à 28 bars."),
+])
+def test_unmapped_pdf_uses_the_detected_language_pack(
+        tmp_path, settings, audit, monkeypatch, language, script, direction, pack, sentence):
     from ocr import engine
     from utils.textutil import script_of
 
-    sentence = "هذا المستند يحتوي على معلومات في التقرير بتاريخ 28/3/1446."
-    source = tmp_path / "arabic.pdf"
+    source = tmp_path / "unmapped.pdf"
     with pymupdf.open() as pdf:
         page = pdf.new_page()
-        pdf.xref_set_key(pdf.pdf_catalog(), "Lang", "(ar)")
-        page.insert_htmlbox(page.rect + (45, 60, -45, -55), f'<p dir="rtl">{sentence}</p>')
-        arabic = next(span for span in page.get_texttrace() if any(script_of(chr(char)) == "arab" for char, *_ in span["chars"]))
-        font = next(font for font in page.get_fonts() if "Arabic" in font[3])
+        pdf.xref_set_key(pdf.pdf_catalog(), "Lang", f"({language})")
+        page.insert_htmlbox(page.rect + (45, 60, -45, -55), f'<p dir="{direction}">{sentence}</p>')
+        span = next(span for span in page.get_texttrace()
+                    if any(script_of(chr(char)) == script for char, *_ in span["chars"]))
+        def font_key(name):
+            return "".join(char for char in name.split("+")[-1] if char.isalnum()).removesuffix("Regular")
+
+        font = next(font for font in page.get_fonts() if font_key(font[3]) == font_key(span["font"]))
         _, reference = pdf.xref_get_key(font[0], "ToUnicode")
-        glyphs = {glyph: char for char, glyph, *_ in arabic["chars"] if glyph > 0}
-        glyphs[next(glyph for glyph, char in glyphs.items() if script_of(chr(char)) == "arab")] = 0xfffd
+        glyphs = {glyph: char for char, glyph, *_ in span["chars"] if glyph > 0}
+        glyphs[next(glyph for glyph, char in glyphs.items() if script_of(chr(char)) == script)] = 0xfffd
         pairs = "\n".join(f"<{glyph:04x}> <{char:04x}>" for glyph, char in glyphs.items())
         cmap = f"""begincmap
 1 begincodespacerange
@@ -101,20 +110,23 @@ endcmap"""
         pdf.save(source)
 
     with pymupdf.open(source) as pdf:
-        diagnostic = analyze_page(pdf[0], settings, "ar")
+        diagnostic = analyze_page(pdf[0], settings, language)
         assert diagnostic["native_unmapped_characters"] > 0
-        assert diagnostic["decision"] == "ocr" and diagnostic["lang_hint"] == "ar"
+        assert diagnostic["decision"] == "ocr" and diagnostic["lang_hint"] == language
 
-    monkeypatch.setattr(engine, "available_langs", lambda _settings: {"ara", "eng"})
-    monkeypatch.setattr(engine, "ocr_page", lambda *args, **options: (
-        [Line(sentence, (120, 58, 540, 76), source="ocr", rtl=True, conf=94)], {"langs": "ara"}))
+    def visual_ocr(page, code, dpi, options, installed, **geometry):
+        assert code == language and pack in installed
+        return [Line(sentence, (120, 58, 540, 76), source="ocr", rtl=direction == "rtl", conf=94)], {"langs": pack}
+
+    monkeypatch.setattr(engine, "available_langs", lambda _settings: {pack, "eng"})
+    monkeypatch.setattr(engine, "ocr_page", visual_ocr)
     settings.doclayout_enabled = settings.docling_enabled = False
     out = tmp_path / "out"
     result = process_pdf(source, settings, out, tmp_path / "work", audit)
-    root = etree.parse(str(out / "arabic.xml")).getroot()
+    root = etree.parse(str(out / "unmapped.xml")).getroot()
     assert result["ok"] and result["processing_counts"]["tesseract"] == 1
     assert not result["multilingual_validation"]["blocking_pages"]
-    assert root.get("dir") == "rtl" and sentence in "".join(root.itertext())
+    assert root.get("dir") == direction and sentence in "".join(root.itertext())
     assert "\ufffd" not in "".join(root.itertext())
 
 

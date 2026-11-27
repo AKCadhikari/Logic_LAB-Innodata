@@ -12,7 +12,7 @@ from config.settings import Settings
 from ocr import engine, glm, paddle, paddle_vl
 from ocr.quality import validate_recognition
 from ocr.recognition import ENGINE_MODES, OCR_ENGINES, Recognition, RecognitionError
-from utils.textutil import language_profile, norm_cmp
+from utils.textutil import ISO_TO_TESS, LANGUAGE_SCRIPTS, language_profile, norm_cmp
 from utils import execution_audit as audit
 
 
@@ -31,29 +31,34 @@ class OCRRouter:
         self.ollama_engines = {"glm-ocr": glm, paddle_vl.ENGINE: paddle_vl}
         self.models = {"glm-ocr": settings.glm_ocr_model, paddle_vl.ENGINE: settings.paddle_vl_model}
 
-    def recover_unmapped_arabic(self, page, dpi: int, diagnostics: dict, status: Callable[[str], None]):
-        """Read damaged Arabic PDF text from pixels before trying general-purpose OCR."""
-        if (self.settings.ocr_backend != "automatic" or diagnostics.get("lang_hint") != "ar"
-                or not diagnostics.get("native_unmapped_characters")):
+    def recover_unmapped_text(self, page, dpi: int, diagnostics: dict, status: Callable[[str], None]):
+        """Read damaged PDF text from pixels using the installed pack for the detected language."""
+        if self.settings.ocr_backend != "automatic" or not diagnostics.get("native_unmapped_characters"):
+            return None
+        language = diagnostics.get("lang_hint", "und")
+        pack = ISO_TO_TESS.get(language)
+        if pack is None:
             return None
         packs = engine.available_langs(self.settings)
-        if "ara" not in packs:
+        if pack not in packs:
             return None
-        scripts = diagnostics["native_language"]["scripts"]
-        if scripts.get("latin", 0) < scripts["arab"] * .02:
-            packs = {"ara"}
+        native_language = diagnostics["native_language"]
+        script = native_language["script"]
+        scripts = native_language["scripts"]
+        if script != "latin" and scripts.get("latin", 0) < scripts.get(script, 0) * .02:
+            packs = {pack}
         status("tesseract")
         try:
-            lines, evidence = engine.ocr_page(page, "ar", max(260, dpi), self.settings, packs,
+            lines, evidence = engine.ocr_page(page, language, max(260, dpi), self.settings, packs,
                                               orient=False, deskew=False)
         except (OSError, RuntimeError, ValueError, TimeoutExpired):
             return None
         candidate = Recognition(page.number + 1, "tesseract", lines=lines,
                                 execution_ids=evidence.get("selected_execution_ids", []))
-        profile = language_profile(candidate.text(), "ar")
+        profile = language_profile(candidate.text(), language)
         confidence = sum(line.conf for line in lines) / max(1, len(lines))
         issues = validate_recognition(candidate, page.number + 1, diagnostics, self.settings)
-        accepted = profile["script"] == "arab" and confidence >= 75 and not issues
+        accepted = profile["script"] in {script, LANGUAGE_SCRIPTS.get(language)} and confidence >= 75 and not issues
         audit.mark(candidate.execution_ids, validation="passed" if accepted else "rejected",
                    detected_language=profile["language"])
         if not accepted:
@@ -61,7 +66,7 @@ class OCRRouter:
         return lines, {**evidence, "engine": "tesseract", "status": "accepted",
                        "confidence": round(confidence, 1), "requires_review": False,
                        "language": profile, "selected_engine": "automatic",
-                       "recovery_reason": "Arabic visual OCR replaced an unmapped PDF text layer."}
+                       "recovery_reason": "Visual OCR recovered text from a PDF page with missing Unicode mappings."}
 
     def recognise(self, page, language: str, dpi: int, diag: dict,
                   status: Callable[[str], None], *, event: Callable[[dict], None] | None = None,

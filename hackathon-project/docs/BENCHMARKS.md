@@ -1,5 +1,14 @@
 # Benchmarks (measured with `project/tests/benchmark.py`; raw numbers in `benchmark_results.json`)
 
+Run the benchmark against a directory of source PDFs and presentations. Reference comparisons are optional.
+
+```powershell
+.\.venv\Scripts\python.exe project/tests/benchmark.py --corpus $sourceDirectory --out $reportPath
+```
+
+For XML comparisons, pass `--source-pdf` and `--reference-xml`. For PowerPoint comparisons, pass `--source-pdf`,
+`--source-pptx`, and `--reference-pptx`.
+
 ## Advanced correction verification
 
 The Windows run processed the 12-page engineering PDF with local GLM-OCR and rendered all 40 output slides with LibreOffice.

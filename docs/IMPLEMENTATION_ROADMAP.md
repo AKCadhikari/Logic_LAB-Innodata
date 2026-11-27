@@ -40,7 +40,7 @@ From `hackathon-project` in PowerShell:
 .\.venv\Scripts\python.exe -B -m pytest -p no:cacheprovider project/tests -q
 .\.venv\Scripts\python.exe -B project/ui/server.py
 .\.venv\Scripts\python.exe -B project/main.py --input phase-1/input --output phase-1/output
-.\.venv\Scripts\python.exe -B project/tests/benchmark.py --corpus "<authorized corpus>" --out storage/windows-benchmark.json
+.\.venv\Scripts\python.exe -B project/tests/benchmark.py --corpus "<source input directory>" --out storage/windows-benchmark.json
 ```
 
 The batch and benchmark commands require input files. The benchmark accepts a new report path, leaving the historical Linux result available.

@@ -186,13 +186,13 @@ const processingStatus = step => {
 
 function showOcrTimeline(job, active) {
     const pane = $("#ocr-timeline"), step = job?.processing;
-    pane.hidden = !job;
+    pane.hidden = !job || job.status === "uploaded";
     const seconds = job?.started ? (new Date(job.finished || Date.now()) - new Date(job.started)) / 1000 : null;
     pane.textContent = [active ? processingStatus(step) || "Waiting to process" : "Processing " + job?.status,
         active && step?.model, seconds == null ? "" : Math.max(0, seconds).toFixed(1) + " s elapsed",
         active && step?.last_ocr_attempt?.fallback_reason].filter(Boolean).join(" · ");
     const stages = $("#processing-stages");
-    stages.hidden = !job;
+    stages.hidden = !active;
     const names = {diagnostics: "PDF diagnostics", rendering: "Page rendering", detection: "DocLayout-YOLO detection",
         ocr: "OCR processing", association: "Layout / OCR association", layout: "Docling reconstruction",
         validation: "XML generation", pptx: "PPTX generation"};
@@ -243,6 +243,14 @@ function hasSavedPdfXml(exportInfo) {
     return ["xml_only", "completed"].includes(exportInfo?.status) && xml?.valid && !xml.draft;
 }
 
+async function savedPdfXmlReport(data, base) {
+    const reports = await workspaceFetch(base + "/presentations");
+    const report = reports.find(item => item.mode === "pdf_processing" &&
+        item.job_id === data.jobs[0].id && hasSavedPdfXml(item));
+    if (!report) throw new Error("The saved XML is unavailable. Check the phase output folder or submit a review to export again.");
+    return report;
+}
+
 $("#dlxml").onclick = async () => {
     if (!S.id) return;
     if (W.batch) {
@@ -255,11 +263,8 @@ $("#dlxml").onclick = async () => {
         return;
     }
     try {
-        const reports = await workspaceFetch(base + "/presentations");
+        const report = await savedPdfXmlReport(data, base);
         if (S.data !== data || W.batch) return;
-        const report = reports.find(item => item.mode === "pdf_processing" &&
-            item.job_id === data.jobs[0].id && hasSavedPdfXml(item));
-        if (!report) throw new Error("The saved XML is unavailable. Check the phase output folder or submit a review to export again.");
         location.href = base + "/presentations/" + encodeURIComponent(report.id) + "/xml?format=auto";
     } catch (error) {
         showError(error);
@@ -271,8 +276,21 @@ function setView(tab) {
     document.querySelectorAll("#vtabs .tab").forEach(button =>
         setActive(button, button.dataset.t === tab));
     if (W.batch) viewer();
-    else { workspaceViewer(); updateInspector(); }
+    else {
+        workspaceViewer();
+        if (tab !== "pdf") $("#viewer").scrollTop = 0;
+        updateInspector();
+    }
 }
+
+function setReviewTab(tab) {
+    S.stab = tab;
+    document.querySelectorAll("#stabs .tab").forEach(button => setActive(button, button.dataset.t === tab));
+    if (W.batch) side();
+    else reviewPanel().catch(showError);
+}
+
+$("#deck-tab").onclick = () => setReviewTab("deck");
 
 async function loadWorkspace(preferred) {
     if (W.batch) return;
@@ -306,6 +324,7 @@ async function selectWorkspace(id, reset = true) {
     clearTimeout(W.timer);
     if (reset) {
         W.page = 1;
+        W.zoom = 100;
         W.highlight = null;
         W.region = W.block = null;
         W.previous = "";
@@ -313,7 +332,10 @@ async function selectWorkspace(id, reset = true) {
         S.rot = 0;
     }
     const data = await workspaceFetch("/api/documents/" + encodeURIComponent(id));
+    const source = W.source?.id === id ? W.source : {id, ...await workspaceFetch(
+        "/api/documents/" + encodeURIComponent(id) + "/source-info").catch(error => ({error: error.message}))};
     if (W.batch || W.selection !== selection) return;
+    W.source = source;
     S.id = id;
     S.data = data;
     $("#docsel").value = id;
@@ -321,6 +343,9 @@ async function selectWorkspace(id, reset = true) {
     const listed = W.documents.find(document => document.id === id);
     if (listed) listed.status = job.status;
     const active = job.status === "queued" || job.status === "running";
+    $("#preview-heading").textContent = data.filename;
+    $("#start-pdf").hidden = job.status !== "uploaded" || !!source.error;
+    $("#start-pdf").disabled = active;
     if (active) W.exportPhases.delete(id);
     showOcrTimeline(job, active);
     showLayoutHealth();
@@ -329,17 +354,22 @@ async function selectWorkspace(id, reset = true) {
     const extractionStatus = data.content_validation?.status === "manual_review_required" ?
         "Extraction complete · manual review required" : data.content_validation?.status === "validation_partial" ?
             "Extraction complete · validation partial" : "Extraction complete";
-    statusText((active && processingStatus(job.processing) || (job.status === "completed" ? extractionStatus : job.status)) +
+    statusText((active && processingStatus(job.processing) || (job.status === "completed" ? extractionStatus :
+        job.status === "uploaded" ? source.error || "Ready to process" : job.error || job.status)) +
         (job.total ? " · " + job.done + "/" + job.total + " pages" : "") +
         (job.ocr_selection?.ocr_backend ? " · " + ocrModeName(job.ocr_selection.ocr_backend) : "") +
         (reviewPages && !active ? " · " + reviewPages + " for review" : ""));
     $("#runchip").dataset.documentId = id;
     $("#runchip").dataset.jobStatus = job.status;
     $("#reproc").disabled = active;
+    $("#reproc").hidden = job.status === "uploaded";
     $("#reproc").textContent = job.status === "failed" ? "Retry" : "Reprocess";
     const canDownloadXml = data.approved || (job.status === "completed" && hasSavedPdfXml(data.submission_export));
     $("#dlxml").disabled = !canDownloadXml;
     $("#dlpptx").disabled = active || !data.approved || !!data.content_validation?.blocking_pages?.length;
+    $("#dlpptx").hidden = !data.approved;
+    $("#deck-tab").hidden = !data.pages;
+    $("#dlxml").hidden = !canDownloadXml;
     $("#dlxml").title = canDownloadXml ? "Downloads a ZIP when the XML has images" : "Approve metadata review before exporting";
     workspaceViewer();
     await reviewPanel();
@@ -347,6 +377,20 @@ async function selectWorkspace(id, reset = true) {
         W.timer = setTimeout(() => selectWorkspace(id, false).catch(showError), 800);
     }
 }
+
+async function startPdfProcessing(options = {}) {
+    const id = S.id;
+    await workspaceFetch(docUrl() + "/retry", {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(options)});
+    if (!W.batch && S.id === id) await selectWorkspace(id, false);
+}
+
+$("#start-pdf").onclick = async event => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try { await startPdfProcessing(); }
+    catch (error) { showError(error); button.disabled = false; }
+};
 
 const bidiDir = language => language?.base_direction === "rtl" ? "rtl" : language?.base_direction === "ltr" ? "ltr" : "auto";
 const regionColors = {text: "#087568", title: "#6834ac", header: "#3659b2", footer: "#525e71",
@@ -356,7 +400,9 @@ const regionCategory = label => ["image_block", "equation_block"].includes(label
 const regionName = label => label.replaceAll("_", " ");
 const boxArea = ([left, top, right, bottom]) => (right - left) * (bottom - top);
 const currentPage = () => S.data?.pages?.[W.page - 1];
-const regionLabel = region => regionName(region.class_name) + " · " + (region.confidence * 100).toFixed(1) + "%";
+const layoutRegions = page => (page.layout_regions || []).filter(region => region.source === "DocLayout-YOLO");
+const regionLabel = region => regionName(region.class_name) + (Number.isFinite(region.confidence) ?
+    " · " + (region.confidence * 100).toFixed(1) + "%" : "");
 const blockOrder = block => block.reading_order || block.i + 1;
 const orderedBlocks = page => [...page.blocks].sort((a, b) => blockOrder(a) - blockOrder(b));
 
@@ -399,14 +445,14 @@ function inspectBlock(index) {
 function updateInspector() {
     const panel = $("#region-inspector"), page = currentPage();
     if (!panel || !page) return;
-    const regions = page.layout_regions || [];
+    const regions = layoutRegions(page);
     const region = regions.find(item => item.id === W.region);
     const block = page.blocks.find(item => item.i === W.block);
     let detail = "";
     if (region || block) {
         const box = (region || block).bbox;
         const heading = region ? regionName(region.class_name) : block.kind || block.tag;
-        const confidence = region ? region.confidence * 100 : block.conf;
+        const confidence = region && Number.isFinite(region.confidence) ? region.confidence * 100 : block?.conf;
         const engines = region ? region.ocr_engines : [block.ocr_engine].filter(Boolean);
         const text = region ? region.ocr_text : block.ocr_engine ? block.text : "";
         const source = region?.source || block?.source_reference?.layout_detection ||
@@ -468,31 +514,99 @@ function renderTextBlocks(blocks, numbered = false) {
     }).join("") + '</div>';
 }
 
+function inspectionMessage(doc) {
+    const job = doc.jobs[0];
+    return job.error || (job.status === "uploaded" ? W.source?.error || "Start processing to see inspection results." :
+        job.status === "completed" ? "No extracted content is available for this page." :
+        "Processing the PDF. Inspection results will appear here when ready.");
+}
+
+function updatePageControls(total) {
+    const select = $("#page-label");
+    if (select.options.length !== total) {
+        select.replaceChildren(...Array.from({length: total}, (_, index) =>
+            new Option((index + 1) + " / " + total, index + 1)));
+    }
+    select.value = W.page;
+    $("#page-prev").disabled = W.page <= 1;
+    $("#page-next").disabled = W.page >= total;
+    $("#zoom-out").disabled = W.zoom <= 50 || S.vtab === "text";
+    $("#zoom-in").disabled = W.zoom >= 200 || S.vtab === "text";
+    $("#fit-width").disabled = S.vtab === "text";
+}
+
+function updatePageInspector() {
+    if (S.stab !== "meta") return;
+    const diagnostics = $("#page-diagnostics"), page = currentPage();
+    if (diagnostics && page) diagnostics.innerHTML = pageDiagnostics(page);
+    const source = $("#source-fields");
+    if (source) source.innerHTML = sourceFields();
+    updateInspector();
+}
+
+function renderSourcePages(viewer, pages) {
+    const key = JSON.stringify([S.id, S.rot, W.zoom, W.highlight]);
+    if (viewer.dataset.sourceStack === key) return;
+    viewer.dataset.sourceStack = key;
+    const scale = W.zoom / 100, dpi = Math.min(220, Math.round(100 * scale));
+    viewer.innerHTML = '<div class="pl"><span>' + W.zoom + '%</span>' +
+        '<a class="workspace-link" target="_blank" rel="noopener" href="' + docUrl() + '/pdf">Open original PDF</a></div>' +
+        pages.map(page => {
+            const swapped = S.rot % 180 !== 0;
+            const aspect = (swapped ? page.h : page.w) + '/' + (swapped ? page.w : page.h);
+            const overlay = W.highlight && !S.rot && W.page === page.n ?
+                '<svg viewBox="0 0 ' + page.w + ' ' + page.h + '">' + svgRectangle(W.highlight, 'class="highlight"', "Selected source region") + '</svg>' : '';
+            return '<div class="page source-page" data-source-page="' + page.n + '" style="width:' + W.zoom + '%;aspect-ratio:' + aspect +
+                '"><img ' + (page.n === W.page ? '' : 'loading="lazy" ') + 'src="' + docUrl() + '/page/' + page.n +
+                '.png?dpi=' + dpi + '&amp;rot=' + S.rot + '" alt="Source PDF page ' + page.n + '">' + overlay + '</div>';
+        }).join("");
+    const frames = Array.from(viewer.querySelectorAll("[data-source-page]"));
+    scrollSourcePage(viewer, W.page);
+    viewer.onscroll = () => {
+        const midpoint = viewer.getBoundingClientRect().top + Math.min(viewer.clientHeight * .28, 130);
+        const frame = frames.find(item => item.getBoundingClientRect().bottom >= midpoint);
+        const number = Number(frame?.dataset.sourcePage || pages.length);
+        if (number === W.page) return;
+        W.page = number;
+        W.region = W.block = null;
+        updatePageControls(pages.length);
+        updatePageInspector();
+    };
+}
+
+function scrollSourcePage(viewer, number) {
+    const frame = viewer.querySelector('[data-source-page="' + number + '"]');
+    if (frame) viewer.scrollTop = number === 1 ? 0 : viewer.scrollTop + frame.getBoundingClientRect().top - viewer.getBoundingClientRect().top - 8;
+}
+
 function workspaceViewer() {
     const doc = S.data;
     if (!doc) return;
     const page = doc.pages?.[W.page - 1];
-    $("#page-tools").hidden = !page;
-    $("#rot").disabled = !page || S.vtab !== "pdf";
+    const sourcePages = W.source?.pages || doc.pages || [];
+    const viewer = $("#viewer");
+    $("#page-tools").hidden = !sourcePages.length;
+    $("#rot").hidden = S.vtab !== "pdf";
+    $("#rot").disabled = !sourcePages.length || S.vtab !== "pdf";
     $("#legend").hidden = true;
-    if (!page) {
-        $("#viewer").innerHTML = '<div class="empty">' + esc(doc.jobs[0].error ||
-            "Processing the PDF. Page previews will appear when the attempt completes.") +
-            ' <a class="workspace-link" target="_blank" rel="noopener" href="' + docUrl() + '/pdf">Open original PDF</a></div>';
+    updatePageControls(sourcePages.length);
+    if (S.vtab === "pdf" && sourcePages.length) {
+        renderSourcePages(viewer, sourcePages);
         return;
     }
-    $("#page-label").textContent = W.page + " / " + doc.pages.length;
-    $("#page-prev").disabled = W.page === 1;
-    $("#page-next").disabled = W.page === doc.pages.length;
-    $("#zoom-out").disabled = W.zoom === 50;
-    $("#zoom-in").disabled = W.zoom === 200;
+    delete viewer.dataset.sourceStack;
+    viewer.onscroll = null;
+    if (!page) {
+        viewer.innerHTML = '<div class="empty">' + esc(S.vtab === "pdf" && W.source?.error || inspectionMessage(doc)) + '</div>';
+        return;
+    }
     if (S.vtab === "text") {
         $("#viewer").innerHTML = renderTextBlocks(page.blocks);
         return;
     }
     let overlay = "";
     if (S.vtab === "zoning") {
-        const regions = page.layout_regions || [];
+        const regions = layoutRegions(page);
         const legend = $("#legend");
         legend.hidden = false;
         legend.innerHTML = '<label><input type="checkbox" id="show-boxes"' + (W.showBoxes ? " checked" : "") +
@@ -539,17 +653,16 @@ function workspaceViewer() {
                 '" text-anchor="middle" font-size="11" fill="white">' + (block.reading_order || block.i + 1) + '</text></g>';
         }).join("");
     }
-    if (W.highlight && S.vtab === "pdf" && !S.rot) {
-        overlay += svgRectangle(W.highlight, 'class="highlight"', "Selected source region");
-    }
     const dpi = Math.min(220, Math.round(100 * W.zoom / 100));
     $("#viewer").innerHTML = '<div class="pl"><span>' + esc(page.source === "ocr" ?
         engineName(page.ocr_engine) || "OCR" : "Native PDF") + ' · ' + W.zoom + '%</span>' +
         '<a class="workspace-link" target="_blank" rel="noopener" href="' + docUrl() + '/pdf#page=' + page.n +
-        '">Open original</a></div><div class="page" style="width:' + W.zoom + '%;max-width:' + (860 * W.zoom / 100) +
-        'px"><img src="' + docUrl() + '/page/' + page.n + '.png?dpi=' + dpi + '&amp;rot=' +
-        (S.vtab === "pdf" ? S.rot : 0) + '" alt="Page ' + page.n + '">' +
-        (overlay ? '<svg viewBox="0 0 ' + page.w + ' ' + page.h + '" preserveAspectRatio="none">' + overlay + '</svg>' : '') + '</div>';
+        '">Open original</a></div><div class="page inspection-page" style="width:' + W.zoom + '%">' +
+        '<img src="' + docUrl() + '/page/' + page.n + '.png?dpi=' + dpi + '" alt="Page ' + page.n + '">' +
+        (overlay ? '<svg viewBox="0 0 ' + page.w + ' ' + page.h + '" preserveAspectRatio="none">' + overlay + '</svg>' : '') + '</div>' +
+        (S.vtab === "order" ? '<section aria-label="Reconstructed reading sequence">' +
+            '<div class="pl">Page ' + page.n + ' · Reconstructed reading order</div>' +
+            (page.blocks.length ? renderTextBlocks(orderedBlocks(page), true) : '<p class="empty">No extracted blocks on this page.</p>') + '</section>' : '');
     $("#viewer").querySelectorAll("[data-region], [data-block]").forEach(control => {
         const activate = () => {
             const region = control.dataset.region, block = control.dataset.block;
@@ -564,15 +677,14 @@ function workspaceViewer() {
 }
 
 function movePage(step) {
-    W.page += step;
+    const total = W.source?.pages?.length || S.data?.pages?.length || 0;
+    W.page = Math.min(total, Math.max(1, W.page + step));
     W.highlight = null;
     W.region = W.block = null;
     workspaceViewer();
-    if (S.stab === "meta") {
-        const diagnostics = $("#page-diagnostics");
-        if (diagnostics) diagnostics.innerHTML = pageDiagnostics(S.data.pages[W.page - 1]);
-        updateInspector();
-    }
+    if (S.vtab === "pdf") scrollSourcePage($("#viewer"), W.page);
+    else $("#viewer").scrollTop = 0;
+    updatePageInspector();
 }
 
 function pageDiagnostics(page) {
@@ -582,7 +694,7 @@ function pageDiagnostics(page) {
     const attempts = (ocr?.attempts || []).map(attempt => '<div>' + esc(attempt.model || engineName(attempt.engine)) +
         ' · ' + esc(attempt.status) + ' · ' + esc(attempt.seconds) + ' s' +
         (attempt.fallback_reason ? ' · ' + esc(attempt.fallback_reason) : '') +
-        (attempt.issues.length ? ' · ' + esc(attempt.issues.join(" ")) : '') + '</div>').join("");
+        (attempt.issues?.length ? ' · ' + esc(attempt.issues.join(" ")) : '') + '</div>').join("");
     return '<div class="sec">Page ' + page.n + ' diagnostics</div><div class="card">' +
         '<div>' + esc(selected) + ' · ' + confidence + '</div><div>' + esc(languageLabel(page.language)) + '</div>' +
         '<div>Native text: ' + esc(diag.health || "unknown") +
@@ -590,28 +702,54 @@ function pageDiagnostics(page) {
         '<div>' + (diag.ocr_required ? "OCR required" : "OCR not required") +
         (diag.appears_scanned ? ' · scanned page' : '') + '</div>' + attempts +
         (diag.layout ? '<div>Layout · ' + esc(diag.layout.engine) + ' · ' + esc(diag.layout.status) + '</div>' : '') +
+        (diag.layout?.error ? '<div class="notice">' + esc(diag.layout.error) + '</div>' : '') +
         (diag.layout?.docling_status ? '<div>Docling · ' + esc(diag.layout.docling_status) + '</div>' : '') +
         (page.requires_review ? '<strong class="notice">Manual review required</strong>' : '') +
         '<div>' + esc([...(diag.reasons || []), ...(diag.review_reasons || [])].join(" ")) + '</div></div>';
+}
+
+function sourceFields() {
+    const page = W.source?.pages?.[W.page - 1];
+    const facts = [["Pages", W.source?.pages?.length], ["Current page", page?.n],
+        ["Page size", page && page.w.toFixed(1) + " × " + page.h.toFixed(1) + " pt"]];
+    const fields = Object.entries(W.source?.metadata || {}).map(([key, value]) => [key[0].toUpperCase() + key.slice(1), value]);
+    const rows = values => '<dl>' + values.filter(([, value]) => value).map(([key, value]) =>
+        '<dt>' + esc(key) + '</dt><dd>' + esc(value) + '</dd>').join("") + '</dl>';
+    return (page ? '<div class="sec">Document and page</div><div class="card region-detail">' + rows(facts) + '</div>' : '') +
+        (fields.length ? '<div class="sec">Embedded PDF metadata</div><div class="card region-detail">' + rows(fields) + '</div>' : '');
 }
 
 async function reviewPanel() {
     const data = S.data, panel = $("#sbody"), bar = $("#sbar");
     if (!data) return;
     const job = data.jobs[0];
-    bar.textContent = data.approved ? "Review approved" : "Review pending";
+    bar.textContent = data.pages ? (data.approved ? "Review approved" : "Review pending") : "";
     if (data.approved && data.review) bar.title = "Reviewed by " + data.review.reviewer;
     else bar.removeAttribute("title");
     $("#dlxml").style.display = S.stab === "deck" ? "none" : "";
     if (S.stab === "xml") {
-        panel.textContent = "";
-        if (!data.pages) return;
-        const xml = await workspaceFetch(docUrl() + "/xml", undefined, true);
-        if (S.data !== data || S.stab !== "xml" || W.batch) return;
-        const preview = document.createElement("pre");
-        preview.className = "xml";
-        preview.textContent = xml;
-        panel.append(preview);
+        if (!data.pages) { panel.textContent = inspectionMessage(data); return; }
+        const saved = data.submission_export, base = docUrl();
+        panel.textContent = "Loading XML…";
+        try {
+            let url = base + "/xml";
+            if (hasSavedPdfXml(saved) && !data.approved) {
+                const report = await savedPdfXmlReport(data, base);
+                url = base + "/presentations/" + encodeURIComponent(report.id) + "/xml?preview=1";
+            }
+            const xml = await workspaceFetch(url, undefined, true);
+            if (S.data !== data || S.stab !== "xml" || W.batch) return;
+            const preview = document.createElement("pre");
+            preview.className = "xml";
+            preview.innerHTML = xml.split(/(<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<[^>]+>)/g).map((token, index) =>
+                index % 2 ? '<span class="xml-tag">' + esc(token) + '</span>' : esc(token)).join("");
+            panel.replaceChildren(preview);
+            if (!hasSavedPdfXml(saved) && !data.approved) panel.prepend(Object.assign(document.createElement("p"), {
+                className: "notice", textContent: saved?.error || "XML preview. Submit the source review to publish an export."
+            }));
+        } catch (error) {
+            if (S.data === data && S.stab === "xml" && !W.batch) panel.textContent = error.message;
+        }
         return;
     }
     if (S.stab === "deck" && data.pages) {
@@ -623,7 +761,8 @@ async function reviewPanel() {
         '</div>' + (attempt.error ? '<div class="notice">' + esc(attempt.error) + '</div>' : '') + '</div>').join("");
     const counts = processingCounts(job.processing?.counts || data.processing_counts);
     if (!data.pages) {
-        panel.innerHTML = counts + history;
+        panel.innerHTML = '<p role="status">' + esc(inspectionMessage(data)) + '</p>' +
+            '<section id="source-fields">' + sourceFields() + '</section>' + counts;
         return;
     }
     const page = data.pages[W.page - 1], title = data.title;
@@ -654,16 +793,17 @@ async function reviewPanel() {
                 '<strong class="notice">Validation partially passed · content review required</strong>' : '') + '</div>' +
         data.warnings.map(warning => '<div class="notice">' + esc(warning) + '</div>').join("") + history;
     panel.innerHTML = '<section id="region-inspector" aria-label="Element inspector"></section>' +
+        '<section id="source-fields">' + sourceFields() + '</section><div class="sec">Extracted metadata</div>' +
         '<form id="metadata-form" class="workspace-tools">' +
         '<div class="fld"><label for="review-title">Title</label>' +
         '<input id="review-title" maxlength="1000" value="' + esc(title?.value) + '">' +
+        (Number.isFinite(title?.confidence) ? '<small>Extraction confidence ' + badge(title.confidence) + '</small>' : '') +
         (title?.bbox ? '<button type="button" class="btn" id="locate">Locate title source</button>' : '') + '</div>' +
         '<div class="fld"><label for="review-lang">Document language</label>' +
         '<input id="review-lang" required maxlength="35" value="' + esc(data.lang) + '"></div>' +
         '<div><button class="btn" value="save">' + (data.approved ? "Re-edit" : "Save draft") +
         '</button> <button class="btn pri" value="approve">Submit review</button></div></form>' +
         '<details class="advanced-details"><summary>Advanced metadata and diagnostics</summary>' +
-        (title ? '<div class="card">Title confidence ' + badge(title.confidence) + '</div>' : '') +
         advanced + '</details>';
     updateInspector();
     const locate = $("#locate");
@@ -827,8 +967,11 @@ function changesPanel(data) {
 
 $("#page-prev").onclick = () => movePage(-1);
 $("#page-next").onclick = () => movePage(1);
-$("#zoom-in").onclick = () => { W.zoom += 25; workspaceViewer(); };
-$("#zoom-out").onclick = () => { W.zoom -= 25; workspaceViewer(); };
+$("#page-label").onchange = event => movePage(Number(event.target.value) - W.page);
+$("#zoom-in").onclick = () => { W.zoom = Math.min(200, W.zoom + 25); workspaceViewer(); };
+$("#zoom-out").onclick = () => { W.zoom = Math.max(50, W.zoom - 25); workspaceViewer(); };
+$("#fit-width").onclick = () => { W.zoom = 100; workspaceViewer(); };
+$("#fullscreen").hidden = !document.fullscreenEnabled;
 $("#fullscreen").onclick = async () => {
     try {
         if (document.fullscreenElement) await document.exitFullscreen();
@@ -881,7 +1024,7 @@ $("#dlpptx").onclick = async () => {
         const report = await submitExport(data, form);
         if (S.data !== data) return;
         const links = presentationLinks(docUrl() + "/presentations", report.id);
-        $("#stabs [data-t=deck]").click();
+        setReviewTab("deck");
         $("#comparison-results").innerHTML = exportCard(report, links);
         if (report.outputs.pptx) {
             const download = document.createElement("a");
@@ -982,13 +1125,19 @@ $("#batch").onclick = async () => {
     $("#upload-zone").hidden = W.batch;
     $("#layout-model").hidden = W.batch;
     $("#dlpptx").hidden = W.batch;
+    $("#start-pdf").hidden = true;
+    $("#deck-tab").hidden = true;
     $("#ocr-controls").hidden = W.batch;
     $("#ocr-timeline").hidden = true;
     $("#processing-stages").hidden = true;
     $("#page-tools").hidden = true;
     $("#rot").disabled = true;
     $("#dlxml").disabled = !W.batch;
+    $("#dlxml").hidden = !W.batch;
     $("#reproc").disabled = !W.batch;
+    $("#reproc").hidden = false;
+    delete $("#viewer").dataset.sourceStack;
+    $("#viewer").onscroll = null;
     $("#viewer").textContent = "";
     $("#sbar").textContent = "";
     $("#sbody").textContent = "";

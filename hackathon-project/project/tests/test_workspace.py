@@ -59,6 +59,35 @@ def wait_for_attempt(client, url):
     pytest.fail("The processing attempt did not finish.")
 
 
+def test_deferred_pdf_upload_can_be_inspected_before_processing(workspace):
+    client, _ = workspace
+    original = pdf_with_text("Original sample pressure measurements were recorded before calibration.")
+    response = client.post("/api/documents", data={"defer": "1", "pdf": (io.BytesIO(original), "inspect-first.pdf")})
+    assert response.status_code == 202
+    base = "/api/documents/" + response.json["id"]
+    pending, = response.json["jobs"]
+    assert pending["status"] == "uploaded"
+    assert "pages" not in client.get(base).json
+    assert client.get(base + "/pdf").data == original
+    assert client.get(base + "/source-info").json["pages"][0]["n"] == 1
+    assert client.get(base + "/page/1.png").mimetype == "image/png"
+    assert client.get(base + "/xml").status_code == 409
+    assert app.test_client().get(base + "/source-info").status_code == 404
+    assert client.post(base + "/retry", json={}).status_code == 202
+    result = wait_for_attempt(client, base)
+    assert result["jobs"][0]["status"] == "completed"
+    assert [job["id"] for job in result["jobs"]] == [pending["id"]]
+    saved = result["submission_export"]
+    assert saved["status"] in {"xml_only", "manual_review_required"}
+    assert saved["outputs"]["xml"]["valid"]
+    report, = client.get(base + "/presentations").json
+    export = base + "/presentations/" + report["id"] + "/xml"
+    preview = client.get(export + "?preview=1")
+    assert preview.status_code == 200 and preview.mimetype == "text/plain"
+    assert preview.data == client.get(export).data
+    assert etree.fromstring(preview.data).tag == "document"
+
+
 def test_export_xml_defaults_to_zip_when_there_is_a_picture(workspace):
     client, _ = workspace
     with pymupdf.open() as art:
@@ -454,6 +483,9 @@ def test_standalone_pptx_job_needs_no_pdf_and_downloads_corrected_output(workspa
         unauthorized = app.test_client()
         unauthorized.set_cookie("docusync_workspace", "0" * 64)
         assert unauthorized.get(f"/api/presentations/{job_id}").status_code == 404
+        assert unauthorized.get(f"/api/presentations/{job_id}/preview").status_code == 404
+        assert unauthorized.get(f"/api/presentations/{job_id}/source").status_code == 404
+        assert Presentation(io.BytesIO(fresh.get(f"/api/presentations/{job_id}/source").data)).slides
     finally:
         thread_worker.shutdown(wait=True)
         ws.settings.ollama_enabled = prior_enabled

@@ -69,7 +69,7 @@ a { color: var(--accent); }
 #reviewer-label:not(:empty)::after { content: " · "; white-space: pre; }
 .top :focus-visible { outline-color: #e1b57c; }
 
-.app.home-view, .app.history-view, .app.batch-view {
+.app.home-view, .app.history-view, .app.batch-view, .app.pptx-view {
     grid-template: auto minmax(0, 1fr) / minmax(0, 1fr);
 }
 #home, #history { grid-column: 1 / -1; min-width: 0; min-height: 0; overflow: auto; }
@@ -111,14 +111,6 @@ a { color: var(--accent); }
 .process-button:disabled { cursor: not-allowed; }
 .advanced-details p { margin: 9px 0; }
 .advanced-details[open] { padding: 10px 12px; border-left: 2px solid var(--line); }
-#pdf-inspection { max-width: 1120px; margin: 14px auto 0; color: var(--ink); }
-#pdf-inspection .tabs { margin-top: 10px; padding-inline: 0; }
-.pdf-inspection-page { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
-.pdf-inspection-preview { max-height: 65vh; border-radius: 6px; }
-.pdf-inspection-preview .page .layout-box { cursor: default; }
-.pdf-inspection-regions { max-height: 185px; overflow: auto; padding-inline-start: 24px; }
-#pdf-inspection-results { overflow-wrap: anywhere; }
-#pdf-inspection-results .textview { max-width: none; max-height: 65vh; overflow: auto; }
 .job-result { display: grid; gap: 9px; margin-top: 12px; padding: 13px; border-radius: 8px; background: #edf5ee; }
 .job-result[data-state="error"] { background: #fcf0ed; color: var(--danger); }
 .job-result a { width: fit-content; }
@@ -147,6 +139,9 @@ a { color: var(--accent); }
 }
 .library h2, .pane-heading h2, .dialog-heading h2 { font: normal 22px/1.2 var(--display); }
 .library h2 { margin-bottom: 16px; }
+.document-tools > summary { color: var(--accent); cursor: pointer; font-weight: 600; }
+.document-tools[open] > summary { margin-bottom: 12px; }
+.review-view:not(:has(.document-tools[open])) { grid-template-columns: 150px minmax(0, 1fr); }
 .library label { display: block; margin: 23px 0 6px; color: var(--mute); font-size: 12px; }
 .library .upload { width: 100%; text-align: left; }
 #ocr-controls { display: grid; gap: 6px; margin-bottom: 12px; }
@@ -195,6 +190,10 @@ a { color: var(--accent); }
     min-height: 56px;
     padding: 12px 15px;
 }
+.pane-heading h2, #pptx-workspace-name { overflow-wrap: anywhere; }
+.document-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+#pptx-workspace-results > div { display: grid; gap: 10px; }
+#pptx-workspace-results a { width: fit-content; }
 .chip {
     display: flex;
     align-items: center;
@@ -253,6 +252,8 @@ select, .fld input, .workspace-tools input {
 }
 .page { position: relative; width: 100%; max-width: 860px; margin: 0 auto 16px; background: white; box-shadow: 0 4px 18px #2c3a2b27; }
 .page img { display: block; width: 100%; height: auto; }
+.xml-tag { color: var(--accent-dark); font-weight: 600; }
+.page.source-page, .page.inspection-page { max-width: none; }
 .page svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .page .highlight { fill: #d88d40; fill-opacity: .3; stroke: #a55212; stroke-width: 2; }
 .pl { display: flex; justify-content: space-between; gap: 12px; max-width: 860px; margin: 0 auto 9px; color: var(--mute); font-size: 12px; }
@@ -378,8 +379,8 @@ dialog::backdrop { background: #132e27a6; }
 
 @media (max-width: 1000px) {
     .app { height: auto; min-height: 100dvh; grid-template: auto auto minmax(0, 1fr) / minmax(0, 1fr); }
-    .app.home-view, .app.history-view, .app.batch-view { height: 100dvh; min-height: 0; grid-template: auto minmax(0, 1fr) / minmax(0, 1fr); }
-    .app.review-view { height: auto; min-height: 100dvh; grid-template: auto auto minmax(0, 1fr) / minmax(0, 1fr); }
+    .app.home-view, .app.history-view, .app.batch-view, .app.pptx-view { height: 100dvh; min-height: 0; grid-template: auto minmax(0, 1fr) / minmax(0, 1fr); }
+    .app.review-view, .app.review-view:not(:has(.document-tools[open])) { height: auto; min-height: 100dvh; grid-template: auto auto minmax(0, 1fr) / minmax(0, 1fr); }
     .library {
         display: grid;
         grid-template-columns: max-content minmax(0, 1fr);
@@ -414,7 +415,8 @@ dialog::backdrop { background: #132e27a6; }
     .history-item-actions { width: 100%; }
     .desk { grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 10px; }
     .pane { height: max(440px, 64dvh); }
-    .side { height: auto; min-height: 320px; }
+    .side { height: 52dvh; min-height: 320px; }
+    .app.pptx-view { height: auto; min-height: 100dvh; }
     .tabs { padding-inline: 9px; }
     .pane-heading { padding-inline: 12px; }
     #processing-stages { grid-template-columns: repeat(2, minmax(0, 1fr)); }

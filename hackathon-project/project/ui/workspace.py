@@ -84,6 +84,7 @@ class Workspace:
         self.root.mkdir(parents=True, exist_ok=True)
         self.settings = settings
         self._layout_lock = Lock()
+        self.preview_lock = Lock()
         self._layout_health = None
         self.export_progress = {}
         self.export_lock = Lock()
@@ -268,6 +269,16 @@ class Workspace:
             row = db.execute("SELECT * FROM presentation_jobs WHERE id=? AND owner=?", (job_id, owner)).fetchone()
         return self._public_presentation(row) if row else None
 
+    def presentation_source(self, job_id: str, owner: str) -> Path | None:
+        with self.db() as db:
+            row = db.execute("SELECT phase, input_path FROM presentation_jobs WHERE id=? AND owner=?",
+                             (job_id, owner)).fetchone()
+        if row:
+            path = Path(row["input_path"]).resolve()
+            if path.is_relative_to(self.phase_input_dir(row["phase"]).resolve()) and path.is_file():
+                return path
+        return None
+
     def presentation_download(self, job_id: str, owner: str) -> Path | None:
         with self.db() as db:
             row = db.execute("SELECT phase, output_folder, status, result FROM presentation_jobs "
@@ -286,7 +297,8 @@ class Workspace:
         return [self._public_presentation(row) for row in rows]
 
     def upload(self, filename: str, stream: BinaryIO, previous_id: str | None, owner: str,
-               *, phase: str = "1", engine: str | None = None, language: str | None = None) -> str:
+               *, phase: str = "1", engine: str | None = None, language: str | None = None,
+               defer: bool = False) -> str:
         if phase not in {"1", "2"}:
             raise ValueError("Choose Phase 1 or Phase 2.")
         document_id = uuid4().hex
@@ -311,8 +323,9 @@ class Workspace:
                 source.parent.rmdir()
                 input_path.unlink(missing_ok=True)
                 raise
-            job = self._create_job(db, document_id, engine, language)
-        self._submit(document_id, job, phase=phase)
+            job = self._create_job(db, document_id, engine, language, status="uploaded" if defer else "queued")
+        if not defer:
+            self._submit(document_id, job, phase=phase)
         return document_id
 
     def owns(self, document_id: str, owner: str | None) -> bool:
@@ -383,7 +396,12 @@ class Workspace:
                                          ORDER BY id DESC LIMIT 1""", (document_id,)).fetchone()
                 if previous is None:
                     return False
-            job = self._create_job(db, document_id, engine, language)
+            if not layout_only:
+                pending = db.execute("UPDATE jobs SET status='queued' WHERE document_id=? AND status='uploaded' "
+                                     "RETURNING id", (document_id,)).fetchone()
+            else:
+                pending = None
+            job = pending["id"] if pending else self._create_job(db, document_id, engine, language)
             if job is None:
                 return False
             if previous is not None:
@@ -394,14 +412,14 @@ class Workspace:
         return True
 
     def _create_job(self, db: sqlite3.Connection, document_id: str, engine: str | None = None,
-                    language: str | None = None) -> int | None:
+                    language: str | None = None, *, status: str = "queued") -> int | None:
         settings = replace(self.settings, ocr_backend=engine or self.settings.ocr_backend,
                            paddle_ocr_lang=language if language is not None else self.settings.paddle_ocr_lang)
         cursor = db.execute("""
             INSERT INTO jobs(document_id, status, created, settings)
-            SELECT ?, 'queued', ?, ? WHERE NOT EXISTS(
+            SELECT ?, ?, ?, ? WHERE NOT EXISTS(
                 SELECT 1 FROM jobs WHERE document_id=? AND status IN ('queued','running'))
-        """, (document_id, now(), json.dumps(settings.to_dict()), document_id))
+        """, (document_id, status, now(), json.dumps(settings.to_dict()), document_id))
         return cursor.lastrowid if cursor.rowcount else None
 
     def _submit(self, document_id: str, job: int, layout_from: int | None = None, *, phase: str = "1") -> None:

@@ -10,6 +10,7 @@ from hashlib import sha256
 from pathlib import Path, PureWindowsPath
 from secrets import token_hex
 from tempfile import SpooledTemporaryFile, TemporaryDirectory
+from subprocess import TimeoutExpired
 from uuid import UUID, uuid4
 from zipfile import BadZipFile, ZipFile
 
@@ -262,7 +263,7 @@ def create_document():
         return fail("The previous document version does not exist.", 400)
     filename, stream = uploaded
     document_id = ws.upload(filename, stream, previous, browser_owner(create=True), phase=phase,
-                            engine=engine, language=language)
+                            engine=engine, language=language, defer=request.form.get("defer") == "1")
     return jsonify(ws.get(document_id)), 202
 
 
@@ -326,6 +327,49 @@ def download_standalone_presentation(job_id: str):
         return fail("The validated PowerPoint output is missing.", 404)
     return send_file(target, as_attachment=True, download_name=target.name,
                      mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+
+@api.get("/presentations/<job_id>/source")
+def standalone_presentation_source(job_id: str):
+    source = workspace().presentation_source(job_id, browser_owner())
+    if not source:
+        return fail("Presentation not found.", 404)
+    return send_file(source, as_attachment=True)
+
+
+@api.get("/presentations/<job_id>/preview")
+@api.get("/presentations/<job_id>/preview/<int:page>.png")
+def standalone_presentation_preview(job_id: str, page: int | None = None):
+    import pymupdf
+    from powerpoint.validation import render_pdf
+    from quality.slide_preview import renderer
+
+    ws = workspace()
+    source = ws.presentation_source(job_id, browser_owner())
+    if not source:
+        return fail("Presentation not found.", 404)
+    folder = ws.root / "presentation-previews"
+    target = folder / f"{job_id}.pdf"
+    try:
+        if not target.is_file():
+            with ws.preview_lock:
+                if not target.is_file():
+                    executable = renderer()
+                    if not executable:
+                        return fail("Install LibreOffice locally to preview slides. The original is available to download.", 503)
+                    folder.mkdir(exist_ok=True)
+                    with TemporaryDirectory(dir=folder, ignore_cleanup_errors=True) as temp:
+                        staging = Path(temp).resolve()
+                        rendered = render_pdf(executable, source, staging / "slides", staging / "profile")
+                        rendered.replace(target)
+        if page is not None:
+            from ui.server import render_page
+            return render_page(target, page)
+        with pymupdf.open(target) as pdf:
+            return jsonify(slides=len(pdf))
+    except (OSError, RuntimeError, TimeoutExpired, ValueError):
+        current_app.logger.exception("Could not render the PowerPoint preview")
+        return fail("The presentation could not be rendered locally. The original is available to download.", 422)
 
 
 def view(ir: DocIR) -> dict:
@@ -445,6 +489,24 @@ def pdf(document_id: str):
     if info is None:
         return fail("Document not found.", 404)
     return send_file(ws.source(document_id), mimetype="application/pdf", download_name=info["filename"])
+
+
+@api.get("/documents/<document_id>/source-info")
+def source_info(document_id: str):
+    import pymupdf
+
+    try:
+        with pymupdf.open(workspace().source(document_id)) as source:
+            if source.needs_pass:
+                return fail("This PDF requires a password.", 422)
+            if not source.page_count:
+                return fail("This PDF contains no pages.", 422)
+            metadata = {key: value for key, value in source.metadata.items()
+                        if value and key in {"title", "author", "subject", "keywords", "creator", "producer"}}
+            return jsonify(pages=[{"n": page.number + 1, "w": page.rect.width, "h": page.rect.height}
+                                  for page in source], metadata=metadata)
+    except (OSError, RuntimeError, ValueError):
+        return fail("This PDF cannot be rendered.", 422)
 
 
 @api.patch("/documents/<document_id>/metadata")
@@ -808,6 +870,8 @@ def download_export(document_id: str, export_id: UUID):
         folder, report = found
         item = report["outputs"].get(kind)
         if item and item["valid"] and (file := export_file(folder, item["filename"])):
+            if kind == "xml" and request.args.get("preview") == "1":
+                return send_file(file, mimetype="text/plain", as_attachment=False)
             if kind == "xml" and request.args.get("format") in {"auto", "zip"}:
                 return download_saved_xml(file)
             return send_file(file, as_attachment=True, download_name=item["filename"])

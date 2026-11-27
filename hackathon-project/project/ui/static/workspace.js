@@ -2,6 +2,7 @@ const W = {batch: false, documents: [], page: 1, zoom: 100, highlight: null,
            selection: 0, timer: null, previous: "", changes: null, region: null, block: null,
            showBoxes: true, exportPhases: new Map()};
 const docUrl = () => "/api/documents/" + encodeURIComponent(S.id);
+const workspaceUpdateMessage = "DocuSync is running an earlier backend. Restart the app and reload this page to open the document workspace.";
 const statusText = message => $("#runchip").textContent = message;
 const engineName = engine => ({"glm-ocr": "GLM-OCR", "paddleocr-vl": "PaddleOCR-VL (Ollama)",
     paddleocr: "PaddleOCR", tesseract: "Tesseract"}[engine] || "");
@@ -226,7 +227,10 @@ async function workspaceFetch(url, options, asText = false) {
     const response = await fetch(url, options);
     if (!response.ok) {
         const body = await response.json().catch(() => ({}));
-        const error = new Error(body.error || "Request failed (" + response.status + ").");
+        const missingPreviewRoute = response.status === 404 && !body.error &&
+            /\/(?:source-info|preview)(?:\/|$)/.test(url);
+        const error = new Error(body.error || (missingPreviewRoute ? workspaceUpdateMessage :
+            "Request failed (" + response.status + ")."));
         if (body.outputs) error.exportReport = body;
         throw error;
     }

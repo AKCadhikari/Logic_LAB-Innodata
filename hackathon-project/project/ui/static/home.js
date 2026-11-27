@@ -198,6 +198,8 @@ async function uploadPair() {
     home$("#pair-retry").hidden = true;
     for (const kind of ["pdf", "pptx"]) syncSelection(kind);
     try {
+        const backend = await workspaceFetch("/api/startup/identity");
+        if (backend.workspace_api_version !== 1) throw new Error(workspaceUpdateMessage);
         await uploadSelected("pdf");
         await uploadSelected("pptx");
         homeState.pair = {...homeState.uploads};

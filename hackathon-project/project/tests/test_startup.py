@@ -171,7 +171,7 @@ def test_windows_click_twice_shutdown_and_restart(tmp_path, entry):
     assert not startup.port_open("127.0.0.1", port)
 
 
-@pytest.mark.parametrize("component", ["backend", "frontend"])
+@pytest.mark.parametrize("component", ["backend", "frontend", "out of date"])
 def test_distinguishes_backend_and_frontend_failure(tmp_path, component):
     settings = Settings.load()
     storage = tmp_path / "workspace"
@@ -182,8 +182,11 @@ def test_distinguishes_backend_and_frontend_failure(tmp_path, component):
                 return
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(json.dumps({"workspace": startup.workspace_id(storage), "backend_ready": True,
-                                         "settings": startup.settings_id(settings)}).encode())
+            identity = {"workspace": startup.workspace_id(storage), "backend_ready": True,
+                        "settings": startup.settings_id(settings)}
+            if component != "out of date":
+                identity["workspace_api_version"] = startup.WORKSPACE_API_VERSION
+            self.wfile.write(json.dumps(identity).encode())
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
         worker = Thread(target=server.serve_forever, daemon=True)
         worker.start()

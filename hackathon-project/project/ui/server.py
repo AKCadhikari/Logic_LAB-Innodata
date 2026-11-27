@@ -56,12 +56,13 @@ def release_managed_request(_error):
 
 @app.get("/api/startup/identity")
 def startup_identity():
-    from startup import settings_id, workspace_id
+    from startup import WORKSPACE_API_VERSION, settings_id, workspace_id
 
     ws = app.extensions.get("workspace")
     if ws is None:
         return jsonify(backend_ready=False), 503
-    return jsonify(backend_ready=True, workspace=workspace_id(ws.root), settings=settings_id(ws.settings), pid=os.getpid())
+    return jsonify(backend_ready=True, workspace=workspace_id(ws.root), settings=settings_id(ws.settings),
+                   pid=os.getpid(), workspace_api_version=WORKSPACE_API_VERSION)
 
 
 @app.post("/api/startup/shutdown")

@@ -28,6 +28,7 @@ from utils import ollama
 from utils.logs import AuditLog
 
 ROOT = Path(__file__).resolve().parent.parent
+WORKSPACE_API_VERSION = 1
 MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)*:[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 
@@ -440,6 +441,8 @@ class StartupManager:
                     identity = self.wait_for(self.backend_health, 3)
                 except StartupError as error:
                     raise StartupError(f"Port {self.port} is occupied and the DocuSync backend could not be verified. {error}") from error
+                if identity.get("workspace_api_version") != WORKSPACE_API_VERSION:
+                    raise StartupError("The running DocuSync backend is out of date. Restart it to load the current workspace.")
                 if identity.get("settings") != settings_id(self.settings):
                     raise StartupError("The running workspace uses different settings. Restart it with the launcher.")
                 source = "reused"

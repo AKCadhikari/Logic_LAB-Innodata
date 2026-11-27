@@ -1,6 +1,35 @@
 # Benchmarks (measured with `project/tests/benchmark.py`; raw numbers in `benchmark_results.json`)
 
-This file records the historical Linux run. The [implementation roadmap](../../docs/IMPLEMENTATION_ROADMAP.md)
+## Advanced correction verification
+
+The Windows run processed the 12-page engineering PDF with local GLM-OCR and rendered all 40 output slides with LibreOffice.
+The correction engine used the original source PDF. The engineering XML and QA deck were supplied after export for comparison.
+
+| Measure | Observed result |
+| --- | --- |
+| Cold PDF extraction | 1,113.99 s |
+| PowerPoint repair and QA | 18.97 s |
+| Engineering XML text similarity | 0.981 |
+| XML reading-order Spearman correlation on matched units | 0.761 |
+| XML assets verified inside the final ZIP | 14 |
+| Exact paragraph matches against the engineering deck | 210/334 before, 215/334 after |
+| Saved PowerPoint corrections | 18 package-verified, 9 independently confirmed in the rendered slides |
+| Unexpected changes outside the verified edit plan | 0 package parts and 0 unchanged slide renders |
+| Review or visual confirmation outstanding | 51 findings |
+
+The sample yielded 26 structured equation entries, of which 12 had verified source transcriptions. One Office equation was
+rebuilt structurally. The output deck retains its submitted structure, with 10 shapes from the engineering QA deck still
+absent. Differences in the engineering references are comparison results and can require independent review against the PDF.
+
+Two additional controlled fixtures seeded five errors across visible text, an omitted bullet, native OMML, and a formula
+picture. All five were detected and corrected in the saved files. All three expected equation structures and all 24 checked
+symbol and structural tokens matched. A live GLM-OCR run corrected the formula picture, saved an editable Office alternative,
+and verified its image fallback through LibreOffice. These measurements describe the labeled fixtures. Broader error recall,
+native Office visual fidelity, and independently labeled general-purpose formula accuracy remain to be measured.
+
+## Historical Linux baseline
+
+The [implementation roadmap](../../docs/IMPLEMENTATION_ROADMAP.md)
 records the Windows synthetic run and browser verification separately. Windows process memory is now sampled
 with psutil, so those memory figures use a different method.
 

@@ -84,6 +84,9 @@ class Settings:
     amend_reorder: bool = False           # retained for existing settings files
     amend_nonlatin_auto: bool = False      # auto-apply non-number corrections in Arabic/CJK/Hangul text (default: review only)
     amend_use_notes: bool = True          # use source page notes as search hints
+    amend_render_validation: bool = True  # local LibreOffice render of the saved deck
+    amend_ai_review: bool = False        # opt-in local advisory review of unresolved source matches
+    amend_embedding_model: str = ""     # optional installed Ollama embedding model
     # --- optional version comparison assistance ---------------------------------
     ollama_enabled: bool = True
     ollama_url: str = "http://localhost:11434"

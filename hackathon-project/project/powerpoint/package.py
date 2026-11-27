@@ -12,7 +12,6 @@ from zipfile import ZipFile
 from lxml import etree
 from pptx import Presentation
 from pptx.oxml.ns import qn
-from powerpoint.language import shape_paragraph
 
 REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 TYPES = "http://schemas.openxmlformats.org/package/2006/content-types"
@@ -25,6 +24,8 @@ class RunEdit:
     path: str
     old: str
     new: str
+    tag: str = qn("a:t")
+    attribute: str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,26 @@ def serialize(element):
     return etree.tostring(element, encoding="UTF-8", xml_declaration=True)
 
 
+def patch_value(node, edit):
+    if edit.attribute:
+        return node.get(edit.attribute, "")
+    if edit.tag == qn("m:oMath"):
+        return etree.tostring(node, method="c14n", exclusive=True).decode("utf-8")
+    return node.text or ""
+
+
+def set_patch_value(node, edit, value):
+    if edit.attribute:
+        node.set(edit.attribute, value)
+    elif edit.tag == qn("m:oMath"):
+        replacement = parse(value.encode("utf-8"))
+        if replacement.tag != edit.tag:
+            raise ValueError("The replacement is not an editable Office equation.")
+        node.getparent().replace(node, replacement)
+    else:
+        node.text = value or None
+
+
 def write_deck(source: Path, target: Path, edits: dict[str, list[RunEdit]], slide_count: int,
                pictures: dict[str, list[PictureEdit]] | None = None) -> None:
     if source.resolve() == target.resolve() or (target.exists() and target.samefile(source)):
@@ -155,21 +176,30 @@ def write_deck(source: Path, target: Path, edits: dict[str, list[RunEdit]], slid
                     data = original.read(entry)
                 if entry.filename in edits:
                     slide = parse(data)
-                    paragraphs = set()
                     for edit in edits[entry.filename]:
                         node = slide.find(edit.path)
-                        if node is None or node.tag != "{http://schemas.openxmlformats.org/drawingml/2006/main}t":
+                        allowed = (edit.attribute is None and edit.tag in {qn("a:t"), qn("m:t"), qn("m:oMath")}) or (
+                            edit.tag == f"{{{REL}}}Relationship" and edit.attribute == "Target")
+                        if not allowed or node is None or node.tag != edit.tag:
                             raise ValueError(f"The slide run is missing in {entry.filename}.")
-                        if (node.text or "") != edit.old:
+                        old = patch_value(node, edit)
+                        if old != edit.old:
                             raise ValueError(f"The slide run has unexpected text in {entry.filename}.")
-                        node.text = edit.new
-                        if node.getparent().tag == qn("a:r"):
-                            paragraphs.add(node.getparent().getparent())
-                    for paragraph in paragraphs:
-                        shape_paragraph(paragraph)
+                        if edit.attribute:
+                            if node.get("TargetMode") != "External" or not node.get("Type", "").endswith("/hyperlink"):
+                                raise ValueError("The edited relationship is not an external hyperlink.")
+                        set_patch_value(node, edit, edit.new)
                     data = serialize(slide)
                 output.writestr(entry, data)
             for name, data in patches.items():
                 output.writestr(name, data)
         validate_deck(staged, slide_count)
+        with ZipFile(staged) as saved:
+            for part, changes in edits.items():
+                tree = parse(saved.read(part))
+                for edit in changes:
+                    node = tree.find(edit.path)
+                    value = None if node is None else patch_value(node, edit)
+                    if value != edit.new:
+                        raise ValueError(f"Saved PowerPoint write-back verification failed in {part}.")
         staged.replace(target)

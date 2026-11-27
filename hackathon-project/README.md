@@ -42,6 +42,23 @@ See [local sample verification](docs/LOCAL_SAMPLE_VERIFICATION.md) for measured 
 
 ## Local review workspace
 
+### Correct one presentation from its source PDF
+
+From the `hackathon-project` directory, run the explicit pair command:
+
+```powershell
+.\.venv\Scripts\python.exe -B project\repair_pptx.py --pdf "path\source.pdf" --pptx "path\original.pptx" --out "path\corrected.pptx"
+```
+
+The command uses the PDF's extracted structure and local OCR evidence. It changes only source-supported
+PowerPoint objects and keeps the original package parts. The output has a nearby `_reports` folder with the
+source IR, detected and applied edits, unresolved items, PDF crops, and an HTML quality report. LibreOffice,
+when available, renders the saved slides for an additional visibility check. Native equations in compatibility
+markup can require a visual check in PowerPoint. Chart workbook edits, figure replacement, new slide objects,
+and unsupported equation structures require manual review. `--ai-review` adds advisory classifications to
+selected unresolved items using local Ollama. Set `amend_embedding_model` in the project configuration to
+an installed local embedding model to supplement keyword and fuzzy retrieval.
+
 On Windows, double-click **[Start_DocuSync_AI.bat](Start_DocuSync_AI.bat)**. The launcher finds or starts Ollama,
 warms each configured model in turn, and verifies which models Ollama keeps loaded. It then starts the existing
 workspace, checks the backend and frontend, and opens [DocuSync AI](http://127.0.0.1:8765/) in the default browser.

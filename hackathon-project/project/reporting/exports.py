@@ -51,7 +51,7 @@ def file_info(path: Path) -> dict:
 
 def correction_record(document_id: str, item: dict) -> dict:
     source = item.get("source") or {}
-    review = item.get("action") == "review" or (
+    review = item.get("action") == "review" or item.get("validation_status") == "visible_write_back_failure" or (
         item.get("action") is None and not item.get("new") and "change_type" in item)
     return {"document_id": document_id, "page": source.get("page"), "slide": item.get("slide"),
             "shape_id": item.get("shape_id"), "paragraph": item.get("paragraph"),
@@ -59,7 +59,8 @@ def correction_record(document_id: str, item: dict) -> dict:
             "updated_content": item.get("new", "" if review else item.get("new_content", "")),
             "source_pdf_reference": source or None, "reason": item.get("reason"),
             "confidence": item.get("confidence"), "status": "MANUAL_REVIEW_REQUIRED" if review else "CORRECT",
-            "manual_review_required": review, "change_type": item.get("change_type")}
+            "manual_review_required": review, "change_type": item.get("change_type"),
+            "validation_status": item.get("validation_status"), "error_id": item.get("error_id")}
 
 
 def materialize_assets(data: bytes, assets: dict, pdf_path: str, folder: Path, *, deduplicate: bool = True) -> bytes:
@@ -273,7 +274,9 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
         archive = folder / f"{stem}.zip"
         temp_zip = archive.with_suffix(".tmp")
         deck_name = deck_path.name if complete else None
-        files = [xml_path.name, *([deck_name] if deck_name else []), *result["xml_assets"], *originals]
+        qa_files = [name for name in result.get("qa_artifacts", []) if relative_path(name)
+                    and (folder / name).resolve().is_relative_to(folder.resolve()) and (folder / name).is_file()]
+        files = [xml_path.name, *([deck_name] if deck_name else []), *result["xml_assets"], *originals, *qa_files]
         try:
             write_zip(temp_zip, folder, files)
             validation["zip"] = validate_archive(temp_zip, xml_path.name, deck_name)

@@ -230,8 +230,8 @@ def requested_ocr(engine, language):
 
     if engine is not None and engine not in ENGINE_MODES:
         raise ValueError("Choose a supported OCR engine or Automatic.")
-    if language is not None and (not isinstance(language, str) or language not in {"", *LANGUAGES}):
-        raise ValueError("Choose a supported PaddleOCR language.")
+    if language is not None and (not isinstance(language, str) or language not in {"", "auto", "ar-en", *LANGUAGES}):
+        raise ValueError("Choose a supported document language.")
     return engine, language
 
 

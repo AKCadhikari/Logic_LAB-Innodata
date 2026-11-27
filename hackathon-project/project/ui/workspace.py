@@ -424,7 +424,7 @@ class Workspace:
                 config = json.loads(state.pop("settings"))
                 state["ocr_selection"] = {key: config.get(key) for key in (
                     "ocr_backend", "ocr_automatic_primary", "ocr_automatic_secondary", "ocr_automatic_tertiary",
-                    "glm_ocr_model", "paddle_vl_model", "paddle_ocr_lang", "paddle_ocr_unknown_lang")}
+                    "glm_ocr_model", "paddle_vl_model", "ocr_language", "paddle_ocr_lang", "paddle_ocr_unknown_lang")}
                 if stage_data:
                     state["processing"] = json.loads(stage_data)
                     if state["status"] == "failed":
@@ -467,8 +467,15 @@ class Workspace:
 
     def _create_job(self, db: sqlite3.Connection, document_id: str, engine: str | None = None,
                     language: str | None = None, *, status: str = "queued") -> int | None:
+        document_language = language if language in {"auto", "en", "ar", "ar-en"} else None
+        if document_language in {"ar", "ar-en"}:
+            engine = "automatic"
+        paddle_language = self.settings.paddle_ocr_lang
+        if language is not None and language != "auto":
+            paddle_language = "" if document_language else language
         settings = replace(self.settings, ocr_backend=engine or self.settings.ocr_backend,
-                           paddle_ocr_lang=language if language is not None else self.settings.paddle_ocr_lang)
+                           ocr_language=document_language or self.settings.ocr_language,
+                           paddle_ocr_lang=paddle_language)
         cursor = db.execute("""
             INSERT INTO jobs(document_id, status, created, settings)
             SELECT ?, ?, ?, ? WHERE NOT EXISTS(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import multiprocessing
 import os
 import sys
@@ -17,8 +18,9 @@ from utils.textutil import is_rtl
 from utils import execution_audit as audit
 
 LATIN = {"en", "fr", "de", "nl", "it", "cs", "sk"}
+ARABIC_RECOGNIZER = "arabic_PP-OCRv5_mobile_rec"
 RECOGNIZERS = {"ja": "PP-OCRv5_mobile_rec", "zh": "PP-OCRv5_mobile_rec",
-               "ko": "korean_PP-OCRv5_mobile_rec", "ar": "arabic_PP-OCRv3_mobile_rec"}
+               "ko": "korean_PP-OCRv5_mobile_rec", "ar": ARABIC_RECOGNIZER}
 LANGUAGES = LATIN | RECOGNIZERS.keys()
 
 
@@ -70,10 +72,13 @@ def worker(connection, detector: Path, recogniser: Path) -> None:
         import cv2
         from paddleocr import PaddleOCR
 
+        detection_options = ({"text_det_limit_side_len": 1280, "text_det_limit_type": "max"}
+                             if recogniser.name == ARABIC_RECOGNIZER else {})
         ocr = PaddleOCR(device="cpu", use_doc_orientation_classify=False, use_doc_unwarping=False,
                         use_textline_orientation=False, enable_mkldnn=False, cpu_threads=2,
                         text_detection_model_name=detector.name, text_detection_model_dir=str(detector),
-                        text_recognition_model_name=recogniser.name, text_recognition_model_dir=str(recogniser))
+                        text_recognition_model_name=recogniser.name, text_recognition_model_dir=str(recogniser),
+                        **detection_options)
         connection.send({"ready": True})
         while (image := connection.recv()) is not None:
             result = next(iter(ocr.predict(cv2.cvtColor(image, cv2.COLOR_GRAY2BGR))), {})
@@ -127,7 +132,13 @@ class PaddleOCR:
                 child.close()
             self.weights = weights
             self._receive(deadline)
-        effective_dpi = min(dpi, max(1, int(1800 * 72 / max(page.rect.width, page.rect.height))))
+        arabic_model = status["model"] == ARABIC_RECOGNIZER
+        if arabic_model:
+            # Keep detail in the line crops while bounding the full-page raster.
+            max_dpi = int(72 * math.sqrt(24_000_000 / page.rect.get_area()))
+        else:
+            max_dpi = int(1800 * 72 / max(page.rect.width, page.rect.height))
+        effective_dpi = min(dpi, max(1, max_dpi))
         image = render_gray(page, effective_dpi)
         number = page.number + 1
         with audit.execution("page_ocr", "paddleocr", status["model"], page=number, language=language,
@@ -159,6 +170,8 @@ class PaddleOCR:
                 except psutil.Error:
                     pass
             result = parse(number, payload["output"], effective_dpi, status["model"])
+            if arabic_model and page.rotation:
+                result.raw["coordinate_space"] = "rendered-page-points"
             if event:
                 result.execution_ids.append(event["execution_id"])
         return result

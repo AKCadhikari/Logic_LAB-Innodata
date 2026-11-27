@@ -35,6 +35,7 @@ def build_parser():
     ap.add_argument("--no-ocr", action="store_true", help="disable OCR fallback (diagnostics only)")
     ap.add_argument("--ocr-backend", choices=["automatic", "glm-ocr", "paddleocr-vl", "paddleocr", "tesseract"],
                     help="select the OCR pipeline")
+    ap.add_argument("--ocr-language", choices=["auto", "en", "ar", "ar-en"], help="document OCR language")
     ap.add_argument("--skip-pptx", action="store_true", help="only generate XML")
     ap.add_argument("--time-budget", type=int, default=None, help="seconds before the run switches to fast mode")
     return ap
@@ -76,7 +77,8 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     settings = Settings.load(args.config, default_schema_profile="sample", workers=args.workers,
                              schema_profile=args.profile, time_budget_s=args.time_budget,
-                             ocr_enabled=False if args.no_ocr else None, ocr_backend=args.ocr_backend)
+                             ocr_enabled=False if args.no_ocr else None, ocr_backend=args.ocr_backend,
+                             ocr_language=args.ocr_language)
     phase_dir = HERE.parent / f"phase-{args.phase}"
     inp = Path(args.input or phase_dir / "input").resolve()
     out = Path(args.output or phase_dir / "output").resolve()

@@ -15,6 +15,7 @@ class Settings:
     # --- diagnostics / OCR -----------------------------------------------------
     ocr_enabled: bool = True
     ocr_backend: str = "automatic"         # automatic | glm-ocr | paddleocr-vl | paddleocr | tesseract
+    ocr_language: str = ""                 # document OCR preference: auto, en, ar, or ar-en
     ocr_automatic_primary: str = "glm-ocr"
     ocr_automatic_secondary: str = "paddleocr-vl"
     ocr_automatic_tertiary: str = "paddleocr"  # empty disables the third attempt
@@ -46,6 +47,7 @@ class Settings:
     ocr_min_paddle_confidence: float = 0.45
     ocr_min_fallback_similarity: float = 0.80
     ocr_dpi: int = 200                     # render DPI for OCR (CPU friendly)
+    ocr_arabic_dpi: int = 300
     ocr_dpi_fast: int = 150                # used once the time budget is under pressure
     ocr_psm: int = 3
     compare_suspicious: bool = True        # OCR suspicious pages and pick the more reliable text

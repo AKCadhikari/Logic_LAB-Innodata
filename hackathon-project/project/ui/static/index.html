@@ -48,6 +48,8 @@
     <div class="settings-grid">
      <label for="phase-select">Submission phase</label>
      <select id="phase-select"><option value="1">Phase 1</option><option value="2">Phase 2</option></select>
+     <label for="home-ocr-language">Document language</label>
+     <select id="home-ocr-language"><option value="auto">Auto Detect</option><option value="en">English</option><option value="ar">Arabic</option><option value="ar-en">Mixed Arabic and English</option></select>
      <label for="home-ocr-engine">OCR engine</label>
      <select id="home-ocr-engine"><option value="glm-ocr">GLM-OCR (default)</option><option value="paddleocr">PaddleOCR</option></select>
     </div>
@@ -55,7 +57,7 @@
    <progress id="home-pdf-progress" class="upload-progress" aria-label="PDF processing progress" hidden></progress>
    <p id="home-pdf-status" class="upload-status" role="status" aria-live="polite"></p>
    <details class="advanced-details"><summary>Advanced details</summary>
-    <p>DocLayout-YOLO detects page structure. OCR reads the text inside those regions.</p>
+    <p>DocLayout-YOLO detects page structure. OCR reads the page text.</p>
     <p id="pdf-advanced-status" role="status">Checking model status...</p>
    </details>
   </article>
@@ -143,12 +145,12 @@
    </optgroup>
   </select>
   <label class="ocr-remember"><input id="ocr-remember" type="checkbox" checked> Remember engine</label>
-  <div id="ocr-paddle-row">
-   <label for="ocr-language">PaddleOCR language</label>
-   <select id="ocr-language"><option value="">Detect / configured default</option></select>
+  <div>
+   <label for="ocr-language">Document language</label>
+   <select id="ocr-language"><option value="auto">Auto Detect</option><option value="en">English</option><option value="ar">Arabic</option><option value="ar-en">Mixed Arabic and English</option></select>
   </div>
   <small id="ocr-choice-status" aria-live="polite"></small>
-  <small>DocLayout-YOLO identifies document structures. GLM-OCR and PaddleOCR recognize the text inside those structures.</small>
+  <small>DocLayout-YOLO identifies page structures for reading order and review.</small>
  </div>
  <label for="docsel">Current document</label>
  <select id="docsel" aria-label="Document" disabled><option>No documents yet</option></select>

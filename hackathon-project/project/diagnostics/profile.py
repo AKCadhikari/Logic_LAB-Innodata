@@ -37,6 +37,8 @@ def decorate_document(ir) -> dict:
     document_types = Counter()
     for page in ir.pages:
         hint = page.diag.get("native_language", {}).get("language", "und")
+        if hint in {"und", "mul"} and page.source == "ocr":
+            hint = page.diag.get("ocr_language_hint", "und")
         page.language = language_profile("\n".join(map(language_text, page.blocks)), hint)
         languages = set()
         reading_order = 0
@@ -53,6 +55,11 @@ def decorate_document(ir) -> dict:
             if not sample.strip():
                 base, direction = direction_of(block_text(block))
                 block.language.update(base_direction=base, direction=direction)
+            if (block.tag == "table" and block.source == "native" and block.cells
+                    and (page.language["base_direction"] == "rtl" or block.language["script"] == "arab")):
+                first_row_right = min(block.cells, key=lambda cell: (cell.row, -cell.col))
+                if direction_of(first_row_right.text)[0] == "rtl":
+                    block.language["base_direction"] = "rtl"
             block.lang = block.language["language"]
             if block.lang != "und" and block.language["confidence"] >= 0.55:
                 languages.add(block.lang)

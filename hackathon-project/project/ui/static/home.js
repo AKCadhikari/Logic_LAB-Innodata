@@ -203,6 +203,7 @@ async function uploadPair() {
         form.append("upload_key", homeState.uploadKey);
         form.append("phase", home$("#phase-select").value);
         form.append("ocr_engine", home$("#home-ocr-engine").value);
+        form.append("ocr_language", home$("#home-ocr-language").value);
         // Establish the browser ownership cookie before a retriable submission.
         await workspaceFetch("/api/documents");
         const job = await uploadWithProgress("/api/paired-jobs", form, (loaded, total) => {
@@ -225,6 +226,11 @@ async function uploadPair() {
 }
 
 home$("#retry-pair").onclick = uploadPair;
+home$("#home-ocr-language").onchange = event => {
+    const arabic = ["ar", "ar-en"].includes(event.target.value);
+    home$("#home-ocr-engine").disabled = arabic;
+    home$("#home-ocr-engine").title = arabic ? "Arabic processing selects an engine based on the PDF text layer." : "";
+};
 home$("#switch-pdf").onclick = () => window.showAppScreen("review");
 home$("#switch-pptx").onclick = () => {
     homeState.activePptx = null;

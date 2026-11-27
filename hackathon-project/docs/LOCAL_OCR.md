@@ -9,6 +9,14 @@ this is `ara.traineddata`. The layout pipeline orders right-to-left columns from
 in the IR and draft XML for review. The selected mode, each executed model, and the accepted output
 are recorded separately.
 
+Under **Processing settings**, **Arabic** tries local Arabic PP-OCRv5 first on scans and uses
+Tesseract's Arabic pack for verified recovery from missing Unicode mappings. **Mixed Arabic and English**
+tries the Arabic and English Tesseract packs first on ambiguous scans, with Arabic PP-OCRv5 available
+as a fallback. Advanced Details identifies the
+engine, model, and effective render resolution. The CLI accepts `--ocr-language ar` and
+`--ocr-language ar-en`. Healthy native pages are extracted directly, and the explicit English
+selection uses the existing engine order.
+
 ## Windows setup
 
 Run these commands from `hackathon-project` with Python 3.11 and Ollama installed. Open the Ollama
@@ -47,7 +55,7 @@ on Windows. Stop the app before installing Python packages that replace OpenCV.
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r project\requirements-ocr.txt
 $paddleRoot = Resolve-Path .venv
-foreach ($model in 'PP-OCRv5_mobile_det', 'latin_PP-OCRv5_mobile_rec') {
+foreach ($model in 'PP-OCRv5_mobile_det', 'latin_PP-OCRv5_mobile_rec', 'arabic_PP-OCRv5_mobile_rec') {
     $modelDir = Join-Path $paddleRoot "ocr-models\$model"
     New-Item -ItemType Directory -Force $modelDir | Out-Null
     foreach ($file in 'inference.yml', 'inference.json', 'inference.pdiparams') {
@@ -58,7 +66,7 @@ foreach ($model in 'PP-OCRv5_mobile_det', 'latin_PP-OCRv5_mobile_rec') {
 .\.venv\Scripts\python.exe -c "import paddle; print(paddle.__version__)"
 ```
 
-These weights provide the default Latin recognizer. For other scripts, provision the compatible detector
+These weights provide the default Latin and Arabic recognizers. For other scripts, provision the compatible detector
 and recognizer and set `DOCUSYNC_PADDLE_DET_MODEL_DIR` and `DOCUSYNC_PADDLE_REC_MODEL_DIR`.
 `DOCUSYNC_PADDLE_OCR_LANG` can override the PDF language hint. The fallback records recognition scores
 and polygon bounds mapped to PDF points. [PaddleOCR models](https://www.paddleocr.ai/main/en/version3.x/module_usage/text_recognition.html)

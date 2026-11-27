@@ -1,7 +1,7 @@
 """Layout reconstruction: lines (+tables/figures) -> ordered semantic blocks.  Deterministic, no model required."""
 from __future__ import annotations
 import math, re, statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from layout.model import Line, Block, PageIR, Span, Cell
 from layout.kinds import ABSTRACT, CLASSIFICATION, KEYW, metadata_kind
 from utils.textutil import norm_cmp, norm_ws, is_rtl, xml_safe
@@ -159,6 +159,55 @@ def _merge_same_row(lines: list[Line]) -> list[Line]:
                 continue
         out.append(ln)
     return out
+
+
+def join_arabic_fragments(lines: list[Line], regions=()) -> list[Line]:
+    """Join adjacent RTL detections while keeping each recognizer string in logical order."""
+    from layout.region_association import match
+
+    source_order = {id(line): index for index, line in enumerate(lines)}
+    groups = []
+    for line in sorted(lines, key=lambda item: -item.bbox[2]):
+        region = None
+        if regions:
+            region = match(line.bbox, regions, "table") or match(line.bbox, regions)
+        x0, y0, x1, y1 = line.bbox
+        height = y1 - y0
+        candidates = []
+        if line.rtl and height > 0:
+            for index, (group, owner) in enumerate(groups):
+                previous = group[-1]
+                a, b, c, d = previous.bbox
+                other_height = d - b
+                gap = a - x1
+                overlap = min(y1, d) - max(y0, b)
+                if (previous.rtl and previous.writing_mode == line.writing_mode == "horizontal"
+                        and (owner is None or region is None or owner == region)
+                        and all(item is None or item["class_name"] != "table" for item in (owner, region))
+                        and min(height, other_height) >= .65 * max(height, other_height)
+                        and overlap >= .8 * min(height, other_height)
+                        and -.35 * min(x1 - x0, c - a) <= gap <= .5 * min(height, other_height)):
+                    candidates.append((abs(gap), index))
+        if candidates:
+            index = min(candidates)[1]
+            members, owner = groups[index]
+            members.append(line)
+            groups[index] = (members, owner or region)
+        else:
+            groups.append(([line], region))
+
+    output = []
+    for group, _ in sorted(groups, key=lambda item: min(source_order[id(line)] for line in item[0])):
+        if len(group) == 1:
+            output.append(group[0])
+            continue
+        boxes = [line.bbox for line in group]
+        text = " ".join(line.text.strip() for line in group)
+        output.append(replace(group[0], text=text, original_text=text,
+                              bbox=(min(box[0] for box in boxes), min(box[1] for box in boxes),
+                                    max(box[2] for box in boxes), max(box[3] for box in boxes)),
+                              conf=min(line.conf for line in group)))
+    return output
 
 
 def _is_marker(text: str):

@@ -7,6 +7,8 @@ const statusText = message => $("#runchip").textContent = message;
 const engineName = engine => ({"glm-ocr": "GLM-OCR", "paddleocr-vl": "PaddleOCR-VL (Ollama)",
     paddleocr: "PaddleOCR", tesseract: "Tesseract"}[engine] || "");
 const ocrModeName = mode => engineName(mode) || (mode === "automatic" ? "Automatic" : "");
+const ocrLanguageName = language => ({auto: "Auto Detect", en: "English", ar: "Arabic",
+    "ar-en": "Mixed Arabic and English", und: "No language hint"}[language] || language || "");
 const ocrJobOptions = () => ({ocr_engine: $("#retry-engine")?.value || $("#ocr-engine").value,
     ocr_language: $("#ocr-language").value});
 let ocrHealth;
@@ -50,16 +52,24 @@ $("#layout-check").onclick = () => loadLayoutHealth(true);
 
 function showOcrChoice() {
     const mode = $("#ocr-engine").value, models = ocrHealth?.engines;
-    $("#ocr-paddle-row").hidden = mode !== "automatic" && mode !== "paddleocr";
+    const language = $("#ocr-language").value;
+    const arabic = ["ar", "ar-en"].includes(language);
+    $("#ocr-engine").disabled = arabic;
     const description = mode === "automatic" ? "Primary " + ocrModeName(ocrHealth?.automatic_primary || "glm-ocr") :
         (models?.[mode]?.model || ocrModeName(mode));
     const job = S.data?.jobs?.[0], attempt = job?.processing;
     const activeOcr = job?.status === "running" && ["ocr", "ocr_attempt"].includes(attempt?.stage) && attempt.engine;
-    if (activeOcr && (mode === "automatic" || mode === attempt.engine)) {
+    if (activeOcr && (arabic || mode === "automatic" || mode === attempt.engine)) {
         const state = attempt.stage === "ocr" ? "Checking / loading" : attempt.status === "requesting" ? "Processing" :
             ({loading: "Loading", unavailable: "Unavailable", timeout: "Timed out", rejected: "Error", failed: "Error", accepted: "Recognized"}
                 [attempt.status] || attempt.status);
-        $("#ocr-choice-status").textContent = engineName(attempt.engine) + " · " + state;
+        $("#ocr-choice-status").textContent = [engineName(attempt.engine), attempt.model, state].filter(Boolean).join(" · ");
+        return;
+    }
+    if (arabic) {
+        $("#ocr-choice-status").textContent = language === "ar-en" ?
+            "Arabic and English language packs with PaddleOCR Arabic fallback." :
+            "PaddleOCR Arabic for scans. Arabic text recovery for broken PDF text layers.";
         return;
     }
     if (mode === "automatic" && models) {
@@ -89,10 +99,15 @@ async function loadOcrSettings() {
                 (model?.status === "unavailable" ?
                 " · Unavailable" : "");
         }
-        const language = $("#ocr-language"), current = language.value;
         const labels = new Intl.DisplayNames(["en"], {type: "language"});
-        language.replaceChildren(new Option("Detect / configured default", ""));
-        for (const code of data.engines.paddleocr.languages) language.add(new Option(labels.of(code), code));
+        const language = $("#ocr-language"), current = language.value;
+        language.querySelector("optgroup")?.remove();
+        const other = document.createElement("optgroup");
+        other.label = "Other PaddleOCR languages";
+        for (const code of data.engines.paddleocr.languages) {
+            if (!["ar", "en"].includes(code)) other.append(new Option(labels.of(code), code));
+        }
+        if (other.children.length) language.append(other);
         if ([...language.options].some(option => option.value === current)) language.value = current;
         showOcrChoice();
         const statuses = {unavailable: "Unavailable", available_unverified: "Available · inference unverified",
@@ -172,6 +187,7 @@ $("#ocr-engine").onchange = () => {
         })).catch(showError);
     }
 };
+$("#ocr-language").onchange = showOcrChoice;
 const processingStatus = step => {
     if (!step) return "";
     if (step.stage === "diagnostics") return "Inspecting PDF pages";
@@ -360,12 +376,17 @@ async function selectWorkspace(id, reset = true) {
     const source = W.source?.id === id ? W.source : {id, ...await workspaceFetch(
         "/api/documents/" + encodeURIComponent(id) + "/source-info").catch(error => ({error: error.message}))};
     if (W.batch || W.selection !== selection) return;
+    const job = data.jobs[0];
+    if (S.id !== id || S.data?.jobs?.[0]?.id !== job.id) {
+        const control = $("#ocr-language");
+        const preferred = job.ocr_selection?.ocr_language || job.ocr_selection?.paddle_ocr_lang || "auto";
+        control.value = [...control.options].some(option => option.value === preferred) ? preferred : "auto";
+    }
     W.source = source;
     S.id = id;
     S.data = data;
     window.updatePairedWorkspace?.(data);
     $("#docsel").value = id;
-    const job = data.jobs[0];
     const listed = W.documents.find(document => document.id === id);
     if (listed) listed.status = job.status;
     const active = job.status === "queued" || job.status === "running";
@@ -722,10 +743,15 @@ function pageDiagnostics(page) {
     const selected = page.source === "ocr" ? engineName(page.ocr_engine || ocr?.engine) || "OCR" : "Native PDF";
     const attempts = (ocr?.attempts || []).map(attempt => '<div>' + esc(attempt.model || engineName(attempt.engine)) +
         ' · ' + esc(attempt.status) + ' · ' + esc(attempt.seconds) + ' s' +
+        (attempt.language_configuration === "model-default" ? ' · Model language defaults' :
+            attempt.input_language ? ' · ' + esc(ocrLanguageName(attempt.input_language)) : '') +
+        (attempt.dpi ? ' · ' + esc(attempt.dpi) + ' DPI' : '') +
         (attempt.fallback_reason ? ' · ' + esc(attempt.fallback_reason) : '') +
         (attempt.issues?.length ? ' · ' + esc(attempt.issues.join(" ")) : '') + '</div>').join("");
     return '<div class="sec">Page ' + page.n + ' diagnostics</div><div class="card">' +
         '<div>' + esc(selected) + ' · ' + confidence + '</div><div>' + esc(languageLabel(page.language)) + '</div>' +
+        (diag.ocr_language_requested ? '<div>Document language · ' + esc(ocrLanguageName(diag.ocr_language_requested)) + '</div>' : '') +
+        (ocr?.langs ? '<div>OCR language packs · ' + esc(ocr.langs) + '</div>' : '') +
         '<div>Native text: ' + esc(diag.health || "unknown") +
         (Number.isInteger(diag.native_chars) ? ' · ' + diag.native_chars + ' characters' : '') + '</div>' +
         '<div>' + (diag.ocr_required ? "OCR required" : "OCR not required") +

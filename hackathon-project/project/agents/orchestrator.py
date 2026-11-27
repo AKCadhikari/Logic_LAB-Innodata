@@ -16,6 +16,7 @@ from layout.model import PageIR, DocIR, Line, Block, Span, ir_from_dict
 from layout import native, reconstruct, kinds, figures, ocr_geometry, equations, pseudocode, doclayout, region_association, running
 from layout.docling_adapter import DoclingLayout
 from ocr import engine as ocr
+from ocr.paddle import ARABIC_RECOGNIZER
 from ocr.router import OCRRouter
 from ocr.recognition import ENGINE_MODES
 from quality.qa import page_confidence, doc_quality
@@ -144,6 +145,9 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
     counts["required"] = sum(bool(d.get("ocr_required")) for d in diags)
     usable = " ".join(doc[i].get_text()[:3000] for i in range(n) if diags[i]["health"] in ("healthy", "suspicious"))[:24000]
     lang = detect_lang(usable)
+    arabic_document = ((metadata_language == "ar" or any(d.get("lang_hint") == "ar" for d in diags))
+                       and not any(d.get("scripts", {}).get("latin", 0) > d.get("scripts", {}).get("arab", 0)
+                                   for d in diags))
     audit.event("analysis", "doc_language", doc=doc_id, lang=lang, healthy_pages=sum(d["health"] == "healthy" for d in diags),
                 decisions={k: sum(d["decision"] == k for d in diags) for k in ("native", "compare", "ocr")})
     stage("diagnostics", state="failed" if any(d["health"] == "error" for d in diags) else "completed")
@@ -154,6 +158,17 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
     for i in range(n):
         d = diags[i]; tp = time.time()
         page_language = d.get("lang_hint", "und")
+        if settings.ocr_language == "ar-en":
+            native_language = d.get("native_language", {})
+            latin_only = (native_language.get("script") == "latin" and native_language.get("confidence", 0) >= .6
+                          and not d.get("scripts", {}).get("arab"))
+            page_language = "en" if latin_only else "ar"
+        elif settings.ocr_language in {"ar", "en"}:
+            page_language = settings.ocr_language
+        elif page_language == "und" and arabic_document:
+            page_language = "ar"
+        d["ocr_language_requested"] = settings.ocr_language or "auto"
+        d["ocr_language_hint"] = page_language
         fast = bool(deadline and time.time() > deadline)
         dpi = settings.ocr_dpi_fast if fast else settings.ocr_dpi
         rec = {"n": i + 1, "w": d["width"], "h": d["height"], "lines": [], "tables": [], "figs": [],
@@ -171,8 +186,10 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             if recovery:
                 rec["lines"], d["ocr"] = recovery
                 rec["source"] = "ocr"
+                if page_language == "ar" and numeric_values(page.get_text()) != numeric_values(_text_of(rec["lines"])):
+                    d["reasons"].append("OCR and embedded PDF text disagree on numeric values. Verify them against the source image.")
+                    d["ocr"]["requires_review"] = True
                 rec["figs"] = native.extract_figures(page, settings, [])
-                counts["tesseract"] = counts.get("tesseract", 0) + 1
                 audit.event("ocr", "selection", doc=doc_id, page=i + 1, **d["ocr"])
             elif decision != "native" and settings.ocr_enabled and settings.ocr_backend in ENGINE_MODES:
                 model_names = {"glm-ocr": settings.glm_ocr_model, "paddleocr-vl": settings.paddle_vl_model}
@@ -208,11 +225,33 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                     if similarity < settings.native_vs_ocr_min_similarity * 100:
                         d["reasons"].append("The OCR result could not corroborate the sparse native text.")
                         info["requires_review"] = True
+                if result and page_language == "ar":
+                    recognized = result.text()
+                    if d.get("native_chars") and numeric_values(page.get_text()) != numeric_values(recognized):
+                        d["reasons"].append("OCR and embedded PDF text disagree on numeric values. Verify them against the source image.")
+                        info["requires_review"] = True
+                    if d.get("scripts", {}).get("latin", 0) >= 8 and not result.language.get("scripts", {}).get("latin"):
+                        d["reasons"].append("OCR did not retain Latin text present in the embedded layer.")
+                        info["requires_review"] = True
+                    if (result.language.get("direction") == "mixed"
+                            and recognized.count("(") != recognized.count(")")):
+                        d["reasons"].append("Mixed-direction OCR contains unmatched parentheses. Verify punctuation against the source.")
+                        info["requires_review"] = True
                 if info.get("review_reason"):
                     d["reasons"].append(info["review_reason"])
                 audit.event("ocr", "selection", doc=doc_id, page=i + 1, **info)
                 if result:
                     rec["lines"], rec["blocks"], rec["source"] = result.lines, result.blocks or None, "ocr"
+                    if result.engine == "paddleocr" and result.model == ARABIC_RECOGNIZER:
+                        low_confidence = sum(line.conf < 65 for line in result.lines)
+                        if low_confidence:
+                            d["reasons"].append(f"{low_confidence} Arabic OCR regions have low recognition confidence.")
+                            info.update(requires_review=True, low_confidence_regions=low_confidence)
+                        regions = layout_pages[i]["detections"]
+                        if result.raw.get("coordinate_space") == "rendered-page-points":
+                            info["display_coordinates"] = True
+                            regions = [{**region, "bbox": region["display_bbox"]} for region in regions]
+                        rec["lines"] = reconstruct.join_arabic_fragments(rec["lines"], regions)
                     if d["health"] != "absent":
                         rec["figs"] = native.extract_figures(page, settings, [])
                         if rec["lines"] and not d["rotation"]:
@@ -283,7 +322,8 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
         raw.append(rec)
         d["selected_ocr_engine"] = settings.ocr_backend
         ocr_info = d.get("ocr", {})
-        for engine, key in (("glm-ocr", "glm_ocr"), ("paddleocr", "paddle_ocr"), ("paddleocr-vl", "paddle_vl")):
+        for engine, key in (("glm-ocr", "glm_ocr"), ("paddleocr", "paddle_ocr"), ("paddleocr-vl", "paddle_vl"),
+                            ("tesseract", "tesseract")):
             if ocr_info.get("engine") == engine and ocr_info.get("status") == "accepted":
                 counts[key] = counts.get(key, 0) + 1
         counts["failed"] += bool(d.get("ocr_required") and
@@ -304,7 +344,8 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
     stage("ocr", state="failed" if counts["failed"] else "completed")
     stage("association", state="running")
     for record, detection in zip(raw, layout_pages):
-        if not record["diag"].get("rotation") and not any(record["diag"].get("ocr", {}).get(k) for k in ("rotate", "skew")):
+        info = record["diag"].get("ocr", {})
+        if not record["diag"].get("rotation") and not any(info.get(k) for k in ("rotate", "skew")):
             region_association.prepare(record, detection["detections"])
     stage("association", state="completed" if settings.doclayout_enabled else "skipped")
     # ---- Layout Reconstruction agent ------------------------------------------------------------------
@@ -326,9 +367,23 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             try:
                 ls = rp["lines"]
                 flow = language_profile(_text_of(ls) + " " + " ".join(block.text for block in rp["blocks"] or []))
-                rtl = flow["script"] in {"arab", "hebrew"} or flow["base_direction"] == "rtl"
-                pg = reconstruct.build_page(rp["n"], source_width, source_height, ls, rp["tables"], rp["figs"],
+                rtl = (flow["script"] in {"arab", "hebrew"} or flow["base_direction"] == "rtl"
+                       or (rp["diag"].get("ocr_language_hint") == "ar" and flow["script"] == "und"
+                           and rp["source"] == "ocr"))
+                display_coordinates = rp["diag"].get("ocr", {}).get("display_coordinates")
+                width, height = (rp["w"], rp["h"]) if display_coordinates else (source_width, source_height)
+                pg = reconstruct.build_page(rp["n"], width, height, ls, rp["tables"],
+                                            [] if display_coordinates else rp["figs"],
                                             ctx, settings, rp["source"], doc_rtl=rtl)
+                if display_coordinates:
+                    def to_source(box):
+                        return tuple(pymupdf.Rect(box) * source_page.derotation_matrix)
+
+                    for block in execution_reports.blocks(pg.blocks):
+                        if block.bbox:
+                            block.bbox = to_source(block.bbox)
+                        block.line_boxes = [to_source(box) for box in block.line_boxes]
+                    pg.blocks.extend(rp["figs"])
                 if rp["blocks"] is not None:
                     pg.blocks = rp["blocks"] + pg.blocks
                 for b in pg.blocks:

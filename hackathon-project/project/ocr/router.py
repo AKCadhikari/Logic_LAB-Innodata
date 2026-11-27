@@ -22,6 +22,7 @@ class OCRRouter:
         self.evidence = evidence
         self.paddle = paddle.PaddleOCR(settings)
         self.model_status = {}
+        self.arabic_packs = None
         mode = settings.ocr_backend
         order = (settings.ocr_automatic_primary, settings.ocr_automatic_secondary, settings.ocr_automatic_tertiary)
         if mode not in ENGINE_MODES or (mode == "automatic" and (
@@ -30,6 +31,23 @@ class OCRRouter:
         self.engines = tuple(dict.fromkeys(filter(None, order))) if mode == "automatic" else (mode,)
         self.ollama_engines = {"glm-ocr": glm, paddle_vl.ENGINE: paddle_vl}
         self.models = {"glm-ocr": settings.glm_ocr_model, paddle_vl.ENGINE: settings.paddle_vl_model}
+
+    def recognise_arabic_tesseract(self, page, dpi, diagnostics):
+        if self.arabic_packs is None:
+            self.arabic_packs = engine.available_langs(self.settings)
+        if "ara" not in self.arabic_packs:
+            raise RecognitionError("Tesseract's Arabic language pack is unavailable.", unavailable=True)
+        packs = self.arabic_packs if self.settings.ocr_language == "ar-en" else {"ara"}
+        scan = bool(diagnostics.get("appears_scanned"))
+        try:
+            lines, evidence = engine.ocr_page(page, "ar", dpi, self.settings, packs, orient=scan, deskew=scan)
+        except TimeoutExpired as error:
+            raise RecognitionError("Tesseract Arabic OCR timed out.", status="timeout") from error
+        confidence = sum(line.conf for line in lines) / len(lines) if lines else None
+        raw = {**evidence, "model": evidence.get("langs", "ara"),
+               "regions": [{"text": line.text, "bbox": line.bbox, "confidence": line.conf} for line in lines]}
+        return Recognition(page.number + 1, "tesseract", lines=lines, confidence=confidence, raw=raw,
+                           execution_ids=evidence.get("selected_execution_ids", []))
 
     def recover_unmapped_text(self, page, dpi: int, diagnostics: dict, status: Callable[[str], None]):
         """Read damaged PDF text from pixels using the installed pack for the detected language."""
@@ -63,6 +81,14 @@ class OCRRouter:
                    detected_language=profile["language"])
         if not accepted:
             return None
+        if language == "ar":
+            candidate.raw = {"model": evidence.get("langs", pack),
+                             "regions": [{"text": line.text, "bbox": line.bbox, "confidence": line.conf}
+                                         for line in lines]}
+            try:
+                self._save(candidate, 1)
+            except OSError:
+                evidence["evidence_error"] = "Could not write the raw OCR response to the run folder."
         return lines, {**evidence, "engine": "tesseract", "status": "accepted",
                        "confidence": round(confidence, 1), "requires_review": False,
                        "language": profile, "selected_engine": "automatic",
@@ -75,7 +101,12 @@ class OCRRouter:
         attempts = []
         observed = ""
         provisional = None
-        for engine_index, engine in enumerate(self.engines):
+        engines = self.engines
+        if (self.settings.ocr_backend == "automatic" and language == "ar"
+                and self.settings.ocr_language in {"ar", "ar-en"}):
+            primary = ("tesseract", "paddleocr") if self.settings.ocr_language == "ar-en" else ("paddleocr", "tesseract")
+            engines = tuple(dict.fromkeys((*primary, *engines)))
+        for engine_index, engine in enumerate(engines):
             fallback_reason = None
             if engine_index:
                 previous = attempts[-1]
@@ -110,15 +141,18 @@ class OCRRouter:
                                        "fallback_reason": fallback_reason})
                             with audit.details(model_digest=state.get("digest")):
                                 result = adapter.recognise(page, dpi, self.settings)
+                        elif engine == "tesseract":
+                            result = self.recognise_arabic_tesseract(page, dpi, diag)
                         else:
                             input_language = self.paddle_language(language, observed, diag)
+                            render_dpi = max(dpi, self.settings.ocr_arabic_dpi) if input_language == "ar" else dpi
                             if event:
                                 model = paddle.models(self.settings, input_language)[1].name
-                                result = self.paddle.recognise(page, input_language, dpi, lambda status: event(
+                                result = self.paddle.recognise(page, input_language, render_dpi, lambda status: event(
                                     {"engine": engine, "model": model, "status": status,
                                      "fallback_reason": fallback_reason}))
                             else:
-                                result = self.paddle.recognise(page, input_language, dpi)
+                                result = self.paddle.recognise(page, input_language, render_dpi)
                     issues = validate_recognition(result, page_number, diag, self.settings)
                     observed = result.text()
                     expected = diag.get("native_language", {})
@@ -127,6 +161,9 @@ class OCRRouter:
                             and expected.get("confidence", 0) >= .6
                             and expected.get("script") not in detected["scripts"]):
                         issues.append("OCR lost the script detected in the native PDF text.")
+                    if (self.settings.ocr_language == "ar" and expected.get("script") in {None, "und", "arab"}
+                            and detected["scripts"].get("latin", 0) >= 8 and "arab" not in detected["scripts"]):
+                        issues.append("OCR returned Latin text for an Arabic page. Verify the page language.")
                 except RecognitionError as error:
                     issues = [str(error)]
                     failure_status = error.status
@@ -137,6 +174,10 @@ class OCRRouter:
                 attempt = {"engine": engine, "model": model, "status": "accepted" if not issues else failure_status,
                            "issues": issues, "seconds": round(time.monotonic() - started, 2),
                            "input_language": input_language}
+                if result is not None and engine == "paddleocr":
+                    attempt["dpi"] = result.raw.get("dpi")
+                if engine in self.ollama_engines:
+                    attempt["language_configuration"] = "model-default"
                 if fallback_reason:
                     attempt["fallback_reason"] = fallback_reason
                 ids = audit.ids_since(audit_start)
@@ -153,7 +194,7 @@ class OCRRouter:
                 attempts.append(attempt)
                 if event:
                     event(attempt)
-                if result is not None and self.settings.audit_private_responses:
+                if result is not None and (self.settings.audit_private_responses or input_language == "ar"):
                     try:
                         self._save(result, len(attempts))
                     except OSError:
@@ -164,6 +205,9 @@ class OCRRouter:
                             "confidence": result.confidence, "requires_review": False,
                             "model": model, "language": profile, "selected_execution_ids": result.execution_ids,
                             "selected_engine": self.settings.ocr_backend, "fallback_reason": fallback_reason}
+                    if engine == "tesseract":
+                        info.update({key: result.raw[key] for key in ("langs", "rotate", "skew", "osd_script")
+                                     if key in result.raw})
                     moderate_language = profile["language"] != "und" and profile["confidence"] < .6
                     if engine in self.ollama_engines and (profile["direction"] in {"mixed", "rtl"} or moderate_language):
                         info.update(requires_review=True, review_reason="OCR language or direction requires independent verification.")
@@ -180,10 +224,10 @@ class OCRRouter:
                                 or re.findall(r"\d+", a) != re.findall(r"\d+", b)):
                             provisional[1].update(fallback_similarity=info["fallback_similarity"], fallback_reason=fallback_reason,
                                                   review_reason="Local recognizers disagree on text, order, or numerical values.")
-                            if engine_index < len(self.engines) - 1:
+                            if engine_index < len(engines) - 1:
                                 break
                             return provisional
-                    if info["requires_review"] and engine_index < len(self.engines) - 1:
+                    if info["requires_review"] and engine_index < len(engines) - 1:
                         provisional = provisional or (result, info)
                         break
                     return result, info

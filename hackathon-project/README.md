@@ -97,7 +97,9 @@ If you originally started the backend directly from a terminal, close it from th
 launcher. `-NoBrowser` suppresses the browser for smoke tests. Advanced commands can supply `-Port`, `-Config`,
 `-Storage` and `-Logs`. Use separate storage and logs when testing a second workspace.
 
-Select **Phase 1** or **Phase 2**, drop a PDF or choose **Browse PDF**, choose the OCR mode, then select **Process PDF**.
+Choose the phase and OCR engine in **Processing settings**, then add a PDF and a PowerPoint using the two upload boxes.
+The workspace opens when both uploads succeed. Switch between **PDF** and **PowerPoint** at the top of the workspace.
+Select **Start Processing** to extract the PDF. PowerPoint proofreading begins after upload.
 The workspace archives the source PDF in the selected `phase-N/input/` folder and stores processing attempts under
 `storage/`. After a successful run it automatically validates and publishes a versioned XML bundle under the matching
 `phase-N/output/` folder. The document details show the output location, DocLayout page status, detection count and

@@ -1,4 +1,5 @@
-const homeState = {pdf: null, pptx: null, pdfBusy: false, pptxBusy: false, activePptx: null};
+const homeState = {pdf: null, pptx: null, uploading: false, activePptx: null, pair: null,
+    uploads: {}, selecting: {pdf: 0, pptx: 0}};
 const pptxPreview = {slide: 1, total: 0};
 const home$ = selector => document.querySelector(selector);
 const homeEsc = value => String(value ?? "").replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
@@ -13,7 +14,15 @@ window.showAppScreen = function (screen) {
     home$("#history").hidden = screen !== "history";
     home$("#pptx-workspace").hidden = screen !== "pptx";
     const reviewVisible = screen === "review" || screen === "batch";
-    home$("#library").hidden = !reviewVisible;
+    home$("#library").hidden = !reviewVisible || !W.batch;
+    const pair = homeState.pair;
+    const paired = !W.batch && pair && ((screen === "review" && S.id === pair.pdf.id) ||
+        (screen === "pptx" && homeState.activePptx === pair.pptx.id));
+    home$("#document-switch").hidden = !paired;
+    app.classList.toggle("paired-workspace", Boolean(paired));
+    app.classList.toggle("batch-tools-visible", reviewVisible && W.batch);
+    setActive(home$("#switch-pdf"), screen === "review");
+    setActive(home$("#switch-pptx"), screen === "pptx");
     home$("#main").hidden = !reviewVisible;
     home$("#dash").hidden = true;
     setActive(home$("#nav-home"), screen === "home" || screen === "review" || screen === "pptx");
@@ -45,9 +54,8 @@ function syncSelection(kind) {
     home$(prefix + "-selection").hidden = !file;
     home$(prefix + "-selected-name").textContent = file?.name || "";
     home$(prefix + "-selected-size").textContent = file ? fileSize(file.size) : "";
-    home$(prefix + "-process").disabled = !file || homeState[kind + "Busy"];
-    home$(prefix + "-remove").disabled = homeState[kind + "Busy"];
-    home$(prefix + "-replace").disabled = homeState[kind + "Busy"];
+    home$(prefix + "-remove").disabled = homeState.uploading;
+    home$(prefix + "-replace").disabled = homeState.uploading;
 }
 
 async function validateSelectedFile(file, kind) {
@@ -69,22 +77,27 @@ async function validateSelectedFile(file, kind) {
 }
 
 async function selectHomeFile(kind, files) {
-    if (homeState[kind + "Busy"]) return;
+    if (homeState.uploading) return;
     const selected = Array.from(files || []);
     if (selected.length !== 1) {
         setUploadStatus(kind, "Choose one file at a time.", "error");
         return;
     }
-    setUploadStatus(kind, "Checking file...", "");
+    const selection = ++homeState.selecting[kind];
+    setUploadStatus(kind, "Checking file?");
     try {
         await validateSelectedFile(selected[0], kind);
-        if (kind === "pdf" && homeState.pdfBusy) return;
+        if (selection !== homeState.selecting[kind] || homeState.uploading) return;
         homeState[kind] = selected[0];
-        home$(kind === "pdf" ? "#pdf-result" : "#pptx-result").hidden = true;
-        setUploadStatus(kind, kind === "pdf" ? "File ready. Confirm to open the workspace." : "File ready. Confirm to open the proofreading workspace.");
+        delete homeState.uploads[kind];
+        home$("#pair-retry").hidden = true;
         syncSelection(kind);
+        const other = kind === "pdf" ? "pptx" : "pdf";
+        if (homeState[other]) await uploadPair();
+        else setUploadStatus(kind, kind === "pdf" ? "PDF selected. Add a PowerPoint to continue." :
+            "PowerPoint selected. Add a PDF to continue.");
     } catch (error) {
-        setUploadStatus(kind, error.message, "error");
+        if (selection === homeState.selecting[kind]) setUploadStatus(kind, error.message, "error");
     }
 }
 
@@ -113,9 +126,11 @@ function setupDrop(kind) {
     });
     home$("#" + prefix + "-replace").onclick = () => input.click();
     home$("#" + prefix + "-remove").onclick = () => {
-        if (homeState[kind + "Busy"]) return;
+        if (homeState.uploading) return;
+        homeState.selecting[kind]++;
         homeState[kind] = null;
-        home$(kind === "pdf" ? "#pdf-result" : "#pptx-result").hidden = true;
+        delete homeState.uploads[kind];
+        home$("#pair-retry").hidden = true;
         setUploadStatus(kind, "File removed.");
         syncSelection(kind);
     };
@@ -150,42 +165,68 @@ async function openPdfWorkspace(id) {
     window.showAppScreen("review");
 }
 
-home$("#pdf-process").onclick = async () => {
-    const file = homeState.pdf;
-    if (!file || homeState.pdfBusy) return;
-    homeState.pdfBusy = true;
-    syncSelection("pdf");
-    const progress = home$("#home-pdf-progress"), card = home$("#pdf-result");
+async function uploadSelected(kind) {
+    if (homeState.uploads[kind]) return;
+    const pdf = kind === "pdf";
+    const progress = home$("#home-" + kind + "-progress");
     progress.hidden = false;
     progress.removeAttribute("value");
-    card.hidden = true;
-    setUploadStatus("pdf", "Uploading PDF...");
+    setUploadStatus(kind, pdf ? "Uploading PDF?" : "Uploading PowerPoint?");
     const form = new FormData();
-    form.append("pdf", file);
-    form.append("phase", home$("#phase-select").value);
-    form.append("ocr_engine", home$("#home-ocr-engine").value);
-    form.append("defer", "1");
-    try {
-        const uploaded = await uploadWithProgress("/api/documents", form, (loaded, total) => {
-            progress.max = total;
-            progress.value = loaded;
-        });
-        await openPdfWorkspace(uploaded.id);
-        setUploadStatus("pdf", "PDF uploaded.", "success");
-        card.dataset.state = "success";
-        const button = Object.assign(document.createElement("button"), {
-            type: "button", className: "btn", textContent: "Open PDF workspace"
-        });
-        button.onclick = () => openPdfWorkspace(uploaded.id).catch(error => setUploadStatus("pdf", error.message, "error"));
-        card.replaceChildren(button);
-        card.hidden = false;
-    } catch (error) {
-        setUploadStatus("pdf", error.message, "error");
-    } finally {
-        homeState.pdfBusy = false;
-        progress.hidden = true;
-        syncSelection("pdf");
+    form.append(kind, homeState[kind]);
+    form.append("phase", home$(pdf ? "#phase-select" : "#pptx-phase-select").value);
+    if (pdf) {
+        form.append("ocr_engine", home$("#home-ocr-engine").value);
+        form.append("defer", "1");
     }
+    try {
+        homeState.uploads[kind] = await uploadWithProgress(pdf ? "/api/documents" : "/api/presentations", form,
+            (loaded, total) => { progress.max = total; progress.value = loaded; });
+        setUploadStatus(kind, "Uploaded.", "success");
+    } catch (error) {
+        const message = (pdf ? "PDF" : "PowerPoint") + " upload failed. " + error.message;
+        setUploadStatus(kind, message, "error");
+        throw new Error(message);
+    } finally {
+        progress.hidden = true;
+    }
+}
+
+async function uploadPair() {
+    if (homeState.uploading || !homeState.pdf || !homeState.pptx) return;
+    homeState.uploading = true;
+    home$("#pair-retry").hidden = true;
+    for (const kind of ["pdf", "pptx"]) syncSelection(kind);
+    try {
+        await uploadSelected("pdf");
+        await uploadSelected("pptx");
+        homeState.pair = {...homeState.uploads};
+        await openPdfWorkspace(homeState.pair.pdf.id);
+        openPptxWorkspace(homeState.pair.pptx, false);
+        homeState.uploads = {};
+        for (const kind of ["pdf", "pptx"]) {
+            homeState[kind] = null;
+            setUploadStatus(kind, "");
+        }
+    } catch (error) {
+        home$("#pair-error").textContent = error.message;
+        home$("#pair-retry").hidden = false;
+    } finally {
+        homeState.uploading = false;
+        for (const kind of ["pdf", "pptx"]) syncSelection(kind);
+    }
+}
+
+home$("#retry-pair").onclick = uploadPair;
+home$("#switch-pdf").onclick = () => {
+    const id = homeState.pair.pdf.id;
+    if (!W.batch && S.id === id) window.showAppScreen("review");
+    else openPdfWorkspace(id).catch(showError);
+};
+home$("#switch-pptx").onclick = () => {
+    const job = homeState.pair.pptx;
+    if (homeState.activePptx === job.id) window.showAppScreen("pptx");
+    else openPptxWorkspace(job);
 };
 
 function renderPptxResult(job) {
@@ -240,7 +281,7 @@ function showPptxJob(job) {
     else home$("#pptx-workspace-results").textContent = job.error || job.progress?.message || statusLabel(job.status);
 }
 
-async function openPptxWorkspace(job) {
+async function openPptxWorkspace(job, show = true) {
     homeState.activePptx = job.id;
     pptxPreview.slide = 1;
     const base = "/api/presentations/" + encodeURIComponent(job.id);
@@ -249,7 +290,7 @@ async function openPptxWorkspace(job) {
     home$("#pptx-slide-tools").hidden = true;
     home$("#pptx-viewer").textContent = "Rendering the original slides?";
     showPptxJob(job);
-    window.showAppScreen("pptx");
+    if (show) window.showAppScreen("pptx");
     loadPptxPreview(job.id, base);
     try {
         while (["queued", "running"].includes(job.status) && homeState.activePptx === job.id) {
@@ -259,51 +300,11 @@ async function openPptxWorkspace(job) {
             job = current;
             showPptxJob(job);
         }
-        setUploadStatus("pptx", job.status === "completed" ? "Proofreading complete." : statusLabel(job.status),
-            job.status === "failed" ? "error" : "");
         loadHistory().catch(() => {});
     } catch (error) {
         if (homeState.activePptx === job.id) home$("#pptx-workspace-results").textContent = error.message;
     }
 }
-
-home$("#pptx-process").onclick = async () => {
-    const file = homeState.pptx;
-    if (!file || homeState.pptxBusy) return;
-    homeState.pptxBusy = true;
-    syncSelection("pptx");
-    const progress = home$("#home-pptx-progress");
-    progress.hidden = false; progress.removeAttribute("value");
-    home$("#pptx-result").hidden = true;
-    setUploadStatus("pptx", "Uploading PowerPoint...");
-    const form = new FormData(); form.append("pptx", file); form.append("phase", home$("#pptx-phase-select").value);
-    try {
-        const job = await uploadWithProgress("/api/presentations", form, (loaded, total) => {
-            progress.max = total; progress.value = loaded;
-        });
-        const card = home$("#pptx-result");
-        const button = Object.assign(document.createElement("button"), {
-            type: "button", className: "btn", textContent: "Open PowerPoint workspace"
-        });
-        button.onclick = async () => {
-            try { await openPptxWorkspace(await workspaceFetch("/api/presentations/" + encodeURIComponent(job.id))); }
-            catch (error) { setUploadStatus("pptx", error.message, "error"); }
-        };
-        card.dataset.state = "success";
-        card.replaceChildren(button);
-        card.hidden = false;
-        await openPptxWorkspace(job);
-    } catch (error) {
-        setUploadStatus("pptx", error.message, "error");
-        home$("#pptx-result").hidden = false;
-        home$("#pptx-result").dataset.state = "error";
-        home$("#pptx-result").textContent = error.message;
-    } finally {
-        homeState.pptxBusy = false;
-        progress.hidden = true;
-        syncSelection("pptx");
-    }
-};
 
 function statusLabel(status) {
     return ({uploaded: "Ready to process", queued: "Queued", running: "Processing", completed: "Completed", failed: "Failed"})[status] || status;

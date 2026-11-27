@@ -354,10 +354,10 @@ async function selectWorkspace(id, reset = true) {
     const extractionStatus = data.content_validation?.status === "manual_review_required" ?
         "Extraction complete · manual review required" : data.content_validation?.status === "validation_partial" ?
             "Extraction complete · validation partial" : "Extraction complete";
-    statusText((active && processingStatus(job.processing) || (job.status === "completed" ? extractionStatus :
+    const waiting = {queued: "Queued", running: "Processing the PDF"};
+    statusText((active && waiting[job.status] || (job.status === "completed" ? extractionStatus :
         job.status === "uploaded" ? source.error || "Ready to process" : job.error || job.status)) +
         (job.total ? " · " + job.done + "/" + job.total + " pages" : "") +
-        (job.ocr_selection?.ocr_backend ? " · " + ocrModeName(job.ocr_selection.ocr_backend) : "") +
         (reviewPages && !active ? " · " + reviewPages + " for review" : ""));
     $("#runchip").dataset.documentId = id;
     $("#runchip").dataset.jobStatus = job.status;

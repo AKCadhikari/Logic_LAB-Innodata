@@ -124,7 +124,7 @@ a { color: var(--accent); }
 .history-item-main { display: grid; min-width: 0; gap: 3px; }
 .history-item-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .history-item-meta { color: var(--mute); font-size: 12px; }
-.history-item-actions { display: flex; flex: 0 0 auto; gap: 7px; }
+.history-item-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .history-status { padding: 3px 9px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-dark); font-size: 12px; }
 .history-status.failed { background: #fcf0ed; color: var(--danger); }
 .settings-advanced { margin-top: 18px; }

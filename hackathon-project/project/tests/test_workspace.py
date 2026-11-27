@@ -415,6 +415,13 @@ def test_phase_two_upload_is_archived_and_xml_is_published_to_phase_two(workspac
     assert deck_output.is_file() and deck_output.is_relative_to(root / "phase-2" / "output")
     corrected = Presentation(deck_output)
     assert "260 units" in corrected.slides[0].shapes[0].text
+    history_row = next(item for item in client.get("/api/history").json["pdfs"] if item["id"] == document["id"])
+    link = history_row["pptx_download_url"]
+    assert client.get(link).data == deck_output.read_bytes()
+    assert app.test_client().get(link).status_code == 404
+    deck_output.unlink()
+    history_row = next(item for item in client.get("/api/history").json["pdfs"] if item["id"] == document["id"])
+    assert "pptx_download_url" not in history_row
 
 
 def test_standalone_pptx_job_needs_no_pdf_and_downloads_corrected_output(workspace, monkeypatch):
@@ -453,11 +460,11 @@ def test_standalone_pptx_job_needs_no_pdf_and_downloads_corrected_output(workspa
         run.font.bold = True
         contents = io.BytesIO()
         deck.save(contents)
-        contents.seek(0)
+        deck_bytes = contents.getvalue()
 
         fresh = app.test_client()
         submitted = fresh.post("/api/presentations", data={
-            "phase": "2", "pptx": (contents, "standalone.pptx")
+            "phase": "2", "pptx": (io.BytesIO(deck_bytes), "standalone.pptx")
         })
         assert submitted.status_code == 202, submitted.json
         job_id = submitted.json["id"]
@@ -479,13 +486,29 @@ def test_standalone_pptx_job_needs_no_pdf_and_downloads_corrected_output(workspa
         corrected = Presentation(io.BytesIO(download.data))
         assert corrected.slides[0].shapes[0].text == "The document contains a clear sentence."
         assert corrected.slides[0].shapes[0].text_frame.paragraphs[0].runs[0].font.bold
-        assert fresh.get("/api/history").json["presentations"][0]["id"] == job_id
+        item = fresh.get("/api/history").json["presentations"][0]
+        assert item["id"] == job_id and item["pptx_download_url"] == job["result"]["download_url"]
         unauthorized = app.test_client()
         unauthorized.set_cookie("docusync_workspace", "0" * 64)
         assert unauthorized.get(f"/api/presentations/{job_id}").status_code == 404
         assert unauthorized.get(f"/api/presentations/{job_id}/preview").status_code == 404
         assert unauthorized.get(f"/api/presentations/{job_id}/source").status_code == 404
         assert Presentation(io.BytesIO(fresh.get(f"/api/presentations/{job_id}/source").data)).slides
+
+        pending_pdf = fresh.post("/api/documents", data={"defer": "1", "pdf": (io.BytesIO(
+            pdf_with_text("The document contains a clear sentence.")), "paired.pdf")}).json
+        document_id = pending_pdf["id"]
+        form = {"document_id": document_id, "phase": "2"}
+        wrong_owner = unauthorized.post("/api/presentations", data={**form, "pptx": (
+            io.BytesIO(deck_bytes), "wrong-owner.pptx")})
+        assert wrong_owner.status_code == 404
+        paired = fresh.post("/api/presentations", data={**form, "pptx": (
+            io.BytesIO(deck_bytes), "paired.pptx")})
+        assert paired.status_code == 202 and paired.json["document_id"] == document_id
+        thread_worker.shutdown(wait=True)
+        pdf_row, = fresh.get("/api/history").json["pdfs"]
+        assert pdf_row["pptx_download_url"] == f"/api/presentations/{paired.json['id']}/download"
+        assert fresh.get(pdf_row["pptx_download_url"]).status_code == 200
     finally:
         thread_worker.shutdown(wait=True)
         ws.settings.ollama_enabled = prior_enabled

@@ -271,7 +271,32 @@ def create_document():
 def processing_history():
     owner = browser_owner(create=True)
     ws = workspace()
-    return jsonify(pdfs=ws.documents(owner), presentations=ws.presentations(owner))
+    pdfs, decks = ws.documents(owner), ws.presentations(owner)
+    linked = {}
+    for deck in decks:
+        if deck.get("document_id") and deck.get("pptx_download_url"):
+            linked.setdefault(deck["document_id"], deck["pptx_download_url"])
+    reports_by_folder = {}
+    for pdf in pdfs:
+        folder = ws.phase_output_dir(pdf["phase"]) / output_stem(pdf["filename"])
+        if folder not in reports_by_folder:
+            reports_by_folder[folder] = list(export_manifests(folder))
+        reports = [(path, report) for path, report in reports_by_folder[folder] if report.get("document_id") == pdf["id"]]
+        for path, report in sorted(reports, key=lambda entry: entry[1].get("created", ""), reverse=True):
+            output = (report.get("outputs") or {}).get("pptx")
+            if (not output or not output.get("valid") or not output.get("filename")
+                    or not export_file(path.parent, output["filename"])):
+                continue
+            try:
+                export_id = UUID(report["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if export_id.hex == path.parent.name and str(export_id) == report["id"]:
+                pdf["pptx_download_url"] = f"/api/documents/{pdf['id']}/presentations/{export_id}"
+                break
+        if pdf["id"] in linked:
+            pdf.setdefault("pptx_download_url", linked[pdf["id"]])
+    return jsonify(pdfs=pdfs, presentations=decks)
 
 
 @api.post("/presentations")
@@ -279,6 +304,11 @@ def create_standalone_presentation():
     phase = request.form.get("phase", "1")
     if phase not in {"1", "2"}:
         return fail("Choose Phase 1 or Phase 2.", 400)
+    owner = browser_owner(create=True)
+    ws = workspace()
+    document_id = request.form.get("document_id") or None
+    if document_id and not ws.owns(document_id, owner):
+        return fail("The paired PDF was not found in this workspace.", 404)
     uploaded, error = upload_file("pptx", ".pptx", b"PK")
     if error:
         return fail(error, 400)
@@ -298,10 +328,8 @@ def create_standalone_presentation():
         stream.seek(0)
     except (BadZipFile, KeyError, OSError, ValueError):
         return fail("This file is not a valid PowerPoint presentation. Choose a .pptx file.", 400)
-    owner = browser_owner(create=True)
-    ws = workspace()
     try:
-        job_id = ws.enqueue_presentation(filename, stream, owner, phase)
+        job_id = ws.enqueue_presentation(filename, stream, owner, phase, document_id=document_id)
     except OSError:
         current_app.logger.exception("Could not archive the standalone PowerPoint input")
         return fail("The presentation could not be saved in the selected phase folder.", 500)
@@ -824,14 +852,23 @@ def export_progress(document_id: str):
 @api.get("/documents/<document_id>/presentations")
 def presentations(document_id: str):
     reports = []
-    for path in export_root(document_id).glob("*/processing_report.json"):
-        report = json.loads(path.read_text(encoding="utf-8"))
+    for path, report in export_manifests(export_root(document_id)):
         if report.get("document_id") == document_id:
             report.pop("metadata", None)
             reports.append(available_outputs(path.parent, report))
     legacy = workspace().source(document_id).parent / "presentations"
     reports.extend(json.loads(path.read_text(encoding="utf-8")) for path in legacy.glob("*/report.json"))
     return jsonify(sorted(reports, key=lambda report: report["created"], reverse=True))
+
+
+def export_manifests(folder: Path):
+    for path in folder.glob("*/processing_report.json"):
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(report, dict) and isinstance(report.get("outputs"), dict) and isinstance(report.get("created"), str):
+            yield path, report
 
 
 def export_file(folder: Path, relative: str) -> Path | None:

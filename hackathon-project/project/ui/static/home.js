@@ -90,6 +90,7 @@ async function selectHomeFile(kind, files) {
         if (selection !== homeState.selecting[kind] || homeState.uploading) return;
         homeState[kind] = selected[0];
         delete homeState.uploads[kind];
+        if (kind === "pdf") delete homeState.uploads.pptx;
         home$("#pair-retry").hidden = true;
         syncSelection(kind);
         const other = kind === "pdf" ? "pptx" : "pdf";
@@ -130,6 +131,7 @@ function setupDrop(kind) {
         homeState.selecting[kind]++;
         homeState[kind] = null;
         delete homeState.uploads[kind];
+        if (kind === "pdf") delete homeState.uploads.pptx;
         home$("#pair-retry").hidden = true;
         setUploadStatus(kind, "File removed.");
         syncSelection(kind);
@@ -178,6 +180,8 @@ async function uploadSelected(kind) {
     if (pdf) {
         form.append("ocr_engine", home$("#home-ocr-engine").value);
         form.append("defer", "1");
+    } else {
+        form.append("document_id", homeState.uploads.pdf.id);
     }
     try {
         homeState.uploads[kind] = await uploadWithProgress(pdf ? "/api/documents" : "/api/presentations", form,
@@ -199,7 +203,7 @@ async function uploadPair() {
     for (const kind of ["pdf", "pptx"]) syncSelection(kind);
     try {
         const backend = await workspaceFetch("/api/startup/identity");
-        if (backend.workspace_api_version !== 1) throw new Error(workspaceUpdateMessage);
+        if (backend.workspace_api_version !== 2) throw new Error(workspaceUpdateMessage);
         await uploadSelected("pdf");
         await uploadSelected("pptx");
         homeState.pair = {...homeState.uploads};
@@ -313,26 +317,30 @@ function statusLabel(status) {
 }
 
 function renderHistory(data) {
+    const pptxLink = item => item.pptx_download_url ? '<a class="btn" href="' +
+        homeEsc(item.pptx_download_url) + '">Download PPTX</a>' : "";
     const items = [];
     for (const item of data.pdfs || []) {
-        items.push('<article class="history-item"><div class="history-item-main"><strong>' + homeEsc(item.filename) +
+        items.push({created: item.created, html: '<article class="history-item"><div class="history-item-main"><strong>' + homeEsc(item.filename) +
             '</strong><span class="history-item-meta">PDF · Phase ' + homeEsc(item.phase) + ' · ' +
             homeEsc(new Date(item.created).toLocaleString()) + (item.total ? ' · ' + homeEsc(item.done) + '/' + homeEsc(item.total) + ' pages' : '') +
             '</span></div><span class="history-status ' + (item.status === "failed" ? "failed" : "") + '">' +
             homeEsc(statusLabel(item.status)) + '</span><div class="history-item-actions"><button class="btn" data-history-pdf="' +
             homeEsc(item.id) + '">Open PDF review</button>' + (item.status === "completed" ?
-            '<button class="btn" data-history-xml="' + homeEsc(item.id) + '">Download XML</button>' : '') + '</div></article>');
+            '<button class="btn" data-history-xml="' + homeEsc(item.id) + '">Download XML</button>' : '') +
+            pptxLink(item) + '</div></article>'});
     }
     for (const item of data.presentations || []) {
-        items.push('<article class="history-item"><div class="history-item-main"><strong>' + homeEsc(item.filename) +
+        items.push({created: item.created, html: '<article class="history-item"><div class="history-item-main"><strong>' + homeEsc(item.filename) +
             '</strong><span class="history-item-meta">PowerPoint · Phase ' + homeEsc(item.phase) + ' · ' +
             homeEsc(new Date(item.created).toLocaleString()) + '</span></div><span class="history-status ' +
             (item.status === "failed" ? "failed" : "") + '">' + homeEsc(statusLabel(item.status)) +
             '</span><div class="history-item-actions"><button class="btn" data-history-pptx="' + homeEsc(item.id) + '">View results</button>' +
-            (item.status === "completed" ? '<a class="btn" href="/api/presentations/' + encodeURIComponent(item.id) +
-                '/download">Download</a>' : '') + '</div></article>');
+            pptxLink(item) + '</div></article>'});
     }
-    home$("#history-list").innerHTML = items.join("") || '<p class="empty">No processing jobs yet. Your PDF and PowerPoint jobs will appear here.</p>';
+    items.sort((first, second) => Date.parse(second.created) - Date.parse(first.created));
+    home$("#history-list").innerHTML = items.map(item => item.html).join("") ||
+        '<p class="empty">No processing jobs yet. Your PDF and PowerPoint jobs will appear here.</p>';
     home$("#history-list").querySelectorAll("[data-history-pdf]").forEach(button => button.onclick = async () => {
         try { await openPdfWorkspace(button.dataset.historyPdf); }
         catch (error) { home$("#history-list").prepend(Object.assign(document.createElement("p"), {className: "notice", textContent: error.message})); }

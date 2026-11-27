@@ -122,7 +122,7 @@ class Workspace:
                     id TEXT PRIMARY KEY, owner TEXT NOT NULL, phase TEXT NOT NULL,
                     filename TEXT NOT NULL, input_path TEXT NOT NULL, output_folder TEXT NOT NULL,
                     status TEXT NOT NULL, created TEXT NOT NULL, started TEXT, finished TEXT,
-                    progress TEXT, result TEXT, error TEXT
+                    progress TEXT, result TEXT, error TEXT, document_id TEXT REFERENCES documents(id)
                 );
             """)
             if "owner" not in {row["name"] for row in db.execute("PRAGMA table_info(documents)")}:
@@ -131,6 +131,8 @@ class Workspace:
                 db.execute("ALTER TABLE local_profile ADD COLUMN batch_owner TEXT")
             if "phase" not in {row["name"] for row in db.execute("PRAGMA table_info(documents)")}:
                 db.execute("ALTER TABLE documents ADD COLUMN phase TEXT NOT NULL DEFAULT '1'")
+            if "document_id" not in {row["name"] for row in db.execute("PRAGMA table_info(presentation_jobs)")}:
+                db.execute("ALTER TABLE presentation_jobs ADD COLUMN document_id TEXT REFERENCES documents(id)")
             db.execute("UPDATE jobs SET status='failed', finished=?, error=? WHERE status IN ('queued','running')",
                        (now(), "Processing was interrupted. Retry to start a new attempt."))
             db.execute("UPDATE presentation_jobs SET status='failed', finished=?, "
@@ -223,7 +225,8 @@ class Workspace:
             db.execute("INSERT INTO ocr_preferences VALUES (?, ?) ON CONFLICT(owner) DO UPDATE SET engine=excluded.engine",
                        (owner, engine))
 
-    def enqueue_presentation(self, filename: str, stream: BinaryIO, owner: str, phase: str) -> str:
+    def enqueue_presentation(self, filename: str, stream: BinaryIO, owner: str, phase: str,
+                             *, document_id: str | None = None) -> str:
         if phase not in {"1", "2"}:
             raise ValueError("Choose Phase 1 or Phase 2.")
         input_path = self.save_phase_input(filename, stream, phase)
@@ -231,8 +234,8 @@ class Workspace:
         output_folder = self.phase_output_dir(phase) / "PowerPoint" / input_path.stem / job_id
         with self.db() as db:
             db.execute("INSERT INTO presentation_jobs(id, owner, phase, filename, input_path, output_folder, "
-                       "status, created) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
-                       (job_id, owner, phase, filename, str(input_path), str(output_folder), now()))
+                       "status, created, document_id) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+                       (job_id, owner, phase, filename, str(input_path), str(output_folder), now(), document_id))
         try:
             future = self.worker.submit(run_pptx_job, self.root, input_path, output_folder,
                                         job_id, json.dumps(self.settings.to_dict()))
@@ -283,18 +286,28 @@ class Workspace:
         with self.db() as db:
             row = db.execute("SELECT phase, output_folder, status, result FROM presentation_jobs "
                              "WHERE id=? AND owner=?", (job_id, owner)).fetchone()
-        if not row or row["status"] != "completed" or not row["result"]:
+        return self._presentation_output(row, json.loads(row["result"])) if row and row["result"] else None
+
+    def _presentation_output(self, row, result: dict) -> Path | None:
+        filename = result.get("output_filename")
+        if row["status"] != "completed" or not result.get("validation", {}).get("valid") or not filename:
             return None
-        result = json.loads(row["result"])
-        output = (Path(row["output_folder"]) / result.get("output_filename", "")).resolve()
+        folder = Path(row["output_folder"]).resolve()
+        output = (folder / filename).resolve()
         phase_output = self.phase_output_dir(row["phase"]).resolve()
-        return output if output.is_relative_to(phase_output) and output.is_file() else None
+        return output if folder.is_relative_to(phase_output) and output.is_relative_to(folder) and output.is_file() else None
 
     def presentations(self, owner: str) -> list[dict]:
         with self.db() as db:
             rows = db.execute("SELECT * FROM presentation_jobs WHERE owner=? ORDER BY created DESC LIMIT 100",
                               (owner,)).fetchall()
-        return [self._public_presentation(row) for row in rows]
+        items = []
+        for row in rows:
+            item = self._public_presentation(row)
+            if item["result"] and self._presentation_output(row, item["result"]):
+                item["pptx_download_url"] = f"/api/presentations/{item['id']}/download"
+            items.append(item)
+        return items
 
     def upload(self, filename: str, stream: BinaryIO, previous_id: str | None, owner: str,
                *, phase: str = "1", engine: str | None = None, language: str | None = None,

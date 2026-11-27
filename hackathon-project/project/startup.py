@@ -28,7 +28,7 @@ from utils import ollama
 from utils.logs import AuditLog
 
 ROOT = Path(__file__).resolve().parent.parent
-WORKSPACE_API_VERSION = 1
+WORKSPACE_API_VERSION = 2
 MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)*:[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 

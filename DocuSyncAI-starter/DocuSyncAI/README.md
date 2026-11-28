@@ -1,6 +1,6 @@
-# DocuSync AI (working title)
+# DocuSync AI starter
 
-A configurable document-processing pipeline for the Innodata AI Catalyst 2026 Employee Track.
+A Phase 1 PDF-to-XML baseline for the Innodata AI Catalyst 2026 Employee Track. Start here if you want to run `project/main.py` in this folder. For OCR, document layout analysis, and PowerPoint repair, use the [full workspace setup](../../README.md#get-started-on-windows).
 
 ## Launch the DocuSync AI workspace
 
@@ -12,30 +12,44 @@ installation, residency, inference checks, and model errors.
 The workspace uses `hackathon-project/.venv`, the optional `hackathon-project/.env`, and
 `hackathon-project/logs/startup.log`. See the [workspace setup, shutdown, and troubleshooting instructions](../../hackathon-project/README.md).
 
-## Current status
+## Technology stack
 
-The command-line entry point below runs the Phase 1 starter baseline:
-- Reads every `*.pdf` in an input folder.
-- Extracts native text blocks page by page using PyMuPDF.
-- Writes well-formed XML with one `<page n="...">` element per PDF page and paragraph blocks.
-- Reports page, empty-page, block, and character counts.
+| Technology | Role |
+| --- | --- |
+| Python 3.11 | Runs the command-line converter. |
+| PyMuPDF | Reads PDFs and extracts their embedded text in page and block order. |
+| `argparse` and `pathlib` | Handle command-line arguments and file paths. |
+| `xml.etree.ElementTree` | Writes UTF-8 XML with numbered pages and paragraph blocks. |
 
-This baseline does **not** yet implement OCR, layout classification, tables, figures, handwritten annotations, change detection, or PowerPoint amendment generation. Do not present it as a complete solution.
+The starter processes PDFs with selectable text. Image-only scanned pages appear as empty pages in its XML output.
 
-## Setup (Windows 11 PowerShell)
+## Run the starter on Windows
 
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r project\requirements.txt
-```
+1. Install Python 3.11 and open PowerShell at the repository root. Confirm that `python --version` reports Python 3.11. If you select Python 3.11 through the Windows Python launcher, use `py -3.11` in place of `python` when creating the environment.
 
-## Run
+2. Enter the starter folder, create a virtual environment, and install its dependency.
 
-```powershell
-python project\main.py --input phase-1\input --output phase-1\output
-```
+   ```powershell
+   Set-Location DocuSyncAI-starter\DocuSyncAI
+   python -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install -r project\requirements.txt
+   ```
+
+3. Create the input folder and copy at least one PDF with selectable text into `phase-1\input`.
+
+   ```powershell
+   New-Item -ItemType Directory -Force phase-1\input
+   ```
+
+4. Run the converter from the starter folder. Both arguments take folder paths. Quote paths that contain spaces.
+
+   ```powershell
+   .\.venv\Scripts\python.exe project\main.py --input phase-1\input --output phase-1\output
+   ```
+
+5. Open `phase-1\output` to find one XML file per PDF. For example, `sample.pdf` produces `sample.xml`. The terminal prints an `[OK]` line for each converted file with the page, empty-page, text block, and character counts.
+
+If the command reports that the input folder is missing or has no PDFs, check the folder path and place the files directly in that folder. The converter creates the output directory as needed and overwrites XML files with the same name on subsequent runs.
 
 ## Next engineering milestones
 

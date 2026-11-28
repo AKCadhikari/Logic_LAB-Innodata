@@ -2,33 +2,61 @@
 
 DocuSync AI is a local document inspection and conversion workspace. It extracts text and structure from digital, scanned, and multilingual PDFs, produces validated XML, and helps users review and correct PowerPoint presentations.
 
+The browser workspace lives in `hackathon-project`. If you are working in `DocuSyncAI-starter`, its Python entry point runs the original PDF-to-XML baseline. See the [starter setup guide](DocuSyncAI-starter/DocuSyncAI/README.md) for that command.
+
+## Technology stack
+
+| Technology | Role |
+| --- | --- |
+| Python 3.11 and Flask | Run the document pipeline and serve the local browser workspace. |
+| HTML, CSS, and JavaScript | Provide document uploads, previews, and job review in the browser. |
+| PyMuPDF | Extracts PDF text and renders pages for layout analysis and OCR. |
+| DocLayout-YOLO and OpenCV | Detect document regions such as text, tables, and figures and process page images. |
+| Ollama, GLM-OCR, and Qwen3 4B | Run OCR and advisory proofreading locally. |
+| lxml and python-pptx | Support structured XML processing and PowerPoint inspection and updates. |
+| LibreOffice | Optionally renders slides for previews and visual checks. |
+| pytest | Runs the automated Python tests. |
+
 ## Get started on Windows
 
-Use Python 3.11 and PowerShell. Install Git LFS for the layout checkpoint and Ollama for GLM-OCR and PowerPoint proofreading. Install LibreOffice if you want slide previews and render-based checks.
+1. Install Python 3.11, Git with Git LFS, and Ollama. Install LibreOffice if you want slide previews and render-based checks. Open PowerShell and confirm that `python --version` reports Python 3.11 and that `git lfs version` and `ollama --version` work. If you select Python 3.11 through the Windows Python launcher, use `py -3.11` in place of `python` for the environment creation commands below.
 
-From the repository root, retrieve the model assets and set up the two Python environments.
+2. Clone the repository if you need a local copy, then open the `Logic_LAB` folder in PowerShell.
 
-```powershell
-git lfs install
-git lfs pull
-git submodule update --init -- hackathon-project/third_party/DocLayout-YOLO-release-v2
+   ```powershell
+   git clone https://github.com/AKCadhikari/Logic_LAB.git
+   Set-Location Logic_LAB
+   ```
 
-Set-Location hackathon-project
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r project\requirements.txt
-py -3.11 -m venv .venv-doclayout
-.\.venv-doclayout\Scripts\python.exe -m pip install .\third_party\DocLayout-YOLO-release-v2
-```
+3. From the repository root, fetch the model checkpoint and the DocLayout-YOLO submodule.
 
-With Ollama running, pull the default OCR and proofreading models, then start the workspace.
+   ```powershell
+   git lfs install
+   git lfs pull
+   git submodule update --init -- hackathon-project/third_party/DocLayout-YOLO-release-v2
+   ```
 
-```powershell
-ollama pull glm-ocr:q8_0
-ollama pull qwen3:4b
-.\Start_DocuSync_AI.bat
-```
+4. Create the workspace and layout-analysis environments. Run the remaining setup commands from `hackathon-project`.
 
-The launcher opens [DocuSync AI on localhost](http://127.0.0.1:8765/). See the [project guide](hackathon-project/README.md) for environment overrides and [local OCR setup](hackathon-project/docs/LOCAL_OCR.md) for PaddleOCR, Docling, and Tesseract.
+   ```powershell
+   Set-Location hackathon-project
+   python -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install -r project\requirements.txt
+   python -m venv .venv-doclayout
+   .\.venv-doclayout\Scripts\python.exe -m pip install .\third_party\DocLayout-YOLO-release-v2
+   ```
+
+5. Open the Ollama app so its local service is running, then download the models and start DocuSync AI.
+
+   ```powershell
+   ollama pull glm-ocr:q8_0
+   ollama pull qwen3:4b
+   .\Start_DocuSync_AI.bat
+   ```
+
+6. The launcher opens [DocuSync AI on localhost](http://127.0.0.1:8765/). Check **AI startup** in the workspace for model status. If startup fails, open `hackathon-project/logs/startup.log`.
+
+After the first setup, run `.\Start_DocuSync_AI.bat` from `hackathon-project` to reopen the workspace. Run `.\Start_DocuSync_AI.bat -Action Stop` to shut it down. See the [project guide](hackathon-project/README.md) for environment overrides and [local OCR setup](hackathon-project/docs/LOCAL_OCR.md) for PaddleOCR, Docling, and Tesseract.
 
 ## Use the workspace
 

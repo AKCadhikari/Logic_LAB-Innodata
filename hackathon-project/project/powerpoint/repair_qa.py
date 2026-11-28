@@ -33,7 +33,7 @@ def write_qa(ir, target: Path, report):
                     if name not in crops:
                         path.parent.mkdir(exist_ok=True)
                         dpi = max(1, min(380, int(3000 * 72 / max(crop.width, crop.height))))
-                        sheet.get_pixmap(dpi=dpi, clip=crop, alpha=False).save(path)
+                        path.write_bytes(sheet.get_pixmap(dpi=dpi, clip=crop, alpha=False).tobytes("png"))
                         crops.append(name)
                     evidence["visual_crop"] = name
                 except (RuntimeError, ValueError, OSError):

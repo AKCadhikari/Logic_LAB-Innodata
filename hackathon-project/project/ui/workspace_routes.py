@@ -137,7 +137,8 @@ def retry_startup_models():
     ws = workspace()
     folder = app.extensions.get("startup_logs", ROOT / "logs")
     with ws.db() as db:
-        if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued', 'running') LIMIT 1").fetchone():
+        if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued', 'running') "
+                      "UNION ALL SELECT 1 FROM bulk_jobs WHERE pending IS NOT NULL OR active=1 LIMIT 1").fetchone():
             return fail("Wait until document processing finishes before warming models again.", 409)
 
     def prepare():
@@ -836,8 +837,9 @@ def run_assessment(changes, settings, audit_path, document_id=None, source_hash=
 
 def export_root(document_id: str) -> Path:
     ws = workspace()
-    info = ws.get(document_id)
-    return ws.phase_output_dir(info["phase"]) / output_stem(info["filename"])
+    with ws.db() as db:
+        info = db.execute("SELECT phase,filename,bulk_path FROM documents WHERE id=?", (document_id,)).fetchone()
+    return ws.document_export_path(ws.output, info["phase"], info["filename"], info["bulk_path"])
 
 
 @api.post("/documents/<document_id>/presentations")
@@ -914,7 +916,7 @@ def sync_deck(document_id: str):
             return fail("An export for this PDF is already running.", 409)
         ws.export_progress[document_id] = {}
     try:
-        summary = publish_document(ws.phase_output_dir(info["phase"]) / stem / export_id.hex,
+        summary = publish_document(export_root(document_id) / export_id.hex,
                                    stem, ir, settings, extraction,
                                    {"id": str(export_id), "document_id": document_id, "filename": filename,
                                     "previous_id": previous_id, "mode": mode, "created": now(),

@@ -74,7 +74,8 @@ def managed_shutdown():
     with lifecycle["lock"]:
         ws = app.extensions["workspace"]
         with ws.db() as db:
-            busy = db.execute("SELECT 1 FROM jobs WHERE status IN ('queued', 'running') LIMIT 1").fetchone()
+            busy = db.execute("SELECT 1 FROM jobs WHERE status IN ('queued', 'running') "
+                              "UNION ALL SELECT 1 FROM bulk_jobs WHERE pending IS NOT NULL OR active=1 LIMIT 1").fetchone()
         retry = app.extensions.get("startup_retry")
         if lifecycle["active"] or busy or (retry and retry.is_alive()):
             return jsonify(error="Finish active workspace requests and processing before shutdown."), 409
@@ -139,6 +140,11 @@ def _reviews() -> dict:
 @app.get("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
+
+
+@app.get("/bulk")
+def bulk_page():
+    return send_from_directory(app.static_folder, "bulk.html")
 
 
 @app.get("/api/summary")
@@ -337,12 +343,15 @@ def configure_workspace(storage: Path, config: str | None = None, output: Path |
     from config.settings import Settings
     from ui.workspace import Workspace
     from ui.workspace_routes import api
+    from ui.bulk_routes import bulk_api
 
     app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
     app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost", "[::1]"]
     app.extensions["workspace"] = Workspace(storage, Settings.load(config, default_schema_profile="sample"), output)
     if api.name not in app.blueprints:
         app.register_blueprint(api)
+        app.register_blueprint(bulk_api)
+    app.extensions["workspace"].bulk.kick()
 
 
 if __name__ == "__main__":

@@ -4,12 +4,14 @@ from __future__ import annotations
 import json
 import math
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from queue import Empty, Queue
 import subprocess
-from threading import Thread
+from threading import Lock, Thread, Timer
 
 import pymupdf
+import psutil
 
 from utils import execution_audit as audit
 
@@ -130,6 +132,58 @@ class Detector:
             process.kill()
             process.wait()
         process.stdout.close()
+
+
+class BulkDetector:
+    """Keep one isolated CPU detector warm briefly between sequential jobs."""
+
+    def __init__(self):
+        self.lock = Lock()
+        self.detector = None
+        self.timer = None
+
+    def _close(self):
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+        if self.detector:
+            self.detector.close()
+            self.detector = None
+
+    def close(self):
+        with self.lock:
+            self._close()
+
+    @contextmanager
+    def use(self, settings, runtime):
+        with self.lock:
+            detector = self.detector
+            if (detector is None or detector.scratch != runtime or any(
+                    getattr(detector.settings, key) != value for key, value in vars(settings).items()
+                    if key.startswith("doclayout_"))):
+                self._close()
+                runtime.mkdir(parents=True, exist_ok=True)
+                self.detector = Detector(settings, runtime)
+            if self.timer:
+                self.timer.cancel()
+            try:
+                yield self.detector
+            finally:
+                if self.detector.process is None or psutil.virtual_memory().available < 2 * 1024**3:
+                    self._close()
+                else:
+                    def expire():
+                        with self.lock:
+                            if self.timer is timer:
+                                self._close()
+
+                    timer = Timer(15, expire)
+                    timer.daemon = True
+                    self.timer = timer
+                    timer.start()
+
+
+bulk_detector = BulkDetector()
 
 
 def render(page, folder, image_size):

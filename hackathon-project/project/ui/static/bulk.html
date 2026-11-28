@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width,initial-scale=1">
+ <title>DocuSync AI | Bulk Processing</title>
+ <link rel="icon" type="image/png" href="/static/docu-sync-icon.png">
+ <link rel="stylesheet" href="/static/workspace.css">
+ <link rel="stylesheet" href="/static/bulk.css">
+ <script src="/static/bulk.js" defer></script>
+</head>
+<body>
+<div class="app home-view">
+ <header class="top">
+  <h1 class="logo"><img class="logo-image" src="/static/docu-sync-logo.webp" alt="DocuSync AI"></h1>
+  <nav class="main-nav" aria-label="Processing modes">
+   <a href="/">Single Processing</a>
+   <a href="/bulk" class="on" aria-current="page">Bulk Processing</a>
+  </nav>
+ </header>
+ <main class="bulk-screen history-screen" aria-labelledby="bulk-heading">
+  <header class="history-heading">
+   <div><h2 id="bulk-heading">Bulk Processing</h2><p>Process one PDF and one PowerPoint per folder.</p></div>
+   <div class="bulk-history">
+    <label for="bulk-history">Bulk history</label>
+    <select id="bulk-history"><option value="">Select a batch</option></select>
+    <button class="btn" id="bulk-new" type="button">New batch</button>
+   </div>
+  </header>
+  <div class="bulk-content">
+   <section id="bulk-intake" class="upload-card bulk-intake" aria-label="Upload folders">
+    <input id="bulk-directory" type="file" webkitdirectory multiple hidden>
+    <button type="button" class="drop-zone" id="bulk-drop">
+     <span class="drop-icon" aria-hidden="true">&#8593;</span>
+     <strong>Choose or drop folders</strong>
+     <span>Select a parent folder or drop folders containing PDF and PowerPoint pairs.</span>
+     <small>Up to 500 folders &middot; Files under 64 MB</small>
+    </button>
+    <div class="bulk-options">
+     <label for="bulk-phase">Submission phase
+      <select id="bulk-phase"><option value="1">Phase 1</option><option value="2">Phase 2</option></select>
+     </label>
+     <label for="bulk-engine">OCR engine
+      <select id="bulk-engine"><option value="glm-ocr">GLM-OCR (default)</option><option value="paddleocr">PaddleOCR</option></select>
+     </label>
+     <label for="bulk-language">Document language
+      <select id="bulk-language"><option value="auto">Auto Detect</option><option value="en">English</option><option value="ar">Arabic</option><option value="ar-en">Mixed Arabic and English</option></select>
+     </label>
+    </div>
+   </section>
+   <div class="bulk-feedback">
+    <p id="bulk-message" role="status" aria-live="polite"></p>
+    <button class="btn" id="bulk-resume-upload" type="button" hidden>Resume upload</button>
+    <progress id="bulk-upload-progress" aria-label="Files uploaded and checked" hidden></progress>
+   </div>
+   <section id="bulk-review" class="upload-card" aria-labelledby="bulk-review-heading" hidden>
+    <header class="bulk-section-heading">
+     <div><h3 id="bulk-review-heading">Folder review</h3><p id="bulk-batch-meta"></p></div>
+     <div class="bulk-actions">
+      <button class="btn" id="bulk-cancel" type="button" hidden>Cancel pending jobs</button>
+      <button class="btn pri" id="bulk-start" type="button">Start bulk processing</button>
+      <a class="btn pri" id="bulk-download" hidden>Download All Results</a>
+     </div>
+    </header>
+    <dl class="bulk-stats" id="bulk-summary"></dl>
+    <dl class="bulk-stats bulk-queue-stats" id="bulk-counts" hidden></dl>
+    <div class="bulk-table-wrap" tabindex="0" aria-label="Bulk document jobs">
+     <table class="bulk-table">
+      <thead><tr><th scope="col">Folder</th><th scope="col">PDF</th><th scope="col">PowerPoint</th>
+       <th scope="col">Status</th><th scope="col">Current stage and progress</th><th scope="col">Actions</th></tr></thead>
+      <tbody id="bulk-jobs"></tbody>
+     </table>
+    </div>
+   </section>
+  </div>
+ </main>
+</div>
+</body>
+</html>

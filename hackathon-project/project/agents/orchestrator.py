@@ -70,11 +70,12 @@ def _text_of(lines) -> str:
 
 def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, audit: AuditLog,
                 deadline: float | None = None, progress: Callable[[int, int], None] | None = None,
-                processing: Callable[[dict], None] | None = None, *, document_id=None) -> dict:
+                processing: Callable[[dict], None] | None = None, *, document_id=None, bulk_layout_runtime=None) -> dict:
     private = work_dir / "private-model-responses" if settings.audit_private_responses else None
     with model_audit.scope(document_id or pdf.stem, file_key(pdf), private):
         try:
-            result = _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing)
+            result = _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing,
+                                  bulk_layout_runtime)
         except Exception:
             save_execution_reports(work_dir, pdf.stem, {})
             raise
@@ -83,12 +84,13 @@ def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, au
         return result
 
 
-def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing):
+def _process_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing, bulk_layout_runtime):
     with ExitStack() as resources:
-        return _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing, resources)
+        return _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing, resources,
+                            bulk_layout_runtime)
 
 
-def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing, resources):
+def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, processing, resources, bulk_layout_runtime):
     import pymupdf
     from rapidfuzz import fuzz
     t0 = time.time()
@@ -151,7 +153,8 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
     audit.event("analysis", "doc_language", doc=doc_id, lang=lang, healthy_pages=sum(d["health"] == "healthy" for d in diags),
                 decisions={k: sum(d["decision"] == k for d in diags) for k in ("native", "compare", "ocr")})
     stage("diagnostics", state="failed" if any(d["health"] == "error" for d in diags) else "completed")
-    layout_pages = detect_layout(doc, settings, work_dir, stage, audit)
+    layout_options = {"bulk_layout_runtime": bulk_layout_runtime} if bulk_layout_runtime else {}
+    layout_pages = detect_layout(doc, settings, work_dir, stage, audit, **layout_options)
     # ---- OCR & Extraction agent ---------------------------------------------------------------
     stage("ocr", state="running")
     raw = []
@@ -484,7 +487,7 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
     return result
 
 
-def detect_layout(doc, settings, work_dir, stage, audit):
+def detect_layout(doc, settings, work_dir, stage, audit, *, bulk_layout_runtime=None):
     pages = [{"status": "disabled", "detections": []} for _ in doc]
     if not settings.doclayout_enabled:
         stage("rendering", state="skipped")
@@ -502,7 +505,9 @@ def detect_layout(doc, settings, work_dir, stage, audit):
                 pages[i].update(status="failed", error=f"Page {i + 1} could not be rendered for layout detection: {error}")
         stage("rendering", state="completed" if len(rendered) == len(pages) else "failed")
         stage("detection", state="running", runtime_status="loading")
-        with doclayout.Detector(settings, folder) as detector:
+        context = (doclayout.bulk_detector.use(settings, bulk_layout_runtime) if bulk_layout_runtime
+                   else doclayout.Detector(settings, folder))
+        with context as detector:
             initialization_error = None
             for rendered_page in rendered:
                 number = rendered_page["page"]

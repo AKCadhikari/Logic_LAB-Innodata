@@ -69,6 +69,16 @@ If the job pauses for source review, check the affected pages and submit the rev
 
 **Processing History** lets you reopen documents and completed jobs. The browser's local workspace session controls access to its uploads and history.
 
+### Bulk Processing
+
+1. Open **Bulk Processing** from the workspace header. Select Phase 1 or Phase 2 and choose the OCR settings for the batch.
+2. Choose a parent directory or drop folders onto the upload area. Put one source PDF and one PowerPoint in each document folder. The filenames can differ from one folder to the next.
+3. Review the detected pairs. **File issues** lists missing files, ambiguous pairs, and unexpected or invalid files. Choose **Start bulk processing** to queue the valid pairs.
+4. Use the queue to track PDF or slide progress, cancel pending jobs, retry failed or partial jobs, or open **View results** to inspect a pair. If source review is required, submit it in the document workspace.
+5. Download an individual XML or PPTX, or choose **Download All Results** for a ZIP with the original folder names and a report of the batch. The ZIP includes successful outputs from partial jobs and any image assets referenced by their XML.
+
+Bulk exports are versioned under `hackathon-project/phase-1/output/bulk/` or `hackathon-project/phase-2/output/bulk/`. **Bulk history** reopens batches for the same browser session. Each batch accepts up to 500 folders and 2,000 files, with each PDF or PPTX under 64 MB. Browser folder pickers may omit empty folders. If DocuSync was already running before the update, use the launcher’s restart command to load the bulk routes.
+
 ## Command-line workflows
 
 Run these commands from `hackathon-project`.

@@ -47,16 +47,17 @@ a { color: var(--accent); }
 .logo { display: flex; align-items: center; flex: 0 1 auto; }
 .logo-image { display: block; width: clamp(168px, 21vw, 286px); height: auto; max-height: 64px; object-fit: contain; }
 .main-nav { display: flex; align-items: center; gap: 5px; }
-.main-nav button {
+.main-nav :is(button, a) {
     padding: 8px 12px;
     border: 1px solid transparent;
     border-radius: 7px;
     background: transparent;
     color: #f6f5ed;
     cursor: pointer;
+    text-decoration: none;
 }
-.main-nav button:hover, .main-nav button.on { border-color: #719788; background: #174f42; }
-.main-nav button.on { font-weight: 650; }
+.main-nav :is(button, a):is(:hover, .on) { border-color: #719788; background: #174f42; }
+.main-nav .on { font-weight: 650; }
 .top #settings {
     max-width: min(46vw, 244px);
     overflow: hidden;
@@ -413,8 +414,8 @@ dialog::backdrop { background: #132e27a6; }
 @media (max-width: 640px) {
     .top { flex-wrap: wrap; gap: 9px; }
     .logo-image { width: min(228px, 58vw); max-height: 54px; }
-    .main-nav { width: 100%; justify-content: space-between; }
-    .main-nav button { padding: 7px 9px; font-size: 13px; }
+    .main-nav { width: 100%; justify-content: space-between; flex-wrap: wrap; }
+    .main-nav :is(button, a) { padding: 7px 9px; font-size: 13px; }
     #reviewer-label { display: none; }
     .home-screen, .history-screen { padding: 19px 13px; }
     .upload-card { padding: 16px; }

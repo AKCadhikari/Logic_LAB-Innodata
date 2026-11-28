@@ -151,12 +151,17 @@ class Workspace:
                 db.execute("ALTER TABLE documents ADD COLUMN source_pptx TEXT")
             if "upload_key" not in columns:
                 db.execute("ALTER TABLE documents ADD COLUMN upload_key TEXT")
+            if "bulk_path" not in columns:
+                db.execute("ALTER TABLE documents ADD COLUMN bulk_path TEXT")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS documents_upload_key ON documents(owner, upload_key)")
             db.execute("UPDATE jobs SET status='failed', finished=?, error=? WHERE status IN ('queued','running')",
                        (now(), "Processing was interrupted. Retry to start a new attempt."))
             db.execute("UPDATE presentation_jobs SET status='failed', finished=?, "
                        "error='Proofreading was interrupted. Upload the presentation again to retry.' "
                        "WHERE status IN ('queued','running')", (now(),))
+        from ui.bulk import BulkQueue
+
+        self.bulk = BulkQueue(self)
 
     def db(self):
         return connect(self.root)
@@ -234,6 +239,12 @@ class Workspace:
             return output
         project_root = output.parent.parent if output.parent.name in {"phase-1", "phase-2"} else output.parent
         return project_root / f"phase-{phase}" / "output"
+
+    @staticmethod
+    def document_export_path(output: Path, phase: str, filename: str, bulk_path: str | None) -> Path:
+        from reporting.exports import output_stem
+
+        return Workspace.phase_output_path(output, phase) / (bulk_path or output_stem(filename))
 
     def ocr_preference(self, owner: str) -> str:
         with self.db() as db:
@@ -395,7 +406,7 @@ class Workspace:
                        j.status, j.done, j.total
                 FROM documents d JOIN jobs j ON j.id =
                     (SELECT MAX(id) FROM jobs WHERE document_id=d.id)
-                WHERE d.owner=? ORDER BY d.created DESC
+                WHERE d.owner=? AND d.bulk_path IS NULL ORDER BY d.created DESC
             """, (owner,))]
 
     def get(self, document_id: str) -> dict | None:
@@ -436,10 +447,15 @@ class Workspace:
             document = dict(row)
             document.pop("owner")
             document.pop("upload_key")
+            document.pop("bulk_path")
             return {**document, "jobs": public_jobs, "review": dict(review) if review else None}
 
     def enqueue(self, document_id: str, *, layout_only: bool = False, engine: str | None = None,
                 language: str | None = None) -> bool:
+        if self.bulk.contains(document_id):
+            if layout_only:
+                return self.bulk.refresh_layout(document_id)
+            return self.bulk.retry(document_id, engine=engine, language=language)
         with self.db() as db:
             previous = None
             document = db.execute("SELECT phase FROM documents WHERE id=?", (document_id,)).fetchone()
@@ -484,13 +500,22 @@ class Workspace:
         return cursor.lastrowid if cursor.rowcount else None
 
     def _submit(self, document_id: str, job: int, layout_from: int | None = None, *, phase: str = "1",
-                resume: bool = False) -> None:
+                resume: bool = False, on_done=None) -> bool:
+        def finished(task):
+            try:
+                self._check_worker(task, job)
+            finally:
+                if on_done:
+                    on_done()
+
         try:
             future = self.worker.submit(self._process, self.root, self.output, document_id, job, layout_from, phase, resume)
         except RuntimeError:
             self._worker_failed(job)
+            return False
         else:
-            future.add_done_callback(lambda task: self._check_worker(task, job))
+            future.add_done_callback(finished)
+            return True
 
     def _check_worker(self, task: Future, job: int) -> None:
         if task.cancelled() or task.exception() is not None:
@@ -507,11 +532,15 @@ class Workspace:
         run = root / document_id / str(job)
         with connect(root) as db:
             prior = db.execute("SELECT settings,result FROM jobs WHERE id=?", (job,)).fetchone()
-            info = db.execute("SELECT filename,source_pptx,title,lang,approved FROM documents WHERE id=?",
+            info = db.execute("SELECT filename,source_pptx,title,lang,approved,bulk_path FROM documents WHERE id=?",
                               (document_id,)).fetchone()
             previous_result = (db.execute("SELECT result FROM jobs WHERE id=? AND document_id=? AND status='completed'",
                                           (layout_from, document_id)).fetchone() if layout_from is not None else None)
-            db.execute("UPDATE jobs SET status='running', started=COALESCE(started,?) WHERE id=?", (now(), job))
+            started = db.execute("UPDATE jobs SET status='running', started=COALESCE(started,?) "
+                                 "WHERE id=? AND (? IS NULL OR status='queued')",
+                                 (now(), job, info["bulk_path"]))
+            if not started.rowcount:
+                return
         settings = Settings(**json.loads(prior["settings"]))
         paired = info["source_pptx"] is not None
         history = deque(maxlen=30)
@@ -554,6 +583,10 @@ class Workspace:
         error = None
         needs_review = False
         try:
+            if not info["bulk_path"] or layout_from is not None:
+                from layout.doclayout import bulk_detector
+
+                bulk_detector.close()
             audit = AuditLog(run / "audit.jsonl")
             if paired and not resume:
                 processing({"stage": "pdf_extraction", "state": "running"})
@@ -568,12 +601,15 @@ class Workspace:
                 result = refresh_layout(run.parent / "source.pdf", ir, settings, run / "output", run, audit,
                                         json.loads(previous_result[0]), progress, processing)
             else:
+                layout_options = {}
+                if info["bulk_path"] and settings.workspace_workers == 1 and settings.doclayout_enabled:
+                    layout_options["bulk_layout_runtime"] = root / "bulk-layout-runtime"
                 result = process_pdf(run.parent / "source.pdf", settings, run / "output", run, audit,
-                                     progress=progress, processing=processing, document_id=document_id)
+                                     progress=progress, processing=processing, document_id=document_id,
+                                     **layout_options)
             if paired and not resume:
                 processing({"stage": "pdf_extraction", "state": "completed" if result.get("ok") else "failed"})
             if result.get("ok"):
-                from layout.model import ir_from_dict
                 from reporting.exports import output_stem, publish_document
 
                 ir = ir_from_dict(json.loads((run / "ir" / "source.json").read_text(encoding="utf-8")))
@@ -611,7 +647,7 @@ class Workspace:
                     return repaired
 
                 export = publish_document(
-                    Workspace.phase_output_path(output, phase) / stem / export_id.hex,
+                    Workspace.document_export_path(output, phase, filename, info["bulk_path"]) / export_id.hex,
                     stem, ir, settings, result,
                     {"id": str(export_id), "document_id": document_id, "filename": filename,
                      "phase": phase, "mode": "unified" if paired else "pdf_processing", "created": now(), "job_id": job},
@@ -622,6 +658,8 @@ class Workspace:
                     "status": export["status"], "xml_profile": export["xml_profile"],
                     "error": export.get("error", ""),
                 }
+                if info["bulk_path"]:
+                    result["submission_export"]["xml_assets"] = export["xml_assets"]
                 if paired:
                     needs_review = export["status"] == "manual_review_required"
                     result["final_export"] = {
@@ -681,9 +719,10 @@ class Workspace:
 
     def review(self, document_id: str, title: str, lang: str, approved: bool) -> bool:
         resume = False
+        bulk_resume = False
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            job = db.execute("SELECT j.id,j.status,j.result,d.phase,d.source_pptx FROM jobs j JOIN documents d "
+            job = db.execute("SELECT j.id,j.status,j.result,d.phase,d.source_pptx,d.bulk_path FROM jobs j JOIN documents d "
                              "ON d.id=j.document_id WHERE d.id=? ORDER BY j.id DESC LIMIT 1", (document_id,)).fetchone()
             if not job or job["status"] != ("review" if job["source_pptx"] else "completed"):
                 return False
@@ -691,8 +730,13 @@ class Workspace:
                 review = json.loads(job["result"])["final_export"].get("source_review") or {}
                 if review.get("blocking_pages") or review.get("issues"):
                     raise ValueError("Reprocess the identified pages to recover missing or inconsistent content before approval.")
-                db.execute("UPDATE jobs SET status='queued',finished=NULL,error=NULL WHERE id=?", (job["id"],))
-                resume = True
+                if job["bulk_path"]:
+                    bulk_resume = self.bulk.schedule_resume(db, document_id)
+                    if not bulk_resume:
+                        return False
+                else:
+                    db.execute("UPDATE jobs SET status='queued',finished=NULL,error=NULL WHERE id=?", (job["id"],))
+                    resume = True
             updated = db.execute("""
                 UPDATE documents SET title=?, lang=?, approved=? WHERE id=?
             """, (title, lang, approved, document_id))
@@ -704,6 +748,8 @@ class Workspace:
             """, (document_id, now(), approved))
         if resume:
             self._submit(document_id, job["id"], phase=job["phase"], resume=True)
+        if bulk_resume:
+            self.bulk.kick()
         return True
 
     def reviewer(self, name: str | None = None) -> str:

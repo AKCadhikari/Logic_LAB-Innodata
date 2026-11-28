@@ -64,6 +64,12 @@
     </header>
     <dl class="bulk-stats" id="bulk-summary"></dl>
     <dl class="bulk-stats bulk-queue-stats" id="bulk-counts" hidden></dl>
+    <dl class="bulk-stats bulk-quality" id="bulk-quality" aria-label="Batch quality targets" hidden>
+     <div><dt>Failure rate</dt><dd id="bulk-failure-rate">—</dd>
+      <dd class="bulk-quality-note"><span id="bulk-failure-detail"></span> · Target 0%</dd></div>
+     <div><dt>Document accuracy</dt><dd>Target 100%</dd>
+      <dd class="bulk-quality-note">Measurement requires verified reference outputs</dd></div>
+    </dl>
     <div class="bulk-table-wrap" tabindex="0" aria-label="Bulk document jobs">
      <table class="bulk-table">
       <thead><tr><th scope="col">Folder</th><th scope="col">PDF</th><th scope="col">PowerPoint</th>

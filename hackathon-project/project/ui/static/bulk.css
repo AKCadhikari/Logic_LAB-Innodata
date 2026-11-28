@@ -20,6 +20,9 @@
 .bulk-stats dt { color: var(--mute); font-size: 12px; }
 .bulk-stats dd { margin: 0; color: var(--accent-dark); font-size: 19px; font-weight: 650; }
 .bulk-queue-stats > div { background: var(--accent-soft); }
+.bulk-quality { grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); }
+.bulk-quality > div { flex-direction: column; }
+.bulk-quality .bulk-quality-note { color: var(--mute); font-size: 12px; font-weight: 400; }
 .bulk-table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
 .bulk-table { width: 100%; min-width: 770px; border-collapse: collapse; text-align: left; }
 .bulk-table th, .bulk-table td { padding: 9px 11px; border-bottom: 1px solid var(--line); vertical-align: top; }

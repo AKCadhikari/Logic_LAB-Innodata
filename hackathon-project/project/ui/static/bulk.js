@@ -28,6 +28,7 @@ const countLabels = {
     failed: "Failed", partial: "Partial", source_review: "Source review", canceled: "Canceled"
 };
 const stamp = new Intl.DateTimeFormat(undefined, {dateStyle: "medium", timeStyle: "short"});
+const percent = new Intl.NumberFormat(undefined, {style: "percent", maximumFractionDigits: 1});
 let current = new URLSearchParams(location.search).get("batch");
 let selection = null;
 let busy = false;
@@ -201,7 +202,15 @@ function render(batch) {
     bulk("#bulk-summary").innerHTML = statCards(summaryLabels, summary);
     const countDisplay = bulk("#bulk-counts");
     countDisplay.hidden = !started;
-    if (started) countDisplay.innerHTML = statCards(countLabels, counts);
+    bulk("#bulk-quality").hidden = !started;
+    if (started) {
+        countDisplay.innerHTML = statCards(countLabels, counts);
+        const finished = counts.completed + counts.failed + counts.partial;
+        bulk("#bulk-failure-rate").textContent = finished ? percent.format(counts.failed / finished) : "—";
+        bulk("#bulk-failure-detail").textContent = finished
+            ? `${counts.failed} of ${finished} finished ${finished === 1 ? "job" : "jobs"} failed`
+            : "Awaiting finished jobs";
+    }
     const list = bulk("#bulk-jobs");
     const markup = batch.jobs.map(jobRow).join("");
     if (markup === previousMarkup) return;

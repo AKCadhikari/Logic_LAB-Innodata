@@ -34,6 +34,9 @@
 .bulk-table td:last-child { min-width: 130px; }
 .bulk-table td .bulk-actions { gap: 4px 9px; }
 .bulk-table progress { display: block; width: 100%; height: 7px; margin-top: 5px; accent-color: var(--accent); }
+.bulk-review-details { max-height: 14rem; margin-top: 6px; overflow: auto; font-size: .88em; }
+.bulk-review-details ul { margin: 5px 0; padding-left: 20px; }
+.bulk-review-details li { margin: 4px 0; }
 .bulk-table .history-status { display: inline-block; }
 .bulk-table .history-status:is(.partial, .needs_review, .source_review, .canceled) { color: var(--warn); background: #f6ecdb; }
 .bulk-table small { display: block; margin-top: 3px; color: var(--mute); font-weight: 400; }

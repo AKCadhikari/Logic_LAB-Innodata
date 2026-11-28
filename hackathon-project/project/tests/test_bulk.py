@@ -287,6 +287,7 @@ def test_source_review_keeps_drafts_out_of_downloads_and_preserves_xml_assets(wo
         waiting = wait_batch(client, url)
         job, = waiting["jobs"]
         assert job["status"] == "source_review" and not job["downloads"]
+        assert job["source_review"]["items"] == [{"page": 1, "kind": "source_numeric_disagreement"}]
         assert client.get(url + "/download").status_code == 409
 
     response = client.patch(f"/api/documents/{job['id']}/metadata",

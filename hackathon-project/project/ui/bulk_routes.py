@@ -167,6 +167,16 @@ def job_status(batch, row, issues, pending, outputs):
     return "partial" if outputs else "failed"
 
 
+def json_array(value):
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def batch_view(batch_id, owner):
     ws = workspace()
     snapshot = ws.bulk.snapshot(batch_id, owner)
@@ -198,6 +208,13 @@ def batch_view(batch_id, owner):
         counts[status] += 1
         base = f"/api/bulk/batches/{batch_id}/jobs/{key}"
         error = row["error"] or row["export_error"]
+        source_review = json.loads(row["source_review"]) if row["source_review"] else None
+        correction_reviews = json_array(row["correction_reviews"])
+        source_warnings = json_array(row["source_warnings"])
+        applied_corrections = json_array(row["applied_corrections"])
+        visual_checks = sum(item.get("render_verification") in {
+            "unconfirmed", "visual_check_pending", "no_visual_change_in_renderer", "requires_visual_equation_check"
+        } for item in applied_corrections)
         if status in {"failed", "partial"} and not error:
             if row["attempt_status"] == "completed":
                 error = "One or more saved outputs are missing or have changed."
@@ -219,6 +236,9 @@ def batch_view(batch_id, owner):
                      "slide": row["slide"], "slide_count": row["slides"],
                      "started": row["started"], "finished": row["finished"] or row["attempt_finished"],
                      "error": error, "warnings": row["warnings"] or 0,
+                     "source_review": source_review,
+                     "source_warnings": source_warnings,
+                     "correction_review_count": len(correction_reviews), "visual_check_count": visual_checks,
                      "view": f"/?job={key}" if row["bulk_path"] else None,
                      "downloads": {kind: f"{base}/download/{kind}" for kind in outputs},
                      "can_retry": status in {"failed", "source_review", "canceled", "partial"}})

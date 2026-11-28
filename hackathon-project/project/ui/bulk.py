@@ -371,6 +371,10 @@ class BulkQueue:
                     COALESCE(json_extract(j.result,'$.processing.total_slides'),
                         json_extract(j.result,'$.total_slides')) AS slides,
                     json_extract(j.result,'$.final_export.warnings') AS warnings,
+                    json_extract(j.result,'$.final_export.source_review') AS source_review,
+                    json_extract(j.result,'$.final_export.review') AS correction_reviews,
+                    json_extract(j.result,'$.final_export.source_warnings') AS source_warnings,
+                    json_extract(j.result,'$.final_export.applied') AS applied_corrections,
                     json_extract(j.result,'$.final_export.error') AS export_error
                 FROM bulk_jobs k LEFT JOIN documents d ON d.id=k.id
                 LEFT JOIN jobs j ON j.id=(SELECT MAX(id) FROM jobs WHERE document_id=k.id)

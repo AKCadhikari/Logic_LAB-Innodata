@@ -167,13 +167,55 @@ function liveProgress(job) {
 function jobRow(job) {
     const issues = [...job.issues, ...job.files.filter(file => file.kind === "unexpected")
         .map(file => file.name + " — " + file.error)];
+    const sourceReview = job.source_review;
+    const sourceReviewItems = [...(sourceReview?.items || []), ...(sourceReview?.issues || [])];
+    const sourceWarnings = job.source_warnings || [];
+    const reviewLabel = item => ({
+        source_extraction_requires_review: "Source extraction needs review",
+        unmatched_native_pdf_number: "A number in the PDF text layer was not matched",
+        unverified_formula_transcription: "Formula transcription is unverified",
+        no_source_blocks: "No source text blocks were recovered",
+        content_changed: "XML text differs from extracted source text",
+        numerical_discrepancy: "Numbers differ between XML and extracted text",
+        reordered_content: "XML content order differs from extracted source order"
+    })[item.kind] || String(item.kind || "Source evidence needs review").replaceAll("_", " ");
+    const reviewDetails = sourceReviewItems.map(item => {
+        const page = item.page ? `Page ${item.page}: ` : "";
+        const reason = (item.reasons || []).join(" ") || item.reason || "";
+        const node = item.node ? ` (${item.node})` : "";
+        const values = valueMap => Object.entries(valueMap || {}).map(([value, count]) =>
+            `${value}${count > 1 ? ` × ${count}` : ""}`).join(", ");
+        const evidence = item.values ? ` PDF values not matched: ${values(item.values)}.` :
+            item.missing || item.added ? ` Missing: ${values(item.missing)}. Added: ${values(item.added)}.` : "";
+        return `<li>${escapeText(page + reviewLabel(item) + node + (reason ? ` — ${reason}` : "") + evidence)}</li>`;
+    }).join("");
+    const blockedPages = sourceReview?.blocking_pages || [];
+    const sourceReviewMarkup = job.status === "source_review" ?
+        `<details class="bulk-review-details"><summary>Why export is blocked (${sourceReviewItems.length} source checks)</summary>
+            ${blockedPages.length ? `<p>Reprocess pages ${escapeText(blockedPages.join(", "))} to recover missing or inconsistent content.</p>` : ""}
+            ${reviewDetails ? `<ul>${reviewDetails}</ul>` : "<p>Open View results for the source review report.</p>"}
+        </details>` : "";
+    const sourceWarningDetails = sourceWarnings.map(item => {
+        const page = item.page ? `Page ${item.page}: ` : "";
+        const reason = (item.reasons || []).join(" ") || item.reason || "";
+        return `<li>${escapeText(page + String(item.kind || "Source warning").replaceAll("_", " ") +
+            (reason ? ` — ${reason}` : ""))}</li>`;
+    }).join("");
+    const sourceWarningsMarkup = sourceWarnings.length ?
+        `<details class="bulk-review-details"><summary>${sourceWarnings.length} non-blocking source warning${sourceWarnings.length === 1 ? "" : "s"}</summary>
+            <ul>${sourceWarningDetails}</ul></details>` : "";
+    const statusError = job.status === "source_review" ?
+        "XML structure passed validation; source evidence still needs review before export." : job.error;
     return `<tr><th scope="row">${escapeText(job.folder)}
         ${issues.length ? `<details data-folder="${job.id}"><summary>File issues</summary>
             <ul>${issues.map(issue => `<li>${escapeText(issue)}</li>`).join("")}</ul></details>` : ""}
         </th><td>${fileList(job.files, "pdf")}</td><td>${fileList(job.files, "pptx")}</td>
         <td><span class="history-status ${job.status}">${statusName[job.status]}</span>
-            ${job.error ? `<small class="bulk-error">${escapeText(job.error)}</small>` : ""}
-            ${job.warnings ? `<small>${job.warnings} review warning${job.warnings === 1 ? "" : "s"}</small>` : ""}</td>
+            ${statusError ? `<small class="bulk-error">${escapeText(statusError)}</small>` : ""}
+            ${sourceReviewMarkup}
+            ${sourceWarningsMarkup}
+            ${job.correction_review_count ? `<small>${job.correction_review_count} PowerPoint correction${job.correction_review_count === 1 ? "" : "s"} need review</small>` : ""}
+            ${job.visual_check_count ? `<small>${job.visual_check_count} saved change${job.visual_check_count === 1 ? "" : "s"} need a visual check</small>` : ""}</td>
         <td>${liveProgress(job)}</td>
         <td><div class="bulk-actions">
         ${job.view ? `<a id="view-${job.id}" href="${job.view}" target="_blank" rel="noopener">View results</a>` : ""}

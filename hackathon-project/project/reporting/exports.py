@@ -251,7 +251,8 @@ def publish_document(folder: Path, stem: str, ir, settings, extraction: dict, re
     if outputs["xml"] and requires_manual_review(extraction, source_gate):
         outputs["xml"]["draft"] = True
         result.update(status="manual_review_required",
-                      error="The XML is a draft. Resolve source review and content differences before exporting the PowerPoint.")
+                      error=("The XML passed structural validation but remains a draft because source evidence needs review. "
+                             "Resolve the listed source review items before exporting the PowerPoint."))
         if final_package:
             result["source_review"] = {"issues": completeness["issues"],
                 "items": source_gate["source_review"], "blocking_pages": quality.get("blocking_pages", [])}

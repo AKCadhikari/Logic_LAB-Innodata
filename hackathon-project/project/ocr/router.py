@@ -9,10 +9,11 @@ from subprocess import TimeoutExpired
 from typing import Callable
 
 from config.settings import Settings
-from ocr import engine, glm, paddle, paddle_vl
+from ocr import engine as tesseract
+from ocr import glm, paddle, paddle_vl
 from ocr.quality import validate_recognition
 from ocr.recognition import ENGINE_MODES, OCR_ENGINES, Recognition, RecognitionError
-from utils.textutil import ISO_TO_TESS, LANGUAGE_SCRIPTS, language_profile, norm_cmp
+from utils.textutil import ISO_TO_TESS, LANGUAGE_SCRIPTS, language_profile, norm_cmp, xml_script_digits
 from utils import execution_audit as audit
 
 
@@ -34,19 +35,20 @@ class OCRRouter:
 
     def recognise_arabic_tesseract(self, page, dpi, diagnostics):
         if self.arabic_packs is None:
-            self.arabic_packs = engine.available_langs(self.settings)
+            self.arabic_packs = tesseract.available_langs(self.settings)
         if "ara" not in self.arabic_packs:
             raise RecognitionError("Tesseract's Arabic language pack is unavailable.", unavailable=True)
-        packs = self.arabic_packs if self.settings.ocr_language == "ar-en" else {"ara"}
+        packs = {"ara"} if self.settings.ocr_language == "ar" else {"ara", "eng"} & self.arabic_packs
         scan = bool(diagnostics.get("appears_scanned"))
         try:
-            lines, evidence = engine.ocr_page(page, "ar", dpi, self.settings, packs, orient=scan, deskew=scan)
+            lines, evidence = tesseract.ocr_page(page, "ar", dpi, self.settings, packs, orient=scan, deskew=scan)
         except TimeoutExpired as error:
             raise RecognitionError("Tesseract Arabic OCR timed out.", status="timeout") from error
         confidence = sum(line.conf for line in lines) / len(lines) if lines else None
         raw = {**evidence, "model": evidence.get("langs", "ara"),
                "regions": [{"text": line.text, "bbox": line.bbox, "confidence": line.conf} for line in lines]}
         return Recognition(page.number + 1, "tesseract", lines=lines, confidence=confidence, raw=raw,
+                           issues=["OCR may have missed visible Arabic lines."] if evidence.get("possible_text_omission") else [],
                            execution_ids=evidence.get("selected_execution_ids", []))
 
     def recover_unmapped_text(self, page, dpi: int, diagnostics: dict, status: Callable[[str], None]):
@@ -57,7 +59,7 @@ class OCRRouter:
         pack = ISO_TO_TESS.get(language)
         if pack is None:
             return None
-        packs = engine.available_langs(self.settings)
+        packs = tesseract.available_langs(self.settings)
         if pack not in packs:
             return None
         native_language = diagnostics["native_language"]
@@ -67,7 +69,7 @@ class OCRRouter:
             packs = {pack}
         status("tesseract")
         try:
-            lines, evidence = engine.ocr_page(page, language, max(260, dpi), self.settings, packs,
+            lines, evidence = tesseract.ocr_page(page, language, max(260, dpi), self.settings, packs,
                                               orient=False, deskew=False)
         except (OSError, RuntimeError, ValueError, TimeoutExpired):
             return None
@@ -76,6 +78,8 @@ class OCRRouter:
         profile = language_profile(candidate.text(), language)
         confidence = sum(line.conf for line in lines) / max(1, len(lines))
         issues = validate_recognition(candidate, page.number + 1, diagnostics, self.settings)
+        if evidence.get("possible_text_omission"):
+            issues.append("OCR may have missed visible Arabic lines.")
         accepted = profile["script"] in {script, LANGUAGE_SCRIPTS.get(language)} and confidence >= 75 and not issues
         audit.mark(candidate.execution_ids, validation="passed" if accepted else "rejected",
                    detected_language=profile["language"])
@@ -102,11 +106,34 @@ class OCRRouter:
         observed = ""
         provisional = None
         engines = self.engines
-        if (self.settings.ocr_backend == "automatic" and language == "ar"
-                and self.settings.ocr_language in {"ar", "ar-en"}):
-            primary = ("tesseract", "paddleocr") if self.settings.ocr_language == "ar-en" else ("paddleocr", "tesseract")
-            engines = tuple(dict.fromkeys((*primary, *engines)))
+        probe_arabic = False
+        if self.settings.ocr_backend == "automatic":
+            if language == "und" and diag.get("appears_scanned"):
+                if self.arabic_packs is None:
+                    self.arabic_packs = tesseract.available_langs(self.settings)
+                if "ara" in self.arabic_packs:
+                    try:
+                        detected = tesseract.pick_language(page, self.settings, self.arabic_packs)
+                    except (OSError, RuntimeError, ValueError, TimeoutExpired):
+                        detected = "und"
+                    if detected == "ar":
+                        language = "ar"
+                    probe_arabic = detected == "und"
+            if language == "ar":
+                primary = (("paddleocr", "tesseract") if self.settings.ocr_language == "ar"
+                           else ("tesseract", "paddleocr"))
+                engines = tuple(dict.fromkeys((*primary, *engines)))
+            elif probe_arabic:
+                engines = ("tesseract", "arabic-paddle", *engines)
+        arabic_paddle_tried = False
         for engine_index, engine in enumerate(engines):
+            if engine == "arabic-paddle":
+                if language_profile(observed)["scripts"].get("arab", 0) < 8:
+                    continue
+                engine, language = "paddleocr", "ar"
+                arabic_paddle_tried = True
+            elif engine == "paddleocr" and arabic_paddle_tried:
+                continue
             fallback_reason = None
             if engine_index:
                 previous = attempts[-1]
@@ -142,6 +169,7 @@ class OCRRouter:
                             with audit.details(model_digest=state.get("digest")):
                                 result = adapter.recognise(page, dpi, self.settings)
                         elif engine == "tesseract":
+                            input_language = "ar"
                             result = self.recognise_arabic_tesseract(page, dpi, diag)
                         else:
                             input_language = self.paddle_language(language, observed, diag)
@@ -157,6 +185,10 @@ class OCRRouter:
                     observed = result.text()
                     expected = diag.get("native_language", {})
                     detected = language_profile(result.text(), language)
+                    if engine == "tesseract" and probe_arabic and (
+                            detected["scripts"].get("arab", 0) < 8 or (result.confidence or 0) < 80):
+                        issues.append("An Arabic scan could not be confirmed reliably.")
+                        observed = ""
                     if ((diag.get("health") in {"healthy", "suspicious"} or diag.get("native_unmapped_characters"))
                             and expected.get("confidence", 0) >= .6
                             and expected.get("script") not in detected["scripts"]):
@@ -221,7 +253,7 @@ class OCRRouter:
                         similarity = fuzz.ratio(norm_cmp(a), norm_cmp(b))
                         info["fallback_similarity"] = round(similarity / 100, 3)
                         if (info["fallback_similarity"] < self.settings.ocr_min_fallback_similarity
-                                or re.findall(r"\d+", a) != re.findall(r"\d+", b)):
+                                or re.findall(r"\d+", xml_script_digits(a)) != re.findall(r"\d+", xml_script_digits(b))):
                             provisional[1].update(fallback_similarity=info["fallback_similarity"], fallback_reason=fallback_reason,
                                                   review_reason="Local recognizers disagree on text, order, or numerical values.")
                             if engine_index < len(engines) - 1:

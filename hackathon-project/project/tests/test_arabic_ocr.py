@@ -3,12 +3,13 @@ from lxml import etree
 
 from agents.orchestrator import process_pdf
 from config.settings import Settings
-from diagnostics.profile import decorate_document
+from diagnostics.profile import BLOCK_LANGUAGE_WARNING, decorate_document
 from layout.model import Block, Cell, DocIR, Line, PageIR
 from layout.reconstruct import join_arabic_fragments
 from ocr import engine, glm, paddle
 from ocr.recognition import Recognition
 from ocr.router import OCRRouter
+from reporting.exports import classify_source_review, requires_manual_review
 from utils.logs import AuditLog
 from xml_engine.serializer import to_xml
 from xml_engine.validate import validate_xml
@@ -106,3 +107,60 @@ def test_mixed_scan_tries_combined_packs_first(tmp_path, monkeypatch):
     assert result.engine == "tesseract"
     assert info["langs"] == "ara+eng"
     assert [attempt["engine"] for attempt in info["attempts"]] == ["tesseract"]
+
+
+def test_automatic_recovers_arabic_scan_when_script_probe_is_inconclusive(tmp_path, monkeypatch):
+    text = "تقرير المراجعة يؤكد العدد ١٢٣ وحدة."
+    monkeypatch.setattr(engine, "available_langs", lambda _: {"ara", "eng"})
+    monkeypatch.setattr(engine, "pick_language", lambda *args: "und")
+    monkeypatch.setattr(engine, "ocr_page", lambda *args, **kwargs: (
+        [Line(text, (20, 50, 200, 65), source="ocr", conf=94, rtl=True)], {"langs": "ara+eng"}))
+
+    def unexpected(_):
+        raise AssertionError("Reliable Arabic OCR should finish before GLM is contacted.")
+
+    monkeypatch.setattr(glm, "model_info", unexpected)
+    router = OCRRouter(Settings(), tmp_path)
+    with pymupdf.open() as pdf:
+        result, info = router.recognise(pdf.new_page(), "und", 200, {"appears_scanned": True}, lambda _: None)
+    assert result.text() == text and info["engine"] == "tesseract"
+    assert not info["requires_review"]
+
+
+def test_automatic_arabic_probe_does_not_replace_unverified_non_arabic_scan(tmp_path, monkeypatch):
+    text = "The audit recorded exactly 123 entries."
+    monkeypatch.setattr(engine, "available_langs", lambda _: {"ara", "eng"})
+    monkeypatch.setattr(engine, "pick_language", lambda *args: "und")
+    monkeypatch.setattr(engine, "ocr_page", lambda *args, **kwargs: (
+        [Line("Different words printed here.", (20, 50, 200, 65), source="ocr", conf=94)], {"langs": "ara+eng"}))
+    monkeypatch.setattr(glm, "model_info", lambda _: {"ready": True})
+    monkeypatch.setattr(glm, "recognise", lambda *args: glm.parse(1, {"done": True, "response": text}))
+    router = OCRRouter(Settings(), tmp_path)
+    with pymupdf.open() as pdf:
+        result, info = router.recognise(pdf.new_page(), "und", 200, {"appears_scanned": True}, lambda _: None)
+    assert result.text() == text
+    assert [(attempt["engine"], attempt["status"]) for attempt in info["attempts"]] == [
+        ("tesseract", "rejected"), ("glm-ocr", "accepted")]
+
+
+def test_arabic_language_metadata_warning_does_not_block_a_valid_export():
+    page = PageIR(1, 500, 600, source="ocr", requires_review=True, diag={
+        "ocr": {"status": "accepted", "requires_review": False},
+        "review_reasons": [BLOCK_LANGUAGE_WARNING],
+    })
+    document = DocIR("fixture", "fixture.pdf", pages=[page])
+    metadata_warning = {"page": 1, "kind": "source_extraction_requires_review"}
+    completeness = {"source_review": [metadata_warning]}
+    gate, warnings = classify_source_review(document, completeness)
+    assert warnings == [metadata_warning]
+    assert not requires_manual_review({}, gate)
+    assert requires_manual_review({"multilingual_validation": {"blocking_pages": [1]}}, gate)
+
+    numeric_disagreement = {"page": 1, "kind": "source_numeric_disagreement"}
+    gate, warnings = classify_source_review(document, {"source_review": [metadata_warning, numeric_disagreement]})
+    assert gate["source_review"] == [numeric_disagreement]
+    assert requires_manual_review({}, gate)
+
+    page.diag["ocr"]["requires_review"] = True
+    gate, warnings = classify_source_review(document, completeness)
+    assert gate["source_review"] == [metadata_warning] and not warnings

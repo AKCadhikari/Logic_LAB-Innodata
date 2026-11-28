@@ -134,7 +134,9 @@ def apply_regions(page: PageIR, regions: list[dict]) -> int:
     candidates = Counter(SPECIAL.get(block.kind) or SPECIAL.get(block.tag) for block in page.blocks)
     matches = {}
     conflicting_text = False
-    native_text_usable = not page.diag.get("native_unmapped_characters")
+    native_text_usable = (page.diag.get("health") not in {"absent", "corrupt"}
+                          and not page.diag.get("native_unmapped_characters")
+                          and not page.diag.get("native_decoding_risk"))
     for block in page.blocks:
         group = SPECIAL.get(block.kind) or SPECIAL.get(block.tag)
         text = norm_cmp(block.text).strip()

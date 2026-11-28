@@ -192,6 +192,20 @@ def ocr_page(page, lang_code: str, dpi: int, settings, installed: set[str] | Non
     return lines, info
 
 
+def _uncovered_arabic_line(image, bbox, dpi):
+    scale = dpi / 72
+    top, bottom = (round(bbox[index] * scale) for index in (1, 3))
+    height = max(1, bottom - top)
+    ink = image < 175
+    if ink.mean() > .14:
+        return False
+    rows = (ink.sum(axis=1) >= max(10, image.shape[1] * .012)).astype(np.uint8)
+    rows[max(0, top - height // 2):bottom + height // 2] = 0
+    changes = np.flatnonzero(np.diff(np.pad(rows.astype(int), 1)))
+    return any(height * .3 <= end - start <= height * 1.5
+               for start, end in zip(changes[::2], changes[1::2]))
+
+
 def _ocr_page(page, lang_code, dpi, settings, installed, orient, deskew):
     gray = render_gray(page, dpi)
     img, info = preprocess(gray, settings, orient=orient, deskew=deskew)
@@ -204,6 +218,22 @@ def _ocr_page(page, lang_code, dpi, settings, installed, orient, deskew):
     if info.get("rotate"):
         info["note"] = "page rotated by OCR preprocessing; bbox are in rotated space"
     lines = ocr_image(img, langs, dpi, settings)
+    if (lang_code == "ar" and len(lines) == 1 and lines[0].bbox
+            and _uncovered_arabic_line(img, lines[0].bbox, dpi)):
+        # Automatic segmentation can return one high-confidence line while
+        # overlooking other isolated lines, especially on sparse RTL scans.
+        info["possible_text_omission"] = True
+        if settings.ocr_psm != 11:
+            try:
+                sparse = ocr_image(img, langs, dpi, settings, psm=11)
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+                sparse = []
+            first = lines[0].bbox
+            extra = [line for line in sparse if line.bbox and line.conf >= 80 and
+                     (line.bbox[3] <= first[1] or line.bbox[1] >= first[3])]
+            if extra:
+                lines = sorted([*lines, *extra], key=lambda line: line.bbox[1])
+                info.update(retry="psm11-sparse-arabic", possible_text_omission=False)
     if not lines:                                   # photo / sparse layouts: retry with sparse-text mode on the raw render
         lines = ocr_image(gray, langs, dpi, settings, psm=11)
         info["retry"] = "psm11-raw"

@@ -12,6 +12,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import pymupdf
 
+from diagnostics.profile import BLOCK_LANGUAGE_WARNING, PAGE_LANGUAGE_WARNING
 from powerpoint.package import validate_deck
 from powerpoint.language import presentation_language_report
 from xml_engine.assets import inspect_assets, relative_path, validate_archive
@@ -36,7 +37,17 @@ def requires_manual_review(extraction: dict, completeness: dict) -> bool:
 
 
 def classify_source_review(document, completeness):
-    review_pages = {page.n for page in document.pages if page.requires_review}
+    review_pages = set()
+    for page in document.pages:
+        if not page.requires_review:
+            continue
+        ocr = page.diag.get("ocr", {})
+        reasons = set(page.diag.get("review_reasons", ()))
+        only_language_metadata = (page.source == "ocr" and ocr.get("status") == "accepted"
+                                  and not ocr.get("requires_review") and reasons
+                                  and reasons <= {BLOCK_LANGUAGE_WARNING, PAGE_LANGUAGE_WARNING})
+        if not only_language_metadata:
+            review_pages.add(page.n)
     visual_formulas = {item["node"] for item in completeness.get("mathematics", []) if item["has_source_crop"]}
     review, warnings = [], []
     for item in completeness["source_review"]:

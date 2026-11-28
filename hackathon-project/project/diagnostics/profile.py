@@ -31,6 +31,10 @@ def has_text_loss(block) -> bool:
     return any(xml_safe(text) != text or "\ufffd" in text for text in raw) or any(map(has_text_loss, block.children))
 
 
+BLOCK_LANGUAGE_WARNING = "At least one block has an uncertain language or unsupported script."
+PAGE_LANGUAGE_WARNING = "The page language or script could not be confidently identified."
+
+
 def decorate_document(ir) -> dict:
     document_languages = set()
     page_profiles = []
@@ -72,7 +76,7 @@ def decorate_document(ir) -> dict:
             if block.writing_mode == "vertical":
                 issues.append("Vertical text order requires visual review.")
             if block.language["review_required"]:
-                issues.append("At least one block has an uncertain language or unsupported script.")
+                issues.append(BLOCK_LANGUAGE_WARNING)
             if xml_safe(raw) != raw or "\ufffd" in raw:
                 issues.append("At least one source block contains replacement or XML-incompatible characters.")
             if block.kind == "equation" and not block.bbox:
@@ -98,7 +102,7 @@ def decorate_document(ir) -> dict:
         page.language["languages"] = sorted(languages)
         document_languages.update(languages)
         if page.language["review_required"]:
-            reasons.append("The page language or script could not be confidently identified.")
+            reasons.append(PAGE_LANGUAGE_WARNING)
         page.diag["review_reasons"] = list(dict.fromkeys(reasons))
         page.requires_review |= bool(reasons)
         page_type = ("mixed" if page.diag.get("mixed_content") else "scanned" if page.diag.get("appears_scanned")

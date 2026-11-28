@@ -23,7 +23,7 @@ from quality.qa import page_confidence, doc_quality
 from utils.cache import Cache, file_key
 from utils.logs import AuditLog
 from utils.naming import xml_name
-from utils.textutil import detect_lang, language_profile, norm_cmp, norm_ws
+from utils.textutil import detect_lang, language_profile, norm_cmp, norm_ws, xml_script_digits
 from reporting.exports import write_report
 from reporting import execution as execution_reports
 from utils import execution_audit as model_audit
@@ -66,6 +66,11 @@ def _ocr_cached(page, cache, identity, fkey, lang, settings, installed, deskew, 
 
 def _text_of(lines) -> str:
     return " ".join(l.text for l in lines)
+
+
+def _arabic_numbers_disagree(native_text, recognized_text):
+    native_numbers = numeric_values(xml_script_digits(native_text))
+    return bool(native_numbers and native_numbers != numeric_values(xml_script_digits(recognized_text)))
 
 
 def process_pdf(pdf: Path, settings: Settings, out_dir: Path, work_dir: Path, audit: AuditLog,
@@ -168,7 +173,8 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             page_language = "en" if latin_only else "ar"
         elif settings.ocr_language in {"ar", "en"}:
             page_language = settings.ocr_language
-        elif page_language == "und" and arabic_document:
+        elif page_language == "und" and (arabic_document or (
+                d.get("scripts", {}).get("arab", 0) >= 8 and d.get("native_language", {}).get("script") == "arab")):
             page_language = "ar"
         d["ocr_language_requested"] = settings.ocr_language or "auto"
         d["ocr_language_hint"] = page_language
@@ -189,9 +195,9 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             if recovery:
                 rec["lines"], d["ocr"] = recovery
                 rec["source"] = "ocr"
-                if page_language == "ar" and numeric_values(page.get_text()) != numeric_values(_text_of(rec["lines"])):
-                    d["reasons"].append("OCR and embedded PDF text disagree on numeric values. Verify them against the source image.")
-                    d["ocr"]["requires_review"] = True
+                if page_language == "ar" and _arabic_numbers_disagree(page.get_text(), _text_of(rec["lines"])):
+                    d["ocr"].update(requires_review=True,
+                                    review_reason="OCR and embedded PDF text disagree on numeric values.")
                 rec["figs"] = native.extract_figures(page, settings, [])
                 audit.event("ocr", "selection", doc=doc_id, page=i + 1, **d["ocr"])
             elif decision != "native" and settings.ocr_enabled and settings.ocr_backend in ENGINE_MODES:
@@ -200,6 +206,8 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                                                lambda engine: stage("ocr", page=i + 1, engine=engine, model=model_names.get(engine)),
                                                event=lambda attempt: stage("ocr_attempt", page=i + 1, **attempt))
                 d["ocr"] = info
+                if (result and page_language == "und" and result.language.get("scripts", {}).get("arab", 0) >= 8):
+                    page_language = d["ocr_language_hint"] = "ar"
                 if result and decision == "compare":
                     native_text = page.get_text()
                     ocr_text = result.text()
@@ -209,8 +217,12 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                     if d.get("native_decoding_risk"):
                         d["compare_order_similarity"] = round(fuzz.ratio(norm_ws(native_text), norm_ws(ocr_text)) / 100, 3)
                         d["native_order_corroborated"] = norm_ws(native_text) == norm_ws(result.text()) and not info["requires_review"]
-                        info["requires_review"] |= not d["native_order_corroborated"]
-                        result = None
+                        visual_arabic = (page_language == "ar" and result.engine in {"paddleocr", "tesseract"}
+                                         and not info["requires_review"] and result.lines
+                                         and all(line.bbox for line in result.lines))
+                        if d["native_order_corroborated"] or not visual_arabic:
+                            info["requires_review"] |= not d["native_order_corroborated"]
+                            result = None
                     elif similarity >= settings.native_vs_ocr_min_similarity:
                         if numeric_disagreement:
                             d["reasons"].append("OCR and native text disagree on numeric values. Review the source before relying on either.")
@@ -230,9 +242,9 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
                         info["requires_review"] = True
                 if result and page_language == "ar":
                     recognized = result.text()
-                    if d.get("native_chars") and numeric_values(page.get_text()) != numeric_values(recognized):
-                        d["reasons"].append("OCR and embedded PDF text disagree on numeric values. Verify them against the source image.")
-                        info["requires_review"] = True
+                    if d.get("native_chars") and _arabic_numbers_disagree(page.get_text(), recognized):
+                        info.update(requires_review=True,
+                                    review_reason="OCR and embedded PDF text disagree on numeric values.")
                     if d.get("scripts", {}).get("latin", 0) >= 8 and not result.language.get("scripts", {}).get("latin"):
                         d["reasons"].append("OCR did not retain Latin text present in the embedded layer.")
                         info["requires_review"] = True
@@ -407,6 +419,11 @@ def _extract_pdf(pdf, settings, out_dir, work_dir, audit, deadline, progress, pr
             pg.ocr_engine = (ocr_info.get("engine") or "") if pg.source == "ocr" else ""
             pg.requires_review = bool(ocr_info.get("requires_review") or pg.diag.get("error")
                                       or pg.diag.get("review_reasons"))
+            if ocr_info.get("requires_review"):
+                reason = ocr_info.get("review_reason") or "OCR needs a visual check against the PDF."
+                if ocr_info.get("status") == "review_required":
+                    reason = "OCR could not recover reliable text. Reprocess using Automatic OCR."
+                pg.diag.setdefault("review_reasons", []).append(reason)
             detection = layout_pages[pg.n - 1]
             layout_status, regions = layout.enrich(pdf, pg)
             pg.diag["layout"] = {

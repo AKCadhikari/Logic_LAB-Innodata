@@ -450,10 +450,11 @@ async function loadHistory() {
 }
 
 async function loadHomeOcrPreference() {
+    const engine = home$("#home-ocr-engine");
     try {
         const preference = await workspaceFetch("/api/ocr-settings");
-        home$("#home-ocr-engine").value = preference.engine === "paddleocr" ? "paddleocr" : "glm-ocr";
-    } catch (_) { home$("#home-ocr-engine").value = "glm-ocr"; }
+        if ([...engine.options].some(option => option.value === preference.engine)) engine.value = preference.engine;
+    } catch (_) { engine.value = "automatic"; }
 }
 
 home$("#home-ocr-engine").onchange = async event => {
